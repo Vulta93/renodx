@@ -25,11 +25,63 @@ namespace {
 std::atomic<int> deadcells_world_composite_counter = 0;
 std::atomic<uint32_t> deadcells_frame_number = 0;
 
+// Tracks the texture bound to pixel-shader slot t0 (D3D11 immediate context),
+// so the world-composite gate can check what draw #0 is actually sampling.
+constexpr bool kDeadCellsDebugLog = false;  // set true to log DC-T0 lines
+std::atomic<uint64_t> deadcells_ps_t0_view = 0;
+
+void OnPushDescriptorsTrackT0(
+    reshade::api::command_list* cmd_list,
+    reshade::api::shader_stage stages,
+    reshade::api::pipeline_layout layout,
+    uint32_t layout_param,
+    const reshade::api::descriptor_table_update& update) {
+  if ((static_cast<uint32_t>(stages) & static_cast<uint32_t>(reshade::api::shader_stage::pixel)) == 0u) return;
+  if (update.type != reshade::api::descriptor_type::texture_shader_resource_view) return;
+  if (update.binding > 0u || update.count == 0u) return;
+  const auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
+  deadcells_ps_t0_view = views[0].handle;
+}
+
+// Returns true if the texture bound to t0 is a render target (i.e. the game's own
+// rendered scene image, not sprite/UI art or a 1x1 fill texture).
+// Also logs (DC-T0) whenever draw #0's texture changes - cheap, only on change.
+bool DeadCellsDraw0SamplesRenderTarget(reshade::api::command_list* cmd_list, uint32_t frame) {
+  static uint64_t last_signature = ~0ull;
+  uint32_t width = 0, height = 0, format = 0;
+  bool is_render_target = false;
+  const uint64_t view_handle = deadcells_ps_t0_view.load();
+  if (view_handle != 0u) {
+    auto* device = cmd_list->get_device();
+    auto resource = device->get_resource_from_view(reshade::api::resource_view{view_handle});
+    if (resource.handle != 0u) {
+      auto desc = device->get_resource_desc(resource);
+      width = desc.texture.width;
+      height = desc.texture.height;
+      format = static_cast<uint32_t>(desc.texture.format);
+      is_render_target = (static_cast<uint32_t>(desc.usage) & static_cast<uint32_t>(reshade::api::resource_usage::render_target)) != 0u;
+    }
+  }
+  const uint64_t signature = (uint64_t(width) << 40) ^ (uint64_t(height) << 20) ^ (uint64_t(format) << 1) ^ (is_render_target ? 1u : 0u);
+  if (!kDeadCellsDebugLog) return is_render_target;
+  if (signature == last_signature) return is_render_target;
+  last_signature = signature;
+  std::stringstream s;
+  s << "DC-T0 frame " << frame << " draw0 t0 " << width << "x" << height
+    << " format " << format << " render_target=" << is_render_target;
+  reshade::log::message(reshade::log::level::info, s.str().c_str());
+  return is_render_target;
+}
+
 bool DeadCellsWorldCompositeGate(reshade::api::command_list* cmd_list) {
   const int draw_index = deadcells_world_composite_counter.fetch_add(1);
-  const bool replace = (draw_index == 0);
+  bool replace = (draw_index == 0);
 
   const uint32_t frame = deadcells_frame_number.load();
+  // Only the real world composite samples the scene render target (e.g. 642x362).
+  // Loading/transition frames draw a 1x1 fill and menus draw art atlases first -
+  // tone mapping those produced the light-blue loading screen.
+  if (replace) replace = DeadCellsDraw0SamplesRenderTarget(cmd_list, frame);
     if (false) {  // debug logging disabled
     uint32_t rt_width = 0;
     uint32_t rt_height = 0;
@@ -66,7 +118,9 @@ bool DeadCellsWorldCompositeGate(reshade::api::command_list* cmd_list) {
 }
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-//  CustomShaderEntry(0x40BF5761),  // character glow/particle effect
+    CustomShaderEntry(0x40BF5761),  // glow add pass, scaled by Glow Strength slider
+    CustomShaderEntry(0x0A271311),  // minimap/map, clamped to 0..1
+    CustomShaderEntry(0x8F0EAF1C),  // main sprite + smoke shader (clamped outputs)
     CustomShaderEntryCallback(0x48C1C006, &DeadCellsWorldCompositeGate),
 };
 
@@ -247,6 +301,16 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
+        .key = "FxGlowStrength",
+        .binding = &shader_injection.custom_glow_strength,
+        .default_value = 100.f,
+        .label = "Glow Strength",
+        .section = "Effects",
+        .tooltip = "Brightness of the added glow/shine (e.g. metal and weapon shine). 100 = original.",
+        .max = 100.f,
+        .parse = [](float value) { return value * 0.01f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "ColorGradeShadows",
         .binding = &shader_injection.tone_map_shadows,
         .default_value = 50.f,
@@ -392,20 +456,7 @@ renodx::utils::settings::Settings settings = {
     },
 };
 
-const std::unordered_map<std::string, reshade::api::format> UPGRADE_TARGETS = {
-    {"R8G8B8A8_TYPELESS", reshade::api::format::r8g8b8a8_typeless},
-    {"B8G8R8A8_TYPELESS", reshade::api::format::b8g8r8a8_typeless},
-    {"R8G8B8A8_UNORM", reshade::api::format::r8g8b8a8_unorm},
-    {"B8G8R8A8_UNORM", reshade::api::format::b8g8r8a8_unorm},
-    {"R8G8B8A8_SNORM", reshade::api::format::r8g8b8a8_snorm},
-    {"R8G8B8A8_UNORM_SRGB", reshade::api::format::r8g8b8a8_unorm_srgb},
-    {"B8G8R8A8_UNORM_SRGB", reshade::api::format::b8g8r8a8_unorm_srgb},
-    {"R10G10B10A2_TYPELESS", reshade::api::format::r10g10b10a2_typeless},
-    {"R10G10B10A2_UNORM", reshade::api::format::r10g10b10a2_unorm},
-    {"B10G10R10A2_UNORM", reshade::api::format::b10g10r10a2_unorm},
-    {"R11G11B10_FLOAT", reshade::api::format::r11g11b10_float},
-    {"R16G16B16A16_TYPELESS", reshade::api::format::r16g16b16a16_typeless},
-};
+
 
 void OnPresetOff() {
   //   renodx::utils::settings::UpdateSetting("toneMapType", 0.f);
@@ -422,10 +473,6 @@ void OnPresetOff() {
   //   renodx::utils::settings::UpdateSetting("colorGradeLUTScaling", 0.f);
 }
 
-const auto UPGRADE_TYPE_NONE = 0.f;
-const auto UPGRADE_TYPE_OUTPUT_SIZE = 1.f;
-const auto UPGRADE_TYPE_OUTPUT_RATIO = 2.f;
-const auto UPGRADE_TYPE_ANY = 3.f;
 
 void OnPresent(reshade::api::command_queue* queue,
                reshade::api::swapchain* swapchain,
@@ -461,6 +508,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::present>(OnPresentFrameReset);
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsTrackT0);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -613,43 +661,17 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           settings.push_back(setting);
         }
 
-        for (const auto& [key, format] : UPGRADE_TARGETS) {
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "Upgrade_" + key,
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 0.f,
-              .label = key,
-              .section = "Resource Upgrades",
-              .labels = {
-                  "Off",
-                  "Output size",
-                  "Output ratio",
-                  "Any size",
-              },
-              .is_global = true,
-              .is_visible = []() { return settings[0]->GetValue() >= 2; },
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          settings.push_back(setting);
-
-          auto value = setting->GetValue();
-          if (value > 0) {
-            renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
-                .old_format = format,
-                .new_format = reshade::api::format::r16g16b16a16_float,
-                .ignore_size = (value == UPGRADE_TYPE_ANY),
-                .use_resource_view_cloning = true,
-                .aspect_ratio = static_cast<float>((value == UPGRADE_TYPE_OUTPUT_RATIO)
-                                                       ? renodx::mods::swapchain::SwapChainUpgradeTarget::BACK_BUFFER
-                                                       : renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
-                .usage_include = reshade::api::resource_usage::render_target,
-            });
-            std::stringstream s;
-            s << "Applying user resource upgrade for ";
-            s << format << ": " << value;
-            reshade::log::message(reshade::log::level::info, s.str().c_str());
-          }
-        }
+        // Dead Cells: always upgrade R8G8B8A8_UNORM render targets (any size) to float16.
+        // The 642x362 internal scene buffer needs this to keep HDR range.
+        // (Replaces the generic template's user-facing "Resource Upgrades" settings.)
+        renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+            .old_format = reshade::api::format::r8g8b8a8_unorm,
+            .new_format = reshade::api::format::r16g16b16a16_float,
+            .ignore_size = true,
+            .use_resource_view_cloning = true,
+            .aspect_ratio = static_cast<float>(renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
+            .usage_include = reshade::api::resource_usage::render_target,
+        });
 
         initialized = true;
       }
@@ -657,6 +679,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::present>(OnPresentFrameReset);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsTrackT0);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_addon(h_module);
       break;
