@@ -713,6 +713,10 @@ void main()
     vec3 outputColor;
     if (RENODX_TONE_MAP_TYPE == 0.0) {
         outputColor = sdr_linear;
+    } else if (RENODX_TONE_MAP_TYPE >= DOOM2016_TONE_MAP_PSYCHOV_17) {
+        // PsychoV (RenoDX shared library): fed the same grade-transferred scene as RenoDRT.
+        vec3 graded = renodx::draw::ComputeUntonemappedGraded(untonemapped, sdr_linear);
+        outputColor = Doom2016PsychoV(graded, RENODX_TONE_MAP_TYPE >= DOOM2016_TONE_MAP_PSYCHOV_30);
     } else {
         outputColor = renodx::draw::ToneMapPass(untonemapped, sdr_linear);
     }
