@@ -1,0 +1,21 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "gujian3",
+  "title": "Gujian 3",
+  "category": "game",
+  "compatibility": "working",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "summary": "HDR output and RenoDX tone mapping for Gujian 3 (Vision Engine, DX11).",
+  "tags": [
+    "HDR"
+  ],
+  "status": "beta",
+  "deploy": {
+    "architecture": [
+      "x64"
+    ],
+    "steam_appid": 994280
+  }
+}
