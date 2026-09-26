@@ -22,15 +22,23 @@
 
 namespace {
 
-std::atomic<int> deadcells_world_composite_counter = 0;
-std::atomic<uint32_t> deadcells_frame_number = 0;
+// ---------------------------------------------------------------------------
+// World composite gating (shader 0x48C1C006)
+//
+// 0x48C1C006 is Heaps' generic "textured quad" shader. The same hash draws:
+//   - the world composite (the game's internal scene render target, e.g.
+//     642x362, upscaled to the back buffer) - first draw of the frame in levels
+//   - every HUD/UI icon, loading fills (1x1 texture) and menu art (atlases)
+// Only the world composite gets the RenoDX tone map / Game Brightness pass.
+// ---------------------------------------------------------------------------
 
-// Tracks the texture bound to pixel-shader slot t0 (D3D11 immediate context),
-// so the world-composite gate can check what draw #0 is actually sampling.
-constexpr bool kDeadCellsDebugLog = false;  // set true to log DC-T0 lines
-std::atomic<uint64_t> deadcells_ps_t0_view = 0;
+// Number of 0x48C1C006 draws so far this frame (reset on present).
+std::atomic<int> world_composite_draw_count = 0;
 
-void OnPushDescriptorsTrackT0(
+// Resource view currently bound to pixel shader slot t0 (D3D11 immediate context).
+std::atomic<uint64_t> pixel_t0_view = 0;
+
+void OnPushDescriptors(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
     reshade::api::pipeline_layout layout,
@@ -40,80 +48,37 @@ void OnPushDescriptorsTrackT0(
   if (update.type != reshade::api::descriptor_type::texture_shader_resource_view) return;
   if (update.binding > 0u || update.count == 0u) return;
   const auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
-  deadcells_ps_t0_view = views[0].handle;
+  pixel_t0_view = views[0].handle;
 }
 
-// Returns true if the texture bound to t0 is a render target (i.e. the game's own
-// rendered scene image, not sprite/UI art or a 1x1 fill texture).
-// Also logs (DC-T0) whenever draw #0's texture changes - cheap, only on change.
-bool DeadCellsDraw0SamplesRenderTarget(reshade::api::command_list* cmd_list, uint32_t frame) {
-  static uint64_t last_signature = ~0ull;
-  uint32_t width = 0, height = 0, format = 0;
-  bool is_render_target = false;
-  const uint64_t view_handle = deadcells_ps_t0_view.load();
-  if (view_handle != 0u) {
-    auto* device = cmd_list->get_device();
-    auto resource = device->get_resource_from_view(reshade::api::resource_view{view_handle});
-    if (resource.handle != 0u) {
-      auto desc = device->get_resource_desc(resource);
-      width = desc.texture.width;
-      height = desc.texture.height;
-      format = static_cast<uint32_t>(desc.texture.format);
-      is_render_target = (static_cast<uint32_t>(desc.usage) & static_cast<uint32_t>(reshade::api::resource_usage::render_target)) != 0u;
-    }
-  }
-  const uint64_t signature = (uint64_t(width) << 40) ^ (uint64_t(height) << 20) ^ (uint64_t(format) << 1) ^ (is_render_target ? 1u : 0u);
-  if (!kDeadCellsDebugLog) return is_render_target;
-  if (signature == last_signature) return is_render_target;
-  last_signature = signature;
-  std::stringstream s;
-  s << "DC-T0 frame " << frame << " draw0 t0 " << width << "x" << height
-    << " format " << format << " render_target=" << is_render_target;
-  reshade::log::message(reshade::log::level::info, s.str().c_str());
-  return is_render_target;
+// True if t0 is a render target, i.e. the game's own rendered scene
+// (not sprite/UI art or a 1x1 fill texture).
+bool PixelT0IsRenderTarget(reshade::api::command_list* cmd_list) {
+  const uint64_t view_handle = pixel_t0_view.load();
+  if (view_handle == 0u) return false;
+  auto* device = cmd_list->get_device();
+  auto resource = device->get_resource_from_view(reshade::api::resource_view{view_handle});
+  if (resource.handle == 0u) return false;
+  const auto desc = device->get_resource_desc(resource);
+  return (static_cast<uint32_t>(desc.usage) & static_cast<uint32_t>(reshade::api::resource_usage::render_target)) != 0u;
 }
 
-bool DeadCellsWorldCompositeGate(reshade::api::command_list* cmd_list) {
-  const int draw_index = deadcells_world_composite_counter.fetch_add(1);
-  bool replace = (draw_index == 0);
+// Restores the game's original pixel shader. RenoDX doesn't re-bind it when a
+// replacement is skipped, and Heaps doesn't re-set its shader between draws,
+// so without this the replacement would leak into the following UI draws.
+void RebindOriginalPixelShader(reshade::api::command_list* cmd_list) {
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state == nullptr) return;
+  auto* pixel_state = renodx::utils::shader::GetCurrentPixelState(shader_state);
+  if (pixel_state->pipeline.handle == 0u) return;
+  cmd_list->bind_pipeline(pixel_state->applied_stage, pixel_state->pipeline);
+}
 
-  const uint32_t frame = deadcells_frame_number.load();
-  // Only the real world composite samples the scene render target (e.g. 642x362).
-  // Loading/transition frames draw a 1x1 fill and menus draw art atlases first -
-  // tone mapping those produced the light-blue loading screen.
-  if (replace) replace = DeadCellsDraw0SamplesRenderTarget(cmd_list, frame);
-    if (false) {  // debug logging disabled
-    uint32_t rt_width = 0;
-    uint32_t rt_height = 0;
-    const bool is_backbuffer = renodx::utils::swapchain::HasBackBufferRenderTarget(cmd_list);
-    auto* state = renodx::utils::swapchain::GetCurrentState(cmd_list);
-    if (state != nullptr && !state->current_render_targets.empty()
-        && state->current_render_targets[0].handle != 0u) {
-      auto* device = cmd_list->get_device();
-      auto resource = device->get_resource_from_view(state->current_render_targets[0]);
-      auto desc = device->get_resource_desc(resource);
-      rt_width = desc.texture.width;
-      rt_height = desc.texture.height;
-    }
-    std::stringstream s;
-    s << "DC-DEBUG frame " << frame
-      << " draw#" << draw_index
-      << " RT " << rt_width << "x" << rt_height
-      << " backbuffer=" << is_backbuffer
-      << " replace=" << replace;
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
-  }
-    if (!replace) {
-    // Put the game's original shader back so our replacement doesn't
-    // leak into the following draws (Heaps doesn't re-bind it itself).
-    auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
-    if (shader_state != nullptr) {
-      auto* pixel_state = renodx::utils::shader::GetCurrentPixelState(shader_state);
-      if (pixel_state->pipeline.handle != 0u) {
-        cmd_list->bind_pipeline(pixel_state->applied_stage, pixel_state->pipeline);
-      }
-    }
-  }
+// on_replace callback: true = use our replacement for this draw.
+bool OnWorldCompositeDraw(reshade::api::command_list* cmd_list) {
+  const bool is_first_draw = (world_composite_draw_count.fetch_add(1) == 0);
+  const bool replace = is_first_draw && PixelT0IsRenderTarget(cmd_list);
+  if (!replace) RebindOriginalPixelShader(cmd_list);
   return replace;
 }
 
@@ -121,7 +86,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x40BF5761),  // glow add pass, scaled by Glow Strength slider
     CustomShaderEntry(0x0A271311),  // minimap/map, clamped to 0..1
     CustomShaderEntry(0x8F0EAF1C),  // main sprite + smoke shader (clamped outputs)
-    CustomShaderEntryCallback(0x48C1C006, &DeadCellsWorldCompositeGate),
+    CustomShaderEntryCallback(0x48C1C006, &OnWorldCompositeDraw),  // world composite only
 };
 
 ShaderInjectData shader_injection;
@@ -486,14 +451,15 @@ void OnPresent(reshade::api::command_queue* queue,
   }
 }
 
+// Registered unconditionally (the template's OnPresent above is only
+// registered when "Use Display Proxy" is on).
 void OnPresentFrameReset(reshade::api::command_queue* queue,
                          reshade::api::swapchain* swapchain,
                          const reshade::api::rect* source_rect,
                          const reshade::api::rect* dest_rect,
                          uint32_t dirty_rect_count,
                          const reshade::api::rect* dirty_rects) {
-  deadcells_world_composite_counter = 0;
-  deadcells_frame_number.fetch_add(1);
+  world_composite_draw_count = 0;
 }
 
 bool initialized = false;
@@ -508,7 +474,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::present>(OnPresentFrameReset);
-      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsTrackT0);
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -679,7 +645,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::present>(OnPresentFrameReset);
-      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptorsTrackT0);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_addon(h_module);
       break;

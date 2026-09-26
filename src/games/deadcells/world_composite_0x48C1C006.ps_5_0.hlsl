@@ -1,3 +1,6 @@
+// 0x48C1C006: Heaps' generic textured-quad shader. Shared by the world composite
+// and all UI icons - addon.cpp (OnWorldCompositeDraw) only swaps this in for the
+// world composite draw, so the tone map / Game Brightness never touch the UI.
 #include "./common.hlsl"
 
 Texture2D<float4> t0 : register(t0);
