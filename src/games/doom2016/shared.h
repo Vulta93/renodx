@@ -45,6 +45,12 @@ struct ShaderInjectData {
 #define RENODX_INTERMEDIATE_ENCODING         (RENODX_GAMMA_CORRECTION + 1.f)
 #define RENODX_SWAP_CHAIN_DECODING           RENODX_INTERMEDIATE_ENCODING
 #define RENODX_SWAP_CHAIN_ENCODING           ENCODING_SCRGB
+// Wide gamut: the scene is stored in the game's r11g11b10 buffer, which can't hold negative values.
+// Colours outside BT.709 are negative in BT.709 but positive in BT.2020, so the intermediate
+// (tonemap -> final pass -> swap chain proxy) is kept in BT.2020.
+#define RENODX_INTERMEDIATE_COLOR_SPACE      renodx::color::convert::COLOR_SPACE_BT2020
+#define RENODX_TONE_MAP_CLAMP_PEAK           renodx::color::convert::COLOR_SPACE_BT2020
+#define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE  renodx::color::convert::COLOR_SPACE_BT2020
 
 #ifndef __cplusplus
 // Vulkan: RenoDX appends its data as push constants. DOOM's post-process pipelines

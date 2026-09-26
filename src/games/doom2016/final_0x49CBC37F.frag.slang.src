@@ -240,6 +240,8 @@ void main()
     vec4 guiColor = tex2Dlod(samp_tex0, param_10);
     vec3 param_11 = guiColor.xyz;
     vec3 _633 = renodx::draw::DecodeColor(saturate(param_11), RENODX_INTERMEDIATE_ENCODING);
+    // RenoDX: scene is in RENODX_INTERMEDIATE_COLOR_SPACE (BT.2020); bring the UI into the same space
+    _633 = renodx::color::convert::ColorSpaces(_633, renodx::color::convert::COLOR_SPACE_BT709, RENODX_INTERMEDIATE_COLOR_SPACE);
     guiColor = vec4(_633.x, _633.y, _633.z, guiColor.w);
     float _637;
     if (freqLow_fragmentUniforms.rendermode.x == 0.0)
