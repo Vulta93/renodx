@@ -63,6 +63,43 @@ PushData gPush;
 #define shader_injection gPush.shader_injection
 
 #include "../../shaders/renodx.hlsl"
+
+// Extra tone mapper types (values of RENODX_TONE_MAP_TYPE set by addon.cpp's dropdown)
+#define DOOM2016_TONE_MAP_PSYCHOV_17 10.f
+#define DOOM2016_TONE_MAP_PSYCHOV_30 11.f
+
+// PsychoV tone mappers from renodx/src/shaders/tonemap/psychov (same call pattern as games/rotsp).
+// Input: linear BT.709, 1.0 = SDR diffuse white. Output: same units, bounded to BT.2020 at peak.
+float3 Doom2016PsychoV(float3 color, bool use_v30) {
+  float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+  [branch]
+  if (RENODX_GAMMA_CORRECTION != 0.f) {
+    peak = renodx::color::correct::Gamma(peak, true, RENODX_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f);
+  }
+  [branch]
+  if (use_v30) {
+    color = renodx::tonemap::psychov::psychotm_test30(
+        color, peak,
+        RENODX_TONE_MAP_EXPOSURE, RENODX_TONE_MAP_HIGHLIGHTS, RENODX_TONE_MAP_SHADOWS,
+        RENODX_TONE_MAP_CONTRAST, RENODX_TONE_MAP_SATURATION,
+        1.f, 100.f, 1.f, 1.f, 0,
+        1.f,                  // cone response exponent
+        0.18f, 0.18f,         // adaptation / background anchors (mid grey)
+        1.f, 1,               // gamut compression on, BT.2020 bound
+        1.f,
+        0.f);                 // compression: 0 = auto
+  } else {
+    color = renodx::tonemap::psychov::psychotm_test17(
+        color, peak,
+        RENODX_TONE_MAP_EXPOSURE, RENODX_TONE_MAP_HIGHLIGHTS, RENODX_TONE_MAP_SHADOWS,
+        RENODX_TONE_MAP_CONTRAST, RENODX_TONE_MAP_SATURATION,
+        1.f, 100.f, 1.f, 1.f, 0,
+        1.f,
+        0.18f, 0.18f,
+        1.f, 1, 1.f);
+  }
+  return color;
+}
 #endif
 
 #endif  // SRC_DOOM2016_SHARED_H_

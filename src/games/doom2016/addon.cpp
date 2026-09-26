@@ -87,7 +87,16 @@ void BuildCustomShaders() {
 
 renodx::utils::settings::Settings settings = renodx::templates::settings::JoinSettings({
     renodx::templates::settings::CreateDefaultSettings({
-        {"ToneMapType", {.binding = &shader_injection.tone_map_type}},
+        {"ToneMapType", {
+                            .binding = &shader_injection.tone_map_type,
+                            .labels = {"Vanilla", "RenoDRT", "PsychoV-17", "PsychoV-30"},
+                            // shader values: 0 = vanilla, 3 = RenoDRT, 10/11 = PsychoV (see shared.h)
+                            .parse = [](float value) {
+                              if (value >= 3.f) return 11.f;
+                              if (value >= 2.f) return 10.f;
+                              return value * 3.f;
+                            },
+                        }},
         {"ToneMapPeakNits", {.binding = &shader_injection.peak_white_nits}},
         {"ToneMapGameNits", {.binding = &shader_injection.diffuse_white_nits}},
         {"ToneMapUINits", {.binding = &shader_injection.graphics_white_nits}},
