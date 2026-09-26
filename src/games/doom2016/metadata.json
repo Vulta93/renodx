@@ -1,0 +1,14 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "doom2016",
+  "title": "DOOM (2016)",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "notes": [
+    "Vulkan renderer only"
+  ],
+  "deploy": {
+    "steam_appid": 379720
+  }
+}
