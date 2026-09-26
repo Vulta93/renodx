@@ -892,6 +892,27 @@ inline bool IsFullSubresourceUpdate(
          && static_cast<uint32_t>(box->back - box->front) == depth;
 }
 
+// Upload pointers come with a pitch but no byte count, and some games (Gujian 3) hand over
+// buffers smaller than the pitch-derived size. Clamp a read to the committed, readable
+// memory region so hashing can never walk off the end of the allocation.
+inline size_t ClampToReadableSize(const void* data, size_t size) {
+  if (data == nullptr || size == 0u) return 0u;
+  const auto start = reinterpret_cast<uintptr_t>(data);
+  uintptr_t cursor = start;
+  const uintptr_t end = start + size;
+  while (cursor < end) {
+    MEMORY_BASIC_INFORMATION info = {};
+    if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0u) break;
+    if (info.State != MEM_COMMIT) break;
+    if ((info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) break;
+    constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+                                | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((info.Protect & kReadable) == 0u) break;
+    cursor = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+  }
+  return static_cast<size_t>(std::min(cursor, end) - start);
+}
+
 inline std::optional<ResourceUploadSignature> BuildUploadSignature(
     const reshade::api::resource_desc& desc,
     const reshade::api::subresource_data& data,
@@ -913,15 +934,15 @@ inline std::optional<ResourceUploadSignature> BuildUploadSignature(
   const auto row_pitch = data.row_pitch != 0u
                              ? data.row_pitch
                              : reshade::api::format_row_pitch(desc.texture.format, width);
-  const auto slice_pitch = data.slice_pitch != 0u
-                               ? data.slice_pitch
-                               : reshade::api::format_slice_pitch(desc.texture.format, row_pitch, height);
+  // D3D11 ignores SysMemSlicePitch for 1D/2D textures, so games may leave garbage there
+  // (Gujian 3 passes a slice pitch larger than the buffer -> over-read crash). Derive it.
+  const auto slice_pitch = reshade::api::format_slice_pitch(desc.texture.format, row_pitch, height);
   if (slice_pitch == 0u) return std::nullopt;
 
   return ResourceUploadSignature{
       .source = source,
       .subresource = subresource,
-      .crc32 = utils::hash::ComputeCRC32(static_cast<const uint8_t*>(data.data), slice_pitch),
+      .crc32 = utils::hash::ComputeCRC32(static_cast<const uint8_t*>(data.data), ClampToReadableSize(data.data, slice_pitch)),
       .format = desc.texture.format,
       .width = width,
       .height = height,
