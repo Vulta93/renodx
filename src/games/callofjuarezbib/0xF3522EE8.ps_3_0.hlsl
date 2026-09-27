@@ -23,13 +23,19 @@ float4 main(float2 uv : TEXCOORD0) : COLOR {
   float dof = saturate(msk.w * 2.f - 1.f);
   float4 blur = tex2D(s_blur, uv);
   float blur_mix = saturate(max(blur.w, msk.z));
-  float3 glow = tex2D(s_glow, uv).rgb;
+  // Glow buffer is built with additive blending; vanilla stored it in 8-bit (clamped to 1).
+  // With upgraded (float16) targets it can stack far above 1 -> clamp like vanilla.
+  float3 glow = saturate(tex2D(s_glow, uv).rgb);
 
   float3 color;
   if (RENODX_TONE_MAP_TYPE > 0.f) {
     color = renodx::color::gamma::EncodeSafe(CoJUntonemapped(x, y), 2.f);
-    color = lerp(color, blur.rgb, dof);
-    color = lerp(color, blur.rgb, blur_mix);
+    // The DOF blur chain uses smaller 8-bit targets (upgrading them tints the whole
+    // image pink), so the blurred copy is capped at SDR white. Re-add the part of
+    // the sharp pixel above white so blurred areas (sky, distance) keep their HDR range.
+    float3 blur_hdr = saturate(blur.rgb) + max(0, color - saturate(color));
+    color = lerp(color, blur_hdr, dof);
+    color = lerp(color, blur_hdr, blur_mix);
     float lum = dot(color, 1.f / 3.f);
     color = lerp(color, lum, CONST_101.w);
     color = max(0, glow * CONST_100.z + color);
