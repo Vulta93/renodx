@@ -20,9 +20,6 @@
 namespace {
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-    // CustomShaderEntry(0x00000000),
-    // CustomSwapchainShader(0x00000000),
-    // BypassShaderEntry(0x00000000),
     __ALL_CUSTOM_SHADERS,
 };
 
@@ -350,51 +347,11 @@ renodx::utils::settings::Settings settings = {
     },
 };
 
-const std::unordered_map<std::string, reshade::api::format> UPGRADE_TARGETS = {
-    {"R8G8B8A8_TYPELESS", reshade::api::format::r8g8b8a8_typeless},
-    {"B8G8R8A8_TYPELESS", reshade::api::format::b8g8r8a8_typeless},
-    {"R8G8B8A8_UNORM", reshade::api::format::r8g8b8a8_unorm},
-    {"B8G8R8A8_UNORM", reshade::api::format::b8g8r8a8_unorm},
-    {"R8G8B8A8_SNORM", reshade::api::format::r8g8b8a8_snorm},
-    {"R8G8B8A8_UNORM_SRGB", reshade::api::format::r8g8b8a8_unorm_srgb},
-    {"B8G8R8A8_UNORM_SRGB", reshade::api::format::b8g8r8a8_unorm_srgb},
-    {"R10G10B10A2_TYPELESS", reshade::api::format::r10g10b10a2_typeless},
-    {"R10G10B10A2_UNORM", reshade::api::format::r10g10b10a2_unorm},
-    {"B10G10R10A2_UNORM", reshade::api::format::b10g10r10a2_unorm},
-    {"R11G11B10_FLOAT", reshade::api::format::r11g11b10_float},
-    {"R16G16B16A16_TYPELESS", reshade::api::format::r16g16b16a16_typeless},
-};
-
 void OnPresetOff() {
-  //   renodx::utils::settings::UpdateSetting("toneMapType", 0.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapPeakNits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapGameNits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapUINits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapGammaCorrection", 0);
-  //   renodx::utils::settings::UpdateSetting("colorGradeExposure", 1.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeHighlights", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeShadows", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeContrast", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeSaturation", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeLUTStrength", 100.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeLUTScaling", 0.f);
-}
-
-const auto UPGRADE_TYPE_NONE = 0.f;
-const auto UPGRADE_TYPE_OUTPUT_SIZE = 1.f;
-const auto UPGRADE_TYPE_OUTPUT_RATIO = 2.f;
-const auto UPGRADE_TYPE_ANY = 3.f;
-
-void OnPresent(reshade::api::command_queue* queue,
-               reshade::api::swapchain* swapchain,
-               const reshade::api::rect* source_rect,
-               const reshade::api::rect* dest_rect,
-               uint32_t dirty_rect_count,
-               const reshade::api::rect* dirty_rects) {
-  auto* device = queue->get_device();
-  if (device->get_api() == reshade::api::device_api::opengl) {
-    shader_injection.custom_flip_uv_y = 1.f;
-  }
+  renodx::utils::settings::UpdateSetting("ToneMapType", 0.f);
+  renodx::utils::settings::UpdateSetting("ToneMapPeakNits", 203.f);
+  renodx::utils::settings::UpdateSetting("ToneMapGameNits", 203.f);
+  renodx::utils::settings::UpdateSetting("ToneMapUINits", 203.f);
 }
 
 bool initialized = false;
@@ -505,28 +462,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           settings.push_back(setting);
         }
 
-        {
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "SwapChainDeviceProxy",
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 1.f,
-              .label = "Use Display Proxy",
-              .section = "Display Proxy",
-              .labels = {"Off", "On"},
-              .is_global = true,
-              .is_visible = []() { return current_settings_mode >= 2; },
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          bool use_device_proxy = setting->GetValue() == 1.f;
-          renodx::mods::swapchain::use_device_proxy = use_device_proxy;
-          renodx::mods::swapchain::set_color_space = !use_device_proxy;
-          if (use_device_proxy) {
-            reshade::register_event<reshade::addon_event::present>(OnPresent);
-          } else {
-            shader_injection.custom_flip_uv_y = 0.f;
-          }
-          settings.push_back(setting);
-        }
+        // DX9 has no HDR swap chain: always present through the D3D11 display proxy.
+        renodx::mods::swapchain::use_device_proxy = true;
+        renodx::mods::swapchain::set_color_space = false;
 
         {
           auto* setting = new renodx::utils::settings::Setting{
@@ -540,8 +478,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .is_visible = []() { return current_settings_mode >= 2; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          bool use_device_proxy =
-              renodx::mods::swapchain::device_proxy_wait_idle_source = (setting->GetValue() == 1.f);
+          renodx::mods::swapchain::device_proxy_wait_idle_source = (setting->GetValue() == 1.f);
           settings.push_back(setting);
         }
 
@@ -557,55 +494,27 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .is_visible = []() { return current_settings_mode >= 2; },
           };
           renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          bool use_device_proxy =
-              renodx::mods::swapchain::device_proxy_wait_idle_destination = (setting->GetValue() == 1.f);
+          renodx::mods::swapchain::device_proxy_wait_idle_destination = (setting->GetValue() == 1.f);
           settings.push_back(setting);
         }
 
-        for (const auto& [key, format] : UPGRADE_TARGETS) {
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "Upgrade_" + key,
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 0.f,
-              .label = key,
-              .section = "Resource Upgrades",
-              .labels = {
-                  "Off",
-                  "Output size",
-                  "Output ratio",
-                  "Any size",
-              },
-              .is_global = true,
-              .is_visible = []() { return settings[0]->GetValue() >= 2; },
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          settings.push_back(setting);
-
-          auto value = setting->GetValue();
-          if (value > 0) {
-            renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
-                .old_format = format,
-                .new_format = reshade::api::format::r16g16b16a16_float,
-                .ignore_size = (value == UPGRADE_TYPE_ANY),
-                .use_resource_view_cloning = true,
-                .aspect_ratio = static_cast<float>((value == UPGRADE_TYPE_OUTPUT_RATIO)
-                                                       ? renodx::mods::swapchain::SwapChainUpgradeTarget::BACK_BUFFER
-                                                       : renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
-                .usage_include = reshade::api::resource_usage::render_target,
-            });
-            std::stringstream s;
-            s << "Applying user resource upgrade for ";
-            s << format << ": " << value;
-            reshade::log::message(reshade::log::level::info, s.str().c_str());
-          }
-        }
+        // Back buffer + full-resolution intermediates are D3DFMT_A8R8G8B8. Upgrade only
+        // output-sized targets: "output ratio" also catches smaller buffers that rely on
+        // 8-bit clamping and tints the whole image pink.
+        renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+            .old_format = reshade::api::format::b8g8r8a8_unorm,
+            .new_format = reshade::api::format::r16g16b16a16_float,
+            .use_resource_view_cloning = true,
+            .aspect_ratio = static_cast<float>(renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
+            .usage_include = reshade::api::resource_usage::render_target,
+        });
+        reshade::log::message(reshade::log::level::info, "callofjuarezbib: upgrading b8g8r8a8_unorm render targets (output size)");
 
         initialized = true;
       }
 
       break;
     case DLL_PROCESS_DETACH:
-      reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_addon(h_module);
       break;
   }

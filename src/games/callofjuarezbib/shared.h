@@ -41,8 +41,8 @@ struct ShaderInjectData {
 
   float swap_chain_encoding;
   float swap_chain_encoding_color_space;
-  float custom_flip_uv_y;
   float padding0;
+  float padding1;
 };
 
 #ifndef __cplusplus
@@ -80,7 +80,6 @@ float4 shader_injection[8] : register(c50);
 #define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection[6][3]
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection[7][0]
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection[7][1]
-#define CUSTOM_FLIP_UV_Y                       shader_injection[7][2]
 
 #else
 
@@ -120,7 +119,6 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection.swap_chain_clamp_color_space
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection.swap_chain_encoding
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
-#define CUSTOM_FLIP_UV_Y                       shader_injection.custom_flip_uv_y
 
 #endif
 
