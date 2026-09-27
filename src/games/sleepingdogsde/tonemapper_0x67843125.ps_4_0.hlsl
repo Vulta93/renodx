@@ -72,6 +72,47 @@ void main(
   r0.xyz = r1.xyz / r0.xyz;
 
   // ---------------------------------------------------------------------------
+  // Hejl-Dawson Extended (4) - souperman9's approach: the game's own curve, extended
+  // linearly above mid grey, then a per-channel display map (neutwo) to Peak.
+  // The vanilla post-steps are kept, applied in linear light:
+  //   / cb0[0].y (white scale, gamma space)   -> / y^2.2
+  //   screen blend with bloom (gamma space)  -> exact up to white, no bloom added above it
+  //   pow(cb0[0].w) (brightness, gamma space) -> linear^w
+  // ---------------------------------------------------------------------------
+  if (injectedData.toneMapType >= 4.f) {
+    float white_scale = max(cbShaderParams.Value0.y, 1e-3f);
+    float brightness_gamma = max(cbShaderParams.Value0.w, 1e-3f);
+
+    float3 curve_input = max(0.f, untonemapped - 0.004f);
+    float3 ext = HejlDawson::ApplyExtended(curve_input, 2.2f);   // linear, vanilla below 0.18
+
+    float3 g = renodx::color::gamma::EncodeSafe(ext, 2.2f);        // to the game's gamma space
+    g /= white_scale;
+    float3 bloom_rgb = 1.f - r2.xyz;                                  // r2 = 1 - bloom
+    g = g + bloom_rgb * (1.f - saturate(g));                          // screen blend, capped at white
+    float3 color = pow(max(0.f, g), 2.2f * brightness_gamma);        // back to linear, with brightness
+
+    color = renodx::color::grade::UserColorGrading(
+        color,
+        injectedData.colorGradeExposure,
+        injectedData.colorGradeHighlights,
+        injectedData.colorGradeShadows,
+        injectedData.colorGradeContrast,
+        injectedData.colorGradeSaturation);
+
+    // Brightest value the game can deliver (x = 5) through the same chain -> maps to Peak.
+    float source_max = pow(
+        renodx::color::gamma::Encode(HejlDawson::ApplyExtended(4.996f, 2.2f), 2.2f) / white_scale,
+        2.2f * brightness_gamma);
+    float peak = injectedData.toneMapPeakNits / injectedData.toneMapGameNits;
+    color = renodx::tonemap::neutwo::PerChannel(max(0.f, color), peak.xxx, max(source_max, peak).xxx);
+
+    o0.rgb = renodx::draw::RenderIntermediatePass(color);
+    o0.w = 1;
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
   // RenoDRT (3): grade-transfer path.
   // 1. Build the complete vanilla SDR image (curve, white scale, bloom, brightness),
   //    clipped at white like the original 8-bit output.
@@ -80,7 +121,7 @@ void main(
   // 3. Tone map that to the display with RenoDRT (neutral settings).
   // The vanilla post-steps below are NOT run on this path (already in the SDR image).
   // ---------------------------------------------------------------------------
-  if (injectedData.toneMapType >= 3.f) {
+  if (injectedData.toneMapType == 3.f) {
     float3 vanilla_gamma = r0.xyz / cbShaderParams.Value0.yyy;            // white scale
     vanilla_gamma = 1.f - r2.xyz * (1.f - vanilla_gamma);                  // screen blend with bloom
     vanilla_gamma = pow(saturate(vanilla_gamma), cbShaderParams.Value0.w); // brightness (8-bit clip)
