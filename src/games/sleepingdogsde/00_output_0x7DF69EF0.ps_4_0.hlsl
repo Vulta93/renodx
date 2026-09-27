@@ -39,5 +39,13 @@ void main(
 
   o0.rgb = pow(abs(o0.rgb), 2.2f);
   o0.rgb *= injectedData.toneMapUINits / 80.f;
+
+  // Safety cap: nothing may exceed Peak Brightness (UI glow flashes reached 4000+ nits).
+  // Scale by the brightest channel so hue is preserved.
+  float peak_scrgb = injectedData.toneMapPeakNits / 80.f;
+  float max_channel = max(o0.r, max(o0.g, o0.b));
+  if (injectedData.toneMapType != 0.f && max_channel > peak_scrgb) {
+    o0.rgb *= peak_scrgb / max_channel;
+  }
   return;
 }
