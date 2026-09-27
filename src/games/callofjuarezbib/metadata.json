@@ -1,0 +1,14 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "callofjuarezbib",
+  "title": "Call of Juarez: Bound in Blood",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "deploy": {
+    "steam_appid": 21980,
+    "architecture": [
+      "x86"
+    ]
+  }
+}
