@@ -71,12 +71,12 @@ void main(
   r0.xyz = r1.xyz / r0.xyz;
 
   // ---------------------------------------------------------------------------
-  // RenoDRT (3), PsychoV-17 (4), PsychoV-30 (5): grade-transfer path.
+  // RenoDRT (3): grade-transfer path.
   // 1. Build the complete vanilla SDR image (curve, white scale, bloom, brightness),
   //    clipped at white like the original 8-bit output.
   // 2. UpgradeToneMap: keep the vanilla look (colour + contrast) in the SDR range and
   //    add the extra HDR highlight range from the untonemapped scene on top.
-  // 3. Tone map that to the display with RenoDRT / PsychoV (neutral settings).
+  // 3. Tone map that to the display with RenoDRT (neutral settings).
   // The vanilla post-steps below are NOT run on this path (already in the SDR image).
   // ---------------------------------------------------------------------------
   if (injectedData.toneMapType >= 3.f) {
@@ -93,56 +93,29 @@ void main(
         1.f);
 
     float3 hdr_color;
-    [branch]
-    if (injectedData.toneMapType >= 4.f) {
-      float peak = injectedData.toneMapPeakNits / injectedData.toneMapGameNits;
-      [branch]
-      if (injectedData.toneMapType >= 5.f) {
-        hdr_color = renodx::tonemap::psychov::psychotm_test30(
-            graded, peak,
-            injectedData.colorGradeExposure, injectedData.colorGradeHighlights, injectedData.colorGradeShadows,
-            injectedData.colorGradeContrast, injectedData.colorGradeSaturation,
-            1.f, 100.f, 1.f, 1.f, 0,
-            1.f,           // cone response exponent
-            0.18f, 0.18f,  // adaptation / background anchors (mid grey)
-            1.f, 0,        // gamut compression on, BT.709 bound (output pass drops negatives)
-            1.f,
-            0.f);          // compression: 0 = auto
-      } else {
-        hdr_color = renodx::tonemap::psychov::psychotm_test17(
-            graded, peak,
-            injectedData.colorGradeExposure, injectedData.colorGradeHighlights, injectedData.colorGradeShadows,
-            injectedData.colorGradeContrast, injectedData.colorGradeSaturation,
-            1.f, 100.f, 1.f, 1.f, 0,
-            1.f,
-            0.18f, 0.18f,
-            1.f, 0, 1.f);
-      }
-    } else {
-      renodx::tonemap::Config drt = renodx::tonemap::config::Create();
-      drt.type = renodx::tonemap::config::type::RENODRT;
-      drt.peak_nits = injectedData.toneMapPeakNits;
-      drt.game_nits = injectedData.toneMapGameNits;
-      drt.exposure = injectedData.colorGradeExposure;
-      drt.highlights = injectedData.colorGradeHighlights;
-      drt.shadows = injectedData.colorGradeShadows;
-      drt.contrast = injectedData.colorGradeContrast;
-      drt.saturation = injectedData.colorGradeSaturation;
-      drt.reno_drt_highlights = 1.0f;
-      drt.reno_drt_shadows = 1.0f;
-      drt.reno_drt_contrast = 1.0f;
-      drt.reno_drt_saturation = 1.0f;
-      drt.reno_drt_dechroma = injectedData.colorGradeBlowout;
-      drt.reno_drt_flare = 0.f;
-      // The scene buffer stores y = 1.04x / (x + 0.2) in a 0..1 target, so the brightest
-      // value the game can ever deliver is x = 0.2 / (1.04 - 1) = 5. RenoDRT's default curve
-      // (Daniele) only reaches peak for inputs ~128-256x brighter, so x = 5 landed at ~588 nits
-      // no matter the Peak setting. Use the Reinhard method (like most RenoDX game mods) with
-      // the white clip at the real source maximum (RenoDRT raises it to at least peak).
-      drt.reno_drt_tone_map_method = renodx::tonemap::renodrt::config::tone_map_method::REINHARD;
-      drt.reno_drt_white_clip = 5.f;
-      hdr_color = renodx::tonemap::config::Apply(graded, drt);
-    }
+    renodx::tonemap::Config drt = renodx::tonemap::config::Create();
+    drt.type = renodx::tonemap::config::type::RENODRT;
+    drt.peak_nits = injectedData.toneMapPeakNits;
+    drt.game_nits = injectedData.toneMapGameNits;
+    drt.exposure = injectedData.colorGradeExposure;
+    drt.highlights = injectedData.colorGradeHighlights;
+    drt.shadows = injectedData.colorGradeShadows;
+    drt.contrast = injectedData.colorGradeContrast;
+    drt.saturation = injectedData.colorGradeSaturation;
+    drt.reno_drt_highlights = 1.0f;
+    drt.reno_drt_shadows = 1.0f;
+    drt.reno_drt_contrast = 1.0f;
+    drt.reno_drt_saturation = 1.0f;
+    drt.reno_drt_dechroma = injectedData.colorGradeBlowout;
+    drt.reno_drt_flare = 0.f;
+    // The scene buffer stores y = 1.04x / (x + 0.2) in a 0..1 target, so the brightest
+    // value the game can ever deliver is x = 0.2 / (1.04 - 1) = 5. RenoDRT's default curve
+    // (Daniele) only reaches peak for inputs ~128-256x brighter, so x = 5 landed at ~588 nits
+    // no matter the Peak setting. Use the Reinhard method (like most RenoDX game mods) with
+    // the white clip at the real source maximum (RenoDRT raises it to at least peak).
+    drt.reno_drt_tone_map_method = renodx::tonemap::renodrt::config::tone_map_method::REINHARD;
+    drt.reno_drt_white_clip = 5.f;
+    hdr_color = renodx::tonemap::config::Apply(graded, drt);
 
     // Same output convention as below: gamma 2.2 value, scaled so the output pass
     // (pow 2.2 x UI nits) lands the world at Game Brightness.
