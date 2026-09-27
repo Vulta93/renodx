@@ -84,6 +84,19 @@ void main(
     config.type = injectedData.toneMapType;
     config.peak_nits = injectedData.toneMapPeakNits;
     config.game_nits = injectedData.toneMapGameNits;
+
+    // The vanilla post-steps below still run after Apply(): divide by cb0[0].y (white-point
+    // scale, ~0.87) and pow(cb0[0].w) (in-game Brightness), both in gamma 2.2 space.
+    // For the brightest pixels they turn Apply()'s maximum M into M^w / y^(2.2*w),
+    // which pushed highlights ~35% past Peak Brightness. Pre-compensate the peak handed
+    // to the tonemapper so the FINAL output tops out exactly at Peak Brightness.
+    float white_scale = cbShaderParams.Value0.y;
+    float brightness_gamma = cbShaderParams.Value0.w;
+    if (white_scale > 0.f && brightness_gamma > 0.f) {
+      float target_max = injectedData.toneMapPeakNits / injectedData.toneMapGameNits;
+      float compensated_max = pow(target_max * pow(white_scale, 2.2f * brightness_gamma), 1.f / brightness_gamma);
+      config.peak_nits = compensated_max * injectedData.toneMapGameNits;
+    }
     config.exposure = injectedData.colorGradeExposure;
     config.highlights = injectedData.colorGradeHighlights;
     config.shadows = injectedData.colorGradeShadows;
