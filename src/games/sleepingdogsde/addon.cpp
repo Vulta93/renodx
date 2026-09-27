@@ -36,7 +36,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "None", "ACES", "RenoDRT"},
+        .labels = {"Vanilla", "None", "ACES", "RenoDRT", "PsychoV-17", "PsychoV-30"},
     },
     new renodx::utils::settings::Setting{
         .key = "toneMapPeakNits",
@@ -131,7 +131,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 50.f,
         .label = "Blowout",
         .section = "Color Grading",
-        .tooltip = "Controls highlight desaturation due to overexposure.",
+        .tooltip = "Controls highlight desaturation due to overexposure. RenoDRT only.",
         .max = 100.f,
         .parse = [](float value) { return value * 0.01f; },
     },
