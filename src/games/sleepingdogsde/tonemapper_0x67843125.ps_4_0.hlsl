@@ -1,4 +1,5 @@
 #include "./shared.h"
+#include "./hejldawson_extended.hlsli"
 
 cbuffer cbShaderParams : register(b0) {
   struct
@@ -85,10 +86,16 @@ void main(
     vanilla_gamma = pow(saturate(vanilla_gamma), cbShaderParams.Value0.w); // brightness (8-bit clip)
     float3 vanilla_sdr = pow(vanilla_gamma, 2.2f);                         // to linear
 
-    float3 hdr_input = max(0.f, untonemapped);
+    // Vanilla curve input (same -0.004 toe as the game), then the game's own
+    // Hejl-Dawson curve extended linearly above 0.18 (souperman9's hejldawson_extended):
+    // identical to vanilla below mid grey, slope-matched linear HDR above it.
+    float3 curve_input = max(0.f, untonemapped - 0.004f);
+    float3 vanilla_curve = HejlDawson::ApplyLinear(curve_input, 2.2f);
+    float3 hdr_input = HejlDawson::ApplyExtended(curve_input, vanilla_curve, 2.2f);
+    // Transfer the vanilla post-steps (white scale, bloom, brightness) onto the extension.
     float3 graded = renodx::tonemap::UpgradeToneMap(
         hdr_input,
-        renodx::tonemap::renodrt::NeutralSDR(hdr_input),
+        vanilla_curve,
         vanilla_sdr,
         1.f);
 
@@ -114,26 +121,21 @@ void main(
     // no matter the Peak setting. Use the Reinhard method (like most RenoDX game mods) with
     // the white clip at the real source maximum (RenoDRT raises it to at least peak).
     drt.reno_drt_tone_map_method = renodx::tonemap::renodrt::config::tone_map_method::REINHARD;
-    drt.reno_drt_white_clip = 5.f;
+    // Brightest value the game can deliver (x = 5) after extension + grade transfer:
+    // SDR white (1) + (extended - vanilla curve) at x = 5.
+    drt.reno_drt_white_clip = 1.f + HejlDawson::ApplyExtended(4.996f, 2.2f) - HejlDawson::ApplyLinear(4.996f, 2.2f);
     hdr_color = renodx::tonemap::config::Apply(graded, drt);
 
-    // Same output convention as below: gamma 2.2 value, scaled so the output pass
-    // (pow 2.2 x UI nits) lands the world at Game Brightness.
-    hdr_color = max(0.f, hdr_color) * (injectedData.toneMapGameNits / injectedData.toneMapUINits);
-    o0.rgb = pow(hdr_color, 1.f / 2.2f);
+    // Standard RenoDX intermediate: scale Game -> UI nits and gamma 2.2 encode;
+    // SwapChainPass in the output shader undoes it.
+    o0.rgb = renodx::draw::RenderIntermediatePass(max(0.f, hdr_color));
     o0.w = 1;
     return;
   }
 
   if (injectedData.toneMapType != 0.f) {
-    float midgray = 0.18f;
-    midgray = max(0, midgray - 0.004f);
-    float midgray_r1 = midgray * 6.2f + 0.5f;
-    midgray_r1 = midgray_r1 * midgray;
-    float midgray_r3 = midgray * 6.2f + 1.7f;
-    midgray = midgray * midgray_r3 + 0.06f;
-    midgray = midgray_r1 / midgray;
-    midgray = pow(midgray, 2.2f);
+    // Vanilla Hejl-Dawson output for 0.18 input, linearised: HBD(0.18 - 0.004)^2.2.
+    const float midgray = 0.2254f;
 
     renodx::tonemap::Config config = renodx::tonemap::config::Create();
     config.type = injectedData.toneMapType;
@@ -189,15 +191,8 @@ void main(
   o0.w = 1;
 
   // o0.rgb = pow(cbShaderParams.Value0.yyy, 1.f/2.2f);
-  float3 signs = sign(o0.rgb);
-  o0.rgb = abs(o0.rgb);
-  o0.rgb = pow(o0.rgb, 2.2f);
-  o0.rgb *= injectedData.toneMapGameNits / injectedData.toneMapUINits;
-  o0.rgb = pow(o0.rgb, 1.f / 2.2f);
-  o0.rgb *= signs;
-  // o0.rgb = r2.xyz;
-  // if (o0.r <= 1.f) o0.r = 0;
-  // if (o0.g <= 1.f) o0.g = 0;
-  // if (o0.b <= 1.f) o0.b = 0;
+  // Vanilla / None / ACES: o0 is gamma 2.2 here. Linearise and hand it to the
+  // standard RenoDX intermediate pass (Game -> UI nits scaling + gamma 2.2 encode).
+  o0.rgb = renodx::draw::RenderIntermediatePass(renodx::color::gamma::DecodeSafe(o0.rgb));
   return;
 }
