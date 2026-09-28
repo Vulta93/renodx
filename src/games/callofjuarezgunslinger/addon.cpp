@@ -388,12 +388,22 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "FxHighlightStart",
         .binding = &shader_injection.highlight_start,
-        .default_value = 65.f,
+        .default_value = 50.f,
         .label = "HDR Highlight Start",
         .section = "Effects",
         .tooltip = "Brightness (% of white, linear) above which the image is expanded to HDR. Below it stays vanilla.",
         .max = 95.f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FxShadowLift",
+        .binding = &shader_injection.shadow_lift,
+        .default_value = 100.f,
+        .label = "Shadow Lift",
+        .section = "Effects",
+        .tooltip = "Brightens dark and mid tones (like the game's brightness option); white is unchanged.",
+        .max = 250.f,
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{

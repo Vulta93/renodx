@@ -58,7 +58,7 @@ float3 CoJGrade(float3 c, float noise) {
 
 // SDR -> HDR expansion. With correct lighting the game renders almost nothing above
 // white, so HDR is created from the finished vanilla image: luminance below the
-// "Highlight Start" knee is untouched (vanilla), above it an inverse-Reinhard style curve
+// "Highlight Start" knee is untouched (vanilla), above it a quadratic curve
 // (slope 1 at the knee, continuous) maps white (1.0) to R x game white, where
 // R = lerp(1, peak / game, "HDR Boost"). Hue is kept (luminance scaling).
 float3 CoJExpandHDR(float3 sdr) {
@@ -69,10 +69,12 @@ float3 CoJExpandHDR(float3 sdr) {
   float y = max(0, renodx::color::y::from::BT709(sdr));
   if (y <= knee || r <= 1.f || knee >= 1.f) return sdr;
 
-  float m = (r - knee) / (1.f - knee);  // expanded span at t = 1
-  float a = 1.f - 1.f / m;
+  // Quadratic: slope 1 at the knee, ends at r. Max slope 2m-1 (the old inverse-Reinhard
+  // curve reached ~35x at white and amplified every 8-bit step / texture wobble near white
+  // into "boiling" clouds).
+  float m = (r - knee) / (1.f - knee);
   float t = saturate((y - knee) / (1.f - knee));
-  float y_new = knee + (1.f - knee) * t / (1.f - a * t);
+  float y_new = knee + (1.f - knee) * (t + (m - 1.f) * t * t);
   return sdr * (y_new / y);
 }
 
@@ -104,11 +106,21 @@ float4 main(float2 uv : TEXCOORD0
   color = saturate(lerp(color, blur.rgb, blur.a));
 #endif
   color = saturate(glow * glow_scale + color);
-  color = CoJGrade(color, noise);
+  float3 graded = CoJGrade(color, noise);
 
   if (RENODX_TONE_MAP_TYPE > 0.f) {
-    color = CoJExpandHDR(color);
+    // Expansion factor from the noise-free image: film grain near white is otherwise
+    // amplified by the steep part of the curve ("boiling" bright clouds).
+#if COJ_NOISE
+    float3 clean = CoJGrade(color, 0.f);
+#else
+    float3 clean = graded;
+#endif
+    float y_clean = renodx::color::y::from::BT709(clean);
+    float y_expanded = renodx::color::y::from::BT709(CoJExpandHDR(clean));
+    graded *= (y_clean > 0.f) ? (y_expanded / y_clean) : 1.f;
   }
+  color = graded;
 
 #if COJ_OVERLAY
   color *= tex2Dlod(s_overlay, uv_lod).rgb;

@@ -14,7 +14,10 @@ float4 main(float2 uv : TEXCOORD0) : COLOR {
   // (e.g. pow(x, 0.8) then sRGB decode ~ x^1.8) it explodes highlights. Apply it to the
   // colour normalised by its max channel and scale the result back linearly.
   float scale = max(1.f, max(linear_color.r, max(linear_color.g, linear_color.b)));
-  float3 encoded = renodx::math::SignPow(linear_color / scale, GAMMA.y);
+  // Shadow Lift: same mechanism as the game's brightness option (smaller exponent),
+  // white stays white. 100% = exponent x0.7, 250% = x0.25.
+  float gamma_exp = GAMMA.y * (1.f - 0.3f * clamp(CUSTOM_SHADOW_LIFT, 0.f, 2.5f));
+  float3 encoded = renodx::math::SignPow(linear_color / scale, gamma_exp);
   float3 color = renodx::color::srgb::DecodeSafe(encoded) * scale;
   color = renodx::draw::RenderIntermediatePass(color);
 
