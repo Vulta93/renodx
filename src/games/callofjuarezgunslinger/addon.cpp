@@ -7,6 +7,9 @@
 
 #define DEBUG_LEVEL_0
 
+#include <atomic>
+#include <sstream>
+
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
@@ -15,12 +18,110 @@
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/shader.hpp"
 #include "./shared.h"
 
 namespace {
 
+// The final gamma pass 0x4003CC02 decodes the HDR encoding written by our composite
+// replacements. Screens drawn through a composite we don't replace (e.g. menus) must not
+// be decoded: then the original final shader is used for that frame.
+std::atomic<bool> composite_ran_this_frame = false;
+
+bool OnCompositeDraw(reshade::api::command_list* cmd_list) {
+  composite_ran_this_frame = true;
+  return true;
+}
+
+void RebindOriginalPixelShader(reshade::api::command_list* cmd_list) {
+  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (shader_state == nullptr) return;
+  auto* pixel_state = renodx::utils::shader::GetCurrentPixelState(shader_state);
+  if (pixel_state->pipeline.handle == 0u) return;
+  cmd_list->bind_pipeline(pixel_state->applied_stage, pixel_state->pipeline);
+}
+
+bool OnFinalGammaDraw(reshade::api::command_list* cmd_list) {
+  if (composite_ran_this_frame.exchange(false)) return true;
+  RebindOriginalPixelShader(cmd_list);
+  return false;
+}
+
+void OnPresentFrameReset(reshade::api::command_queue* queue,
+                         reshade::api::swapchain* swapchain,
+                         const reshade::api::rect* source_rect,
+                         const reshade::api::rect* dest_rect,
+                         uint32_t dirty_rect_count,
+                         const reshade::api::rect* dirty_rects) {
+  composite_ran_this_frame = false;
+}
+
 renodx::mods::shader::CustomShaders custom_shaders = {
-    __ALL_CUSTOM_SHADERS,
+    CustomShaderEntryCallback(0x4003CC02, &OnFinalGammaDraw),
+    CustomShaderEntryCallback(0x001F451B, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x04E01654, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x07BB9390, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x09F8CAF8, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x1ECEB053, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x2ED8B94F, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x2F3DCE6A, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x310E685A, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x34E96937, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x378B0930, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x3865D913, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x39D77EB2, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x40A30215, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x462A1F05, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x46B381C2, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x4761B27F, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x4A81411D, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x507DCC48, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x54D3D4B8, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x59F018C2, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x5F06CE55, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x63A564B8, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x6B3F60A0, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x7336A671, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x75771E7A, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x7C37DC48, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x7FA3041A, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x80C1F10C, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x81580623, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x8A7A7779, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x9209FC07, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x93580769, &OnCompositeDraw),
+    CustomShaderEntryCallback(0x970A48F0, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xA17C9960, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xA2079816, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xA31546FA, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xAA8A7660, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xB10574E4, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xB36C5C28, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xB8846E56, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xBD80EAE0, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xBE36C389, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xC0A97E66, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xC353D967, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xC3BCCD1C, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xC3EDB339, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xC5ECA26A, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xC63F3B62, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xCD4A7D86, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xCF3D618F, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xD2C19E56, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xD2CD2C54, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xD58D386E, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xE20AB5D1, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xE4A8C037, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xE55FFEE5, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xE88DDDE7, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xE8CDF0C1, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xEA7F6AB5, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xEDA3CA37, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xEE5049A5, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xEFAC5450, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xFB9AEC46, &OnCompositeDraw),
+    CustomShaderEntryCallback(0xFECF4F1D, &OnCompositeDraw),
 };
 
 ShaderInjectData shader_injection;
@@ -87,7 +188,7 @@ renodx::utils::settings::Settings settings = {
         .key = "GammaCorrection",
         .binding = &shader_injection.gamma_correction,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = 0.f,
         .label = "Gamma Correction",
         .section = "Tone Mapping",
         .tooltip = "Emulates a display EOTF.",
@@ -121,7 +222,7 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapHueProcessor",
         .binding = &shader_injection.tone_map_hue_processor,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
+        .default_value = 2.f,
         .label = "Hue Processor",
         .section = "Tone Mapping",
         .tooltip = "Selects hue processor",
@@ -145,7 +246,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ToneMapHueShift",
         .binding = &shader_injection.tone_map_hue_shift,
-        .default_value = 50.f,
+        .default_value = 0.f,
         .label = "Hue Shift",
         .section = "Tone Mapping",
         .tooltip = "Hue-shift emulation strength.",
@@ -274,31 +375,31 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "FxHighlightStrength",
-        .binding = &shader_injection.highlight_strength,
-        .default_value = 80.f,
-        .label = "HDR Highlight Strength",
+        .key = "FxHDRBoost",
+        .binding = &shader_injection.hdr_boost,
+        .default_value = 30.f,
+        .label = "HDR Boost",
         .section = "Effects",
-        .tooltip = "How far above white the scene's brightest parts go.\nThe game lights sunlit ground far above white and relied on clipping it.",
+        .tooltip = "How far above paper white the brightest parts of the image go (100 = Peak Brightness).",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
-        .key = "FxHighlightHue",
-        .binding = &shader_injection.highlight_hue,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
-        .label = "Highlight Color",
+        .key = "FxHighlightStart",
+        .binding = &shader_injection.highlight_start,
+        .default_value = 65.f,
+        .label = "HDR Highlight Start",
         .section = "Effects",
-        .tooltip = "Vanilla: bright surfaces take the colour of the clipped (washed-out white) image.\nNatural: bright surfaces keep their real colour (sunlit sand stays sand).",
-        .labels = {"Vanilla", "Natural"},
+        .tooltip = "Brightness (% of white, linear) above which the image is expanded to HDR. Below it stays vanilla.",
+        .max = 95.f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
         .key = "FxGlow",
         .binding = &shader_injection.glow_strength,
-        .default_value = 80.f,
+        .default_value = 100.f,
         .label = "Glow",
         .section = "Effects",
         .tooltip = "Strength of the game's glow (bloom)",
@@ -398,6 +499,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
+      reshade::register_event<reshade::addon_event::present>(OnPresentFrameReset);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -531,16 +633,45 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           settings.push_back(setting);
         }
 
+        // DEBUG: global toggle (needs a game restart) to test what the upgrade changes.
+        {
+          auto* setting = new renodx::utils::settings::Setting{
+              .key = "DebugUpgradeTargets",
+              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+              .default_value = 1.f,
+              .label = "DEBUG: Upgrade Render Targets (restart)",
+              .section = "Debug",
+              .labels = {"Off", "On"},
+              .is_global = true,
+          };
+          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
+          settings.push_back(setting);
+          if (setting->GetValue() == 0.f) {
+            reshade::log::message(reshade::log::level::info, "callofjuarezgunslinger: DEBUG render target upgrades OFF");
+            initialized = true;
+            break;
+          }
+        }
+
         // Full-resolution intermediates are D3DFMT_A8R8G8B8 (as in Bound in Blood). Upgrade only
         // output-sized targets: "output ratio" also catches smaller buffers that rely on
         // 8-bit clamping and tints the whole image pink.
-        renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
-            .old_format = reshade::api::format::b8g8r8a8_unorm,
-            .new_format = reshade::api::format::r16g16b16a16_float,
-            .use_resource_view_cloning = true,
-            .aspect_ratio = static_cast<float>(renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
-            .usage_include = reshade::api::resource_usage::render_target,
-        });
+        // Full-resolution b8g8r8a8 targets, by creation order: #0 G-buffer depth, #1 scene
+        // colour (+ final gamma output), #2 G-buffer RT0 (+ composite output), #3 G-buffer
+        // RT1, #4. #2 stays 8-bit: geometry/decals blend into it relying on 8-bit clamping,
+        // as float16 sunlit ground blows out to white. The composite therefore writes HDR
+        // into it with an invertible RGB encoding (see common.hlsli / 0x4003CC02).
+        for (int i = 0; i < 32; ++i) {
+          if (i == 2) continue;
+          renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+              .old_format = reshade::api::format::b8g8r8a8_unorm,
+              .new_format = reshade::api::format::r16g16b16a16_float,
+              .index = i,
+              .use_resource_view_cloning = true,
+              .aspect_ratio = static_cast<float>(renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
+              .usage_include = reshade::api::resource_usage::render_target,
+          });
+        }
         // The D3D9 back buffer is D3DFMT_X8R8G8B8.
         renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
             .old_format = reshade::api::format::b8g8r8x8_unorm,
@@ -549,13 +680,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
             .aspect_ratio = static_cast<float>(renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
             .usage_include = reshade::api::resource_usage::render_target,
         });
-        reshade::log::message(reshade::log::level::info, "callofjuarezgunslinger: upgrading b8g8r8a8/b8g8r8x8_unorm render targets (output size)");
+        reshade::log::message(reshade::log::level::info, "callofjuarezgunslinger: upgrading b8g8r8a8/b8g8r8x8 render targets (output size)");
 
         initialized = true;
       }
 
       break;
     case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::present>(OnPresentFrameReset);
       reshade::unregister_addon(h_module);
       break;
   }

@@ -7,8 +7,8 @@
 // (s_crv, optionally in gamma 2.2), levels, colorize and an overlay multiply.
 // The result is linear; the final pass 0x4003CC02 applies GAMMA.
 //
-// HDR: the scene target is upgraded to float16, so clr holds values above 1. The vanilla
-// grade runs on the clipped (vanilla) colour; the luminance above white is added back.
+// HDR: with the packed-depth target left 8-bit the lit scene is essentially SDR, so the
+// vanilla image is rebuilt exactly and its highlights are expanded (CoJExpandHDR).
 #include "./common.hlsli"
 
 static const float3 COJ_LUMA = float3(0.2125f, 0.7154f, 0.0721f);
@@ -56,15 +56,24 @@ float3 CoJGrade(float3 c, float noise) {
   return c;
 }
 
-// Sunlit ground sits a few times above white in the raw scene (the game clipped it).
-// Scale the part above white by the "HDR Highlight Strength" slider for moderate
-// excess (ground), easing back to full strength for extreme excess (sun, fire, flashes)
-// so those still reach peak. excess is in units of vanilla white.
-static const float COJ_EXCESS_KNEE = 8.f;
-float3 CoJScaleExcess(float3 excess) {
-  float3 t = excess / COJ_EXCESS_KNEE;
-  float3 w = (t * t) / (1.f + t * t);  // 0 for small excess -> 1 for large
-  return excess * lerp(CUSTOM_HIGHLIGHT_STRENGTH, 1.f, w);
+// SDR -> HDR expansion. With correct lighting the game renders almost nothing above
+// white, so HDR is created from the finished vanilla image: luminance below the
+// "Highlight Start" knee is untouched (vanilla), above it an inverse-Reinhard style curve
+// (slope 1 at the knee, continuous) maps white (1.0) to R x game white, where
+// R = lerp(1, peak / game, "HDR Boost"). Hue is kept (luminance scaling).
+float3 CoJExpandHDR(float3 sdr) {
+  float knee = saturate(CUSTOM_HIGHLIGHT_START);
+  float peak_ratio = max(1.f, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
+  float r = lerp(1.f, peak_ratio, saturate(CUSTOM_HDR_BOOST));
+
+  float y = max(0, renodx::color::y::from::BT709(sdr));
+  if (y <= knee || r <= 1.f || knee >= 1.f) return sdr;
+
+  float m = (r - knee) / (1.f - knee);  // expanded span at t = 1
+  float a = 1.f - 1.f / m;
+  float t = saturate((y - knee) / (1.f - knee));
+  float y_new = knee + (1.f - knee) * t / (1.f - a * t);
+  return sdr * (y_new / y);
 }
 
 float4 main(float2 uv : TEXCOORD0
@@ -88,40 +97,23 @@ float4 main(float2 uv : TEXCOORD0
   float4 blur = tex2Dlod(s_blur, uv_lod);
 #endif
 
-  float3 color;
-  if (RENODX_TONE_MAP_TYPE > 0.f) {
-    float3 hdr = max(0, clr);
+  // Vanilla composite (the game's clip at white is its only "tone mapping").
+  float glow_scale = CONST_100.w * (RENODX_TONE_MAP_TYPE > 0.f ? CUSTOM_GLOW_STRENGTH : 1.f);
+  float3 color = clr;
 #if COJ_BLUR
-    hdr = lerp(hdr, CoJBlurHDR(blur.rgb, hdr), saturate(blur.a));
+  color = saturate(lerp(color, blur.rgb, blur.a));
 #endif
-    hdr += glow * CONST_100.w * CUSTOM_GLOW_STRENGTH;
+  color = saturate(glow * glow_scale + color);
+  color = CoJGrade(color, noise);
 
-    // Vanilla stand-in is the game's own clip, not NeutralSDR: the curve LUT/levels are
-    // steep near white, and running them on NeutralSDR's compressed values then adding the
-    // HDR excess back inflated everything above white (~2x: white surfaces at ~420 nits).
-    // UpgradeToneMap adds luminance above the clip onto the vanilla grade, so the SDR range
-    // stays identical to vanilla and only the part above white becomes HDR.
-    float3 clipped_sdr = saturate(hdr);
-    hdr = clipped_sdr + CoJScaleExcess(max(0, hdr - clipped_sdr));
-    // "Natural" highlight colour: instead of the per-channel clip (which bleaches
-    // bright sand/roads towards white), scale the colour down by its max channel so the
-    // SDR stand-in keeps the real hue. Identical to the clip for pixels below white.
-    float3 hue_kept_sdr = hdr / max(1.f, renodx::math::Max(hdr));
-    clipped_sdr = lerp(clipped_sdr, hue_kept_sdr, CUSTOM_HIGHLIGHT_HUE);
-    float3 graded_sdr = CoJGrade(clipped_sdr, noise);
-    color = renodx::draw::ToneMapPass(hdr, graded_sdr, clipped_sdr);
-  } else {
-    color = clr;
-#if COJ_BLUR
-    color = saturate(lerp(color, blur.rgb, blur.a));
-#endif
-    color = saturate(glow * CONST_100.w + color);
-    color = CoJGrade(color, noise);
+  if (RENODX_TONE_MAP_TYPE > 0.f) {
+    color = CoJExpandHDR(color);
   }
 
 #if COJ_OVERLAY
   color *= tex2Dlod(s_overlay, uv_lod).rgb;
 #endif
 
+  if (RENODX_TONE_MAP_TYPE > 0.f) return float4(CoJEncodeHDR(color), 0.f);
   return float4(color, 0.f);
 }
