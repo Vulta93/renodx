@@ -1,0 +1,14 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "callofjuarezgunslinger",
+  "title": "Call of Juarez: Gunslinger",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "deploy": {
+    "steam_appid": 204450,
+    "architecture": [
+      "x86"
+    ]
+  }
+}
