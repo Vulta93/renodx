@@ -419,6 +419,16 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "FxDepthOfField",
+        .binding = &shader_injection.dof_strength,
+        .default_value = 0.f,
+        .label = "Depth of Field",
+        .section = "Effects",
+        .tooltip = "Strength of the game's depth-of-field blur (100 = vanilla, 0 = off).",
+        .max = 100.f,
+        .parse = [](float value) { return value * 0.01f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "FxGlow",
         .binding = &shader_injection.glow_strength,
         .default_value = 25.f,

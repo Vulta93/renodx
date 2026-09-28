@@ -78,6 +78,10 @@ float3 CoJExpandHDR(float3 sdr) {
   return sdr * (y_new / y);
 }
 
+float CoJSunMarker(float3 clr) {
+  return smoothstep(3.f, COJ_SUN_MARKER * 0.75f, max(clr.r, max(clr.g, clr.b)));
+}
+
 float4 main(float2 uv : TEXCOORD0
 #if COJ_NOISE
             ,
@@ -99,18 +103,37 @@ float4 main(float2 uv : TEXCOORD0
   float4 blur = tex2Dlod(s_blur, uv_lod);
 #endif
 
-  // Sun disc: marked by 0x795E3B26 with a huge value (only in HDR mode).
+  // Sun disc: marked by 0x795E3B26 with a huge value (only in HDR mode). The sprite has a
+  // hard edge and a flat outer rim, so the marker is blurred (centre + 4 rings of 8 taps,
+  // bell-shaped weights) into a smooth radial falloff: full boost in the core, fading
+  // gradually through the rim into the sky with no plateau.
   float sun_mask = 0.f;
   if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_SUN_BRIGHTNESS > 0.f) {
-    float peak_clr = max(clr.r, max(clr.g, clr.b));
-    sun_mask = saturate((peak_clr - 8.f) / (COJ_SUN_MARKER * 0.5f - 8.f));
+    static const float2 dirs[8] = {
+        float2(1.f, 0.f), float2(0.7071f, 0.7071f), float2(0.f, 1.f), float2(-0.7071f, 0.7071f),
+        float2(-1.f, 0.f), float2(-0.7071f, -0.7071f), float2(0.f, -1.f), float2(0.7071f, -0.7071f)};
+    static const float ring_weight[4] = {0.9f, 0.7f, 0.45f, 0.25f};
+    const float2 aspect = float2(1.f, 16.f / 9.f);
+    float sum = CoJSunMarker(clr);
+    float weight = 1.f;
+    [unroll] for (int ring = 0; ring < 4; ++ring) {
+      float radius = 0.008f * (ring + 1);
+      float ring_sum = 0.f;
+      [unroll] for (int k = 0; k < 8; ++k) {
+        ring_sum += CoJSunMarker(tex2Dlod(s_clr, float4(uv + dirs[k] * aspect * radius, 0.f, 0.f)).rgb);
+      }
+      sum += ring_sum / 8.f * ring_weight[ring];
+      weight += ring_weight[ring];
+    }
+    float m = saturate(sum / weight * 1.6f);
+    sun_mask = m * m * (3.f - 2.f * m);
   }
 
   // Vanilla composite (the game's clip at white is its only "tone mapping").
   float glow_scale = CONST_100.w * (RENODX_TONE_MAP_TYPE > 0.f ? CUSTOM_GLOW_STRENGTH : 1.f);
   float3 color = clr;
 #if COJ_BLUR
-  color = saturate(lerp(color, blur.rgb, blur.a));
+  color = saturate(lerp(color, blur.rgb, saturate(blur.a) * CUSTOM_DOF_STRENGTH));
 #endif
   color = saturate(glow * glow_scale + color);
   float3 graded = CoJGrade(color, noise);

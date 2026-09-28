@@ -47,7 +47,7 @@ struct ShaderInjectData {
   float highlight_start;
   float sun_brightness;
   float shadow_lift;
-  float padding2;
+  float dof_strength;
 };
 
 #ifndef __cplusplus
@@ -89,6 +89,7 @@ float4 shader_injection[9] : register(c50);
 #define CUSTOM_HDR_BOOST                       shader_injection[7][3]
 #define CUSTOM_HIGHLIGHT_START                 shader_injection[8][0]
 #define CUSTOM_SHADOW_LIFT                     shader_injection[8][2]
+#define CUSTOM_DOF_STRENGTH                    shader_injection[8][3]
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection[8][1]
 
 #else
@@ -133,6 +134,7 @@ cbuffer shader_injection : register(b13) {
 #define CUSTOM_HDR_BOOST                       shader_injection.hdr_boost
 #define CUSTOM_HIGHLIGHT_START                 shader_injection.highlight_start
 #define CUSTOM_SHADOW_LIFT                     shader_injection.shadow_lift
+#define CUSTOM_DOF_STRENGTH                    shader_injection.dof_strength
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection.sun_brightness
 
 #endif
