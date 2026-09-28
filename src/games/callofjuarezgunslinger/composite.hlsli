@@ -61,10 +61,10 @@ float3 CoJGrade(float3 c, float noise) {
 // "Highlight Start" knee is untouched (vanilla), above it a quadratic curve
 // (slope 1 at the knee, continuous) maps white (1.0) to R x game white, where
 // R = lerp(1, peak / game, "HDR Boost"). Hue is kept (luminance scaling).
-float3 CoJExpandHDR(float3 sdr) {
+float3 CoJExpandHDR(float3 sdr, float boost) {
   float knee = saturate(CUSTOM_HIGHLIGHT_START);
   float peak_ratio = max(1.f, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
-  float r = lerp(1.f, peak_ratio, saturate(CUSTOM_HDR_BOOST));
+  float r = lerp(1.f, peak_ratio, saturate(boost));
 
   float y = max(0, renodx::color::y::from::BT709(sdr));
   if (y <= knee || r <= 1.f || knee >= 1.f) return sdr;
@@ -96,7 +96,10 @@ float4 main(float2 uv : TEXCOORD0
 #endif
 
   float4 uv_lod = float4(uv, 0.f, 0.f);
-  float3 clr = tex2Dlod(s_clr, uv_lod).rgb;
+  float4 clr_a = tex2Dlod(s_clr, uv_lod);
+  float3 clr = clr_a.rgb;
+  // Sky marker: 0x3848A019 writes alpha as -1 - a in HDR mode (see common.hlsli).
+  float sky_mask = (RENODX_TONE_MAP_TYPE > 0.f) ? saturate(-clr_a.a) : 0.f;
   // Glow chain: vanilla 8-bit (<= 1); clamp in case it gets upgraded.
   float3 glow = saturate(tex2Dlod(s_glow, uv_lod).rgb);
 #if COJ_BLUR
@@ -147,7 +150,7 @@ float4 main(float2 uv : TEXCOORD0
     float3 clean = graded;
 #endif
     float y_clean = renodx::color::y::from::BT709(clean);
-    float y_expanded = renodx::color::y::from::BT709(CoJExpandHDR(clean));
+    float y_expanded = renodx::color::y::from::BT709(CoJExpandHDR(clean, lerp(CUSTOM_HDR_BOOST, CUSTOM_SKY_HDR_BOOST, sky_mask)));
     graded *= (y_clean > 0.f) ? (y_expanded / y_clean) : 1.f;
   }
   color = graded;

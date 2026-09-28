@@ -48,14 +48,19 @@ struct ShaderInjectData {
   float sun_brightness;
   float shadow_lift;
   float dof_strength;
+
+  float sky_hdr_boost;
+  float padding0;
+  float padding1;
+  float padding2;
 };
 
 #ifndef __cplusplus
 #if (__SHADER_TARGET_MAJOR == 3)
 
 // DX9 (ps_3_0): the add-on pushes the injection data into pixel shader
-// constants c50..c57 (constant_buffer_offset = 50 * 4 in addon.cpp).
-float4 shader_injection[9] : register(c50);
+// constants c50..c59 (constant_buffer_offset = 50 * 4 in addon.cpp).
+float4 shader_injection[10] : register(c50);
 
 #define RENODX_PEAK_WHITE_NITS                 shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS              shader_injection[0][1]
@@ -91,6 +96,7 @@ float4 shader_injection[9] : register(c50);
 #define CUSTOM_SHADOW_LIFT                     shader_injection[8][2]
 #define CUSTOM_DOF_STRENGTH                    shader_injection[8][3]
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection[8][1]
+#define CUSTOM_SKY_HDR_BOOST                   shader_injection[9][0]
 
 #else
 
@@ -136,6 +142,7 @@ cbuffer shader_injection : register(b13) {
 #define CUSTOM_SHADOW_LIFT                     shader_injection.shadow_lift
 #define CUSTOM_DOF_STRENGTH                    shader_injection.dof_strength
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection.sun_brightness
+#define CUSTOM_SKY_HDR_BOOST                   shader_injection.sky_hdr_boost
 
 #endif
 

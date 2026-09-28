@@ -19,3 +19,10 @@ float3 CoJDecodeHDR(float3 encoded) {
 // Sun disc marker written by 0x795E3B26 into the float16 scene target (nothing else in
 // the scene gets anywhere near it); the composite detects it and lifts the sun.
 static const float COJ_SUN_MARKER = 64.f;
+
+// Sky marker: the sky 0x3848A019 writes its alpha (glow weight a >= 0) as -1 - a, so the
+// composite can tell sky from world (mask = saturate(-alpha)). The glow bright pass
+// 0x41AE4161 decodes it back to the vanilla weight.
+float CoJDecodeSceneAlpha(float a) {
+  return (a < 0.f) ? max(0.f, -1.f - a) : a;
+}
