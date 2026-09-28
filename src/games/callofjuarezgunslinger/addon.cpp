@@ -285,6 +285,17 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "FxHighlightHue",
+        .binding = &shader_injection.highlight_hue,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 1.f,
+        .label = "Highlight Color",
+        .section = "Effects",
+        .tooltip = "Vanilla: bright surfaces take the colour of the clipped (washed-out white) image.\nNatural: bright surfaces keep their real colour (sunlit sand stays sand).",
+        .labels = {"Vanilla", "Natural"},
+        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "FxGlow",
         .binding = &shader_injection.glow_strength,
         .default_value = 80.f,

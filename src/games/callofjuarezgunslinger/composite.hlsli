@@ -103,6 +103,11 @@ float4 main(float2 uv : TEXCOORD0
     // stays identical to vanilla and only the part above white becomes HDR.
     float3 clipped_sdr = saturate(hdr);
     hdr = clipped_sdr + CoJScaleExcess(max(0, hdr - clipped_sdr));
+    // "Natural" highlight colour: instead of the per-channel clip (which bleaches
+    // bright sand/roads towards white), scale the colour down by its max channel so the
+    // SDR stand-in keeps the real hue. Identical to the clip for pixels below white.
+    float3 hue_kept_sdr = hdr / max(1.f, renodx::math::Max(hdr));
+    clipped_sdr = lerp(clipped_sdr, hue_kept_sdr, CUSTOM_HIGHLIGHT_HUE);
     float3 graded_sdr = CoJGrade(clipped_sdr, noise);
     color = renodx::draw::ToneMapPass(hdr, graded_sdr, clipped_sdr);
   } else {

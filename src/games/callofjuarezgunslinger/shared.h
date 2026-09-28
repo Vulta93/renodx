@@ -43,6 +43,11 @@ struct ShaderInjectData {
   float swap_chain_encoding_color_space;
   float glow_strength;
   float highlight_strength;
+
+  float highlight_hue;
+  float padding0;
+  float padding1;
+  float padding2;
 };
 
 #ifndef __cplusplus
@@ -50,7 +55,7 @@ struct ShaderInjectData {
 
 // DX9 (ps_3_0): the add-on pushes the injection data into pixel shader
 // constants c50..c57 (constant_buffer_offset = 50 * 4 in addon.cpp).
-float4 shader_injection[8] : register(c50);
+float4 shader_injection[9] : register(c50);
 
 #define RENODX_PEAK_WHITE_NITS                 shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS              shader_injection[0][1]
@@ -82,6 +87,7 @@ float4 shader_injection[8] : register(c50);
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection[7][1]
 #define CUSTOM_GLOW_STRENGTH                   shader_injection[7][2]
 #define CUSTOM_HIGHLIGHT_STRENGTH              shader_injection[7][3]
+#define CUSTOM_HIGHLIGHT_HUE                   shader_injection[8][0]
 
 #else
 
@@ -123,6 +129,7 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
 #define CUSTOM_GLOW_STRENGTH                   shader_injection.glow_strength
 #define CUSTOM_HIGHLIGHT_STRENGTH              shader_injection.highlight_strength
+#define CUSTOM_HIGHLIGHT_HUE                   shader_injection.highlight_hue
 
 #endif
 
