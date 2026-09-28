@@ -23,6 +23,8 @@
 
 namespace {
 
+ShaderInjectData shader_injection;
+
 // The final gamma pass 0x4003CC02 decodes the HDR encoding written by our composite
 // replacements. Screens drawn through a composite we don't replace (e.g. menus) must not
 // be decoded: then the original final shader is used for that frame.
@@ -30,6 +32,30 @@ std::atomic<bool> composite_ran_this_frame = false;
 
 bool OnCompositeDraw(reshade::api::command_list* cmd_list) {
   composite_ran_this_frame = true;
+  return true;
+}
+
+
+// Heat haze: 0x35B8A99A copies the scene into the 8-bit target #2 and the haze 0xD84F5620
+// draws a distorted part of it back over the scene, reading it with sRGB decoding. The
+// vanilla 8-bit scene was stored sRGB-encoded; the float16 scene is linear, so the copy came
+// out ~2x too dark ("black smoke"). The full-resolution copy re-encodes to sRGB in HDR mode;
+// the same shader also does small 128x128 copies, which must stay untouched.
+reshade::api::resource_view current_render_target = {0u};
+
+void OnBindRenderTargets(reshade::api::command_list*, uint32_t count, const reshade::api::resource_view* rtvs,
+                         reshade::api::resource_view) {
+  current_render_target = count > 0 ? rtvs[0] : reshade::api::resource_view{0u};
+}
+
+bool OnSceneCopyDraw(reshade::api::command_list* cmd_list) {
+  float full_res = 0.f;
+  if (current_render_target.handle != 0u) {
+    auto* device = cmd_list->get_device();
+    auto res = device->get_resource_from_view(current_render_target);
+    if (res.handle != 0u && device->get_resource_desc(res).texture.width >= 1024) full_res = 1.f;
+  }
+  shader_injection.copy_full_res = full_res;
   return true;
 }
 
@@ -61,6 +87,7 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x795E3B26),
     CustomShaderEntry(0x3848A019),
     CustomShaderEntry(0x41AE4161),
+    CustomShaderEntryCallback(0x35B8A99A, &OnSceneCopyDraw),
     CustomShaderEntryCallback(0x001F451B, &OnCompositeDraw),
     CustomShaderEntryCallback(0x04E01654, &OnCompositeDraw),
     CustomShaderEntryCallback(0x07BB9390, &OnCompositeDraw),
@@ -127,7 +154,6 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0xFECF4F1D, &OnCompositeDraw),
 };
 
-ShaderInjectData shader_injection;
 
 float current_settings_mode = 0;
 
@@ -545,6 +571,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::present>(OnPresentFrameReset);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -733,6 +760,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::present>(OnPresentFrameReset);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
       reshade::unregister_addon(h_module);
       break;
   }

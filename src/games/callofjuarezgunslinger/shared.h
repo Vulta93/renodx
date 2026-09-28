@@ -50,7 +50,7 @@ struct ShaderInjectData {
   float dof_strength;
 
   float sky_hdr_boost;
-  float padding0;
+  float copy_full_res;
   float padding1;
   float padding2;
 };
@@ -97,6 +97,7 @@ float4 shader_injection[10] : register(c50);
 #define CUSTOM_DOF_STRENGTH                    shader_injection[8][3]
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection[8][1]
 #define CUSTOM_SKY_HDR_BOOST                   shader_injection[9][0]
+#define CUSTOM_COPY_FULL_RES                   shader_injection[9][1]
 
 #else
 
@@ -143,6 +144,7 @@ cbuffer shader_injection : register(b13) {
 #define CUSTOM_DOF_STRENGTH                    shader_injection.dof_strength
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection.sun_brightness
 #define CUSTOM_SKY_HDR_BOOST                   shader_injection.sky_hdr_boost
+#define CUSTOM_COPY_FULL_RES                   shader_injection.copy_full_res
 
 #endif
 
