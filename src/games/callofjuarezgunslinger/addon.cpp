@@ -58,6 +58,7 @@ void OnPresentFrameReset(reshade::api::command_queue* queue,
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x4003CC02, &OnFinalGammaDraw),
+    CustomShaderEntry(0x795E3B26),
     CustomShaderEntryCallback(0x001F451B, &OnCompositeDraw),
     CustomShaderEntryCallback(0x04E01654, &OnCompositeDraw),
     CustomShaderEntryCallback(0x07BB9390, &OnCompositeDraw),
@@ -397,9 +398,20 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "FxSunBrightness",
+        .binding = &shader_injection.sun_brightness,
+        .default_value = 100.f,
+        .label = "Sun Brightness",
+        .section = "Effects",
+        .tooltip = "Brightness of the sun disc (100 = Peak Brightness, 0 = like the rest of the image).",
+        .max = 100.f,
+        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "FxShadowLift",
         .binding = &shader_injection.shadow_lift,
-        .default_value = 100.f,
+        .default_value = 150.f,
         .label = "Shadow Lift",
         .section = "Effects",
         .tooltip = "Brightens dark and mid tones (like the game's brightness option); white is unchanged.",
@@ -409,7 +421,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "FxGlow",
         .binding = &shader_injection.glow_strength,
-        .default_value = 100.f,
+        .default_value = 25.f,
         .label = "Glow",
         .section = "Effects",
         .tooltip = "Strength of the game's glow (bloom)",

@@ -99,6 +99,13 @@ float4 main(float2 uv : TEXCOORD0
   float4 blur = tex2Dlod(s_blur, uv_lod);
 #endif
 
+  // Sun disc: marked by 0x795E3B26 with a huge value (only in HDR mode).
+  float sun_mask = 0.f;
+  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_SUN_BRIGHTNESS > 0.f) {
+    float peak_clr = max(clr.r, max(clr.g, clr.b));
+    sun_mask = saturate((peak_clr - 8.f) / (COJ_SUN_MARKER * 0.5f - 8.f));
+  }
+
   // Vanilla composite (the game's clip at white is its only "tone mapping").
   float glow_scale = CONST_100.w * (RENODX_TONE_MAP_TYPE > 0.f ? CUSTOM_GLOW_STRENGTH : 1.f);
   float3 color = clr;
@@ -121,6 +128,13 @@ float4 main(float2 uv : TEXCOORD0
     graded *= (y_clean > 0.f) ? (y_expanded / y_clean) : 1.f;
   }
   color = graded;
+
+  if (sun_mask > 0.f) {
+    // Sun up to "Sun Brightness" x peak (relative to game white), keeping its hue.
+    float peak_ratio = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+    float3 sun = color / max(1e-4f, max(color.r, max(color.g, color.b))) * peak_ratio * CUSTOM_SUN_BRIGHTNESS;
+    color = lerp(color, max(color, sun), sun_mask);
+  }
 
 #if COJ_OVERLAY
   color *= tex2Dlod(s_overlay, uv_lod).rgb;
