@@ -56,6 +56,17 @@ float3 CoJGrade(float3 c, float noise) {
   return c;
 }
 
+// Sunlit ground sits a few times above white in the raw scene (the game clipped it).
+// Scale the part above white by the "HDR Highlight Strength" slider for moderate
+// excess (ground), easing back to full strength for extreme excess (sun, fire, flashes)
+// so those still reach peak. excess is in units of vanilla white.
+static const float COJ_EXCESS_KNEE = 8.f;
+float3 CoJScaleExcess(float3 excess) {
+  float3 t = excess / COJ_EXCESS_KNEE;
+  float3 w = (t * t) / (1.f + t * t);  // 0 for small excess -> 1 for large
+  return excess * lerp(CUSTOM_HIGHLIGHT_STRENGTH, 1.f, w);
+}
+
 float4 main(float2 uv : TEXCOORD0
 #if COJ_NOISE
             ,
@@ -91,10 +102,7 @@ float4 main(float2 uv : TEXCOORD0
     // UpgradeToneMap adds luminance above the clip onto the vanilla grade, so the SDR range
     // stays identical to vanilla and only the part above white becomes HDR.
     float3 clipped_sdr = saturate(hdr);
-    // Sunlit ground sits 2-6x above white in the raw scene (the game clipped it); scale
-    // only the part above white so broad surfaces stay near paper white, while the sun,
-    // fire etc. (far above white) still reach peak.
-    hdr = clipped_sdr + max(0, hdr - clipped_sdr) * CUSTOM_HIGHLIGHT_STRENGTH;
+    hdr = clipped_sdr + CoJScaleExcess(max(0, hdr - clipped_sdr));
     float3 graded_sdr = CoJGrade(clipped_sdr, noise);
     color = renodx::draw::ToneMapPass(hdr, graded_sdr, clipped_sdr);
   } else {

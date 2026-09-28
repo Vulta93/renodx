@@ -276,7 +276,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "FxHighlightStrength",
         .binding = &shader_injection.highlight_strength,
-        .default_value = 70.f,
+        .default_value = 80.f,
         .label = "HDR Highlight Strength",
         .section = "Effects",
         .tooltip = "How far above white the scene's brightest parts go.\nThe game lights sunlit ground far above white and relied on clipping it.",
@@ -287,7 +287,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "FxGlow",
         .binding = &shader_injection.glow_strength,
-        .default_value = 90.f,
+        .default_value = 80.f,
         .label = "Glow",
         .section = "Effects",
         .tooltip = "Strength of the game's glow (bloom)",
