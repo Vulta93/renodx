@@ -485,7 +485,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "FxGlow",
         .binding = &shader_injection.glow_strength,
-        .default_value = 25.f,
+        .default_value = 100.f,
         .label = "Glow",
         .section = "Effects",
         .tooltip = "Strength of the game's glow (bloom)",
