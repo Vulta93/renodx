@@ -56,6 +56,79 @@ float3 CoJGrade(float3 c, float noise) {
   return c;
 }
 
+// ---------------------------------------------------------------------------------------
+// Extended finishing pipeline ("Extended" tone mapper): the same steps as CoJGrade, but on
+// the UNCLIPPED scene. Exact wherever vanilla did not clip; above white each step continues
+// instead of clamping:
+//  - weights / masks (dot products) stay saturated, colour values are only floored at 0;
+//  - the s_crv LUT continues linearly with the slope of its last segment (clamped);
+//  - the levels pow() continues along its tangent at 1;
+//  - the tint's luminance weight stays <= 1 (its "lum * c" would otherwise square highlights).
+static const float COJ_CURVE_SLOPE_MIN = 0.5f;
+static const float COJ_CURVE_SLOPE_MAX = 1.f;
+
+float3 CoJCurveExt(float3 x) {
+  float3 xc = min(x, 1.f);
+  float3 coords = xc * 0.96875f + 0.015625f;
+  float3 curve = float3(
+      tex2Dlod(s_crv, float4(coords.x, coords.x, 0.f, 0.f)).x,
+      tex2Dlod(s_crv, float4(coords.y, coords.y, 0.f, 0.f)).y,
+      tex2Dlod(s_crv, float4(coords.z, coords.z, 0.f, 0.f)).z);
+  // Last LUT segment: texel centres 30.5/32 and 31.5/32 (1/31 apart in x).
+  float3 prev = float3(
+      tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).x,
+      tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).y,
+      tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).z);
+  float3 top = float3(
+      tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).x,
+      tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).y,
+      tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).z);
+  float3 slope = clamp((top - prev) * 31.f, COJ_CURVE_SLOPE_MIN, COJ_CURVE_SLOPE_MAX);
+  return curve + max(x - 1.f, 0.f) * slope;
+}
+
+float3 CoJPowExt(float3 x, float3 p) {
+  return pow(min(x, 1.f), p) + max(x - 1.f, 0.f) * p;
+}
+
+float3 CoJGradeExt(float3 c, float noise) {
+  c = max(0, c);
+  float lum = dot(c, COJ_LUMA);
+  c = max(0, lerp(lum.xxx, c, CONST_102.w));
+
+#if COJ_NOISE
+  c = max(0, c + noise);
+#endif
+
+#if COJ_DESATURATE
+  float desat_lum = saturate(dot(c, v_pp_desaturate_factor_lum.rgb));
+  float3 tint = desat_lum * v_pp_desaturate_tint__weight.rgb;
+  float3 masked = c * v_pp_desaturate_tint_masked.rgb - tint;
+  float mask = saturate(dot(c, v_pp_desaturate_factor_mask.rgb));
+  float3 desat = max(0, mask * masked + tint);
+  c = max(0, c * v_pp_desaturate_tint__weight.w + desat);
+#endif
+
+  bool curves_gamma = f_curves_new.x > 0.f;
+  float3 x = curves_gamma ? exp2(log2(c) * (1.f / 2.2f)) : c;
+  float3 curve = CoJCurveExt(x);
+  c = curves_gamma ? exp2(log2(max(curve, 1e-6f)) * 2.2f) : curve;
+
+#if COJ_LEVELS
+  c = max(0, c * CONST_103.rgb + CONST_104.rgb);
+  c = CoJPowExt(c, float3(CONST_104.w, CONST_105.w, CONST_106.w));
+  c = max(0, c * CONST_105.rgb + CONST_106.rgb);
+#endif
+
+#if COJ_TINT
+  float tint_lum = saturate(dot(CONST_101.rgb, c));
+  float3 tinted = max(0, tint_lum * c * CONST_102.rgb);
+  c = max(0, lerp(c, tinted, CONST_101.w));
+#endif
+
+  return c;
+}
+
 // SDR -> HDR expansion. With correct lighting the game renders almost nothing above
 // white, so HDR is created from the finished vanilla image: luminance below the
 // "Highlight Start" knee is untouched (vanilla), above it a quadratic curve
@@ -76,6 +149,16 @@ float3 CoJExpandHDR(float3 sdr, float boost) {
   float t = saturate((y - knee) / (1.f - knee));
   float y_new = knee + (1.f - knee) * (t + (m - 1.f) * t * t);
   return sdr * (y_new / y);
+}
+
+// Display map for the debug views: exact up to game white (1.0), above it a Neutwo shoulder
+// (slope 1 at white) towards peak. Scales by the max channel, so hue is kept.
+float3 CoJDisplayMap(float3 c, float peak_ratio) {
+  float m = max(c.r, max(c.g, c.b));
+  if (m <= 1.f) return c;
+  float p = max(1.f, peak_ratio);
+  float new_m = 1.f + renodx::tonemap::Neutwo(m - 1.f, max(1e-3f, p - 1.f));
+  return c * (new_m / m);
 }
 
 float CoJSunMarker(float3 clr) {
@@ -132,6 +215,38 @@ float4 main(float2 uv : TEXCOORD0
     sun_mask = m * m * (3.f - 2.f * m);
   }
 
+  // TEMPORARY debug views of the raw float16 scene (before the composite's clip / grade).
+  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_DEBUG_VIEW > 0.5f) {
+    float3 raw = clr + glow * (CONST_100.w * CUSTOM_GLOW_STRENGTH);
+    float peak_r = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+    float3 dbg;
+    if (CUSTOM_DEBUG_VIEW < 1.5f) {
+      dbg = CoJDisplayMap(max(0, raw), peak_r);
+    } else if (CUSTOM_DEBUG_VIEW < 2.5f) {
+      dbg = saturate(raw);
+    } else if (CUSTOM_DEBUG_VIEW > 3.5f) {
+      // Extended grade vs vanilla grade where the raw scene is <= white: should match (grey);
+      // yellow = differs > 2%, red = differs > 10% (a vanilla intermediate clip).
+      float3 v = CoJGrade(saturate(raw), 0.f);
+      float3 e = CoJGradeExt(min(max(0, raw), 1000.f), 0.f);
+      dbg = v * 0.3f;
+      if (max(raw.r, max(raw.g, raw.b)) <= 1.f) {
+        float d = max(abs(e.r - v.r), max(abs(e.g - v.g), abs(e.b - v.b)));
+        if (d > 0.1f) dbg = float3(1.f, 0.f, 0.f);
+        else if (d > 0.02f) dbg = float3(1.f, 1.f, 0.f);
+      }
+    } else {
+      float m = max(raw.r, max(raw.g, raw.b));
+      // dim clipped image; over-white pixels: green 1-1.5, yellow 1.5-3, red 3-16, magenta >16
+      dbg = saturate(raw) * 0.3f;
+      if (m > 16.f) dbg = float3(1.f, 0.f, 1.f);
+      else if (m > 3.f) dbg = float3(1.f, 0.f, 0.f);
+      else if (m > 1.5f) dbg = float3(1.f, 1.f, 0.f);
+      else if (m > 1.f) dbg = float3(0.f, 1.f, 0.f);
+    }
+    return float4(CoJEncodeHDR(dbg), 0.f);
+  }
+
   // Vanilla composite (the game's clip at white is its only "tone mapping").
   float glow_scale = CONST_100.w * (RENODX_TONE_MAP_TYPE > 0.f ? CUSTOM_GLOW_STRENGTH : 1.f);
   float3 color = clr;
@@ -139,9 +254,43 @@ float4 main(float2 uv : TEXCOORD0
   color = saturate(lerp(color, blur.rgb, saturate(blur.a) * CUSTOM_DOF_STRENGTH));
 #endif
   color = saturate(glow * glow_scale + color);
-  float3 graded = CoJGrade(color, noise);
+  float3 graded;
+  if (RENODX_TONE_MAP_TYPE > 3.5f) {
+    // "Extended": vanilla pipeline on the unclipped scene, then a display map (exact up to
+    // white, Neutwo shoulder to peak). The DOF blur chain is 8-bit: keep the sharp pixel's
+    // part above white.
+    float3 xr = min(max(0, clr), 1000.f);
+#if COJ_BLUR
+    float3 blur_hdr = blur.rgb + max(0, xr - saturate(xr));
+    xr = lerp(xr, blur_hdr, saturate(blur.a) * CUSTOM_DOF_STRENGTH);
+#endif
+    xr += glow * glow_scale;
+    graded = CoJGradeExt(xr, noise);
+    // Sky only: the game's sky has almost nothing above white, so it keeps the Sky HDR Boost
+    // expansion (on the part up to white; anything above white is passed through). The factor
+    // comes from the grain-free image so grain does not boil in the clouds.
+    if (sky_mask > 0.f) {
+#if COJ_NOISE
+      float3 sky_clean = CoJGradeExt(xr, 0.f);
+#else
+      float3 sky_clean = graded;
+#endif
+      float3 sky_base = saturate(sky_clean);
+      float y_base = renodx::color::y::from::BT709(sky_base);
+      float y_exp = renodx::color::y::from::BT709(CoJExpandHDR(sky_base, CUSTOM_SKY_HDR_BOOST));
+      float3 sky_over = graded - saturate(graded);
+      float3 sky_graded = saturate(graded) * ((y_base > 0.f) ? (y_exp / y_base) : 1.f) + sky_over;
+      graded = lerp(graded, sky_graded, sky_mask);
+    }
+    // Highlight Gain: scales only the part above white (1 = the game's own values).
+    float mg = max(graded.r, max(graded.g, graded.b));
+    if (mg > 1.f) graded *= (1.f + CUSTOM_HIGHLIGHT_GAIN * (mg - 1.f)) / mg;
+    graded = CoJDisplayMap(graded, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
+  } else {
+    graded = CoJGrade(color, noise);
+  }
 
-  if (RENODX_TONE_MAP_TYPE > 0.f) {
+  if (RENODX_TONE_MAP_TYPE > 0.f && RENODX_TONE_MAP_TYPE < 3.5f) {
     // Expansion factor from the noise-free image: film grain near white is otherwise
     // amplified by the steep part of the curve ("boiling" bright clouds).
 #if COJ_NOISE

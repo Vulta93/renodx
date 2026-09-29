@@ -51,8 +51,8 @@ struct ShaderInjectData {
 
   float sky_hdr_boost;
   float copy_full_res;
-  float padding1;
-  float padding2;
+  float debug_view;
+  float highlight_gain;
 };
 
 #ifndef __cplusplus
@@ -98,6 +98,8 @@ float4 shader_injection[10] : register(c50);
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection[8][1]
 #define CUSTOM_SKY_HDR_BOOST                   shader_injection[9][0]
 #define CUSTOM_COPY_FULL_RES                   shader_injection[9][1]
+#define CUSTOM_DEBUG_VIEW                      shader_injection[9][2]
+#define CUSTOM_HIGHLIGHT_GAIN                  shader_injection[9][3]
 
 #else
 
@@ -145,6 +147,8 @@ cbuffer shader_injection : register(b13) {
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection.sun_brightness
 #define CUSTOM_SKY_HDR_BOOST                   shader_injection.sky_hdr_boost
 #define CUSTOM_COPY_FULL_RES                   shader_injection.copy_full_res
+#define CUSTOM_DEBUG_VIEW                      shader_injection.debug_view
+#define CUSTOM_HIGHLIGHT_GAIN                  shader_injection.highlight_gain
 
 #endif
 
