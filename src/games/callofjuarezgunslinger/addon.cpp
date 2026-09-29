@@ -29,6 +29,9 @@ ShaderInjectData shader_injection;
 // replacements. Screens drawn through a composite we don't replace (e.g. menus) must not
 // be decoded: then the original final shader is used for that frame.
 std::atomic<bool> composite_ran_this_frame = false;
+// Set once the final gamma pass has run: later full-res copies of the scene target (e.g. the
+// damage "tear" overlay) see the final image, not the linear scene.
+std::atomic<bool> final_pass_ran_this_frame = false;
 
 bool OnCompositeDraw(reshade::api::command_list* cmd_list) {
   composite_ran_this_frame = true;
@@ -50,7 +53,7 @@ void OnBindRenderTargets(reshade::api::command_list*, uint32_t count, const resh
 
 bool OnSceneCopyDraw(reshade::api::command_list* cmd_list) {
   float full_res = 0.f;
-  if (current_render_target.handle != 0u) {
+  if (current_render_target.handle != 0u && !final_pass_ran_this_frame) {
     auto* device = cmd_list->get_device();
     auto res = device->get_resource_from_view(current_render_target);
     if (res.handle != 0u && device->get_resource_desc(res).texture.width >= 1024) full_res = 1.f;
@@ -68,6 +71,7 @@ void RebindOriginalPixelShader(reshade::api::command_list* cmd_list) {
 }
 
 bool OnFinalGammaDraw(reshade::api::command_list* cmd_list) {
+  final_pass_ran_this_frame = true;
   if (composite_ran_this_frame.exchange(false)) return true;
   RebindOriginalPixelShader(cmd_list);
   return false;
@@ -80,6 +84,7 @@ void OnPresentFrameReset(reshade::api::command_queue* queue,
                          uint32_t dirty_rect_count,
                          const reshade::api::rect* dirty_rects) {
   composite_ran_this_frame = false;
+  final_pass_ran_this_frame = false;
 }
 
 renodx::mods::shader::CustomShaders custom_shaders = {
