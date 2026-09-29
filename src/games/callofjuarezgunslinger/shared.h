@@ -53,6 +53,16 @@ struct ShaderInjectData {
   float copy_full_res;
   float debug_view;
   float highlight_gain;
+
+  float sun_reach;
+  float sun_falloff;
+  float sun_halo;
+  float sun_halo_radius;
+
+  float sun_profile;
+  float padding3;
+  float padding4;
+  float padding5;
 };
 
 #ifndef __cplusplus
@@ -60,7 +70,7 @@ struct ShaderInjectData {
 
 // DX9 (ps_3_0): the add-on pushes the injection data into pixel shader
 // constants c50..c59 (constant_buffer_offset = 50 * 4 in addon.cpp).
-float4 shader_injection[10] : register(c50);
+float4 shader_injection[12] : register(c50);
 
 #define RENODX_PEAK_WHITE_NITS                 shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS              shader_injection[0][1]
@@ -100,6 +110,11 @@ float4 shader_injection[10] : register(c50);
 #define CUSTOM_COPY_FULL_RES                   shader_injection[9][1]
 #define CUSTOM_DEBUG_VIEW                      shader_injection[9][2]
 #define CUSTOM_HIGHLIGHT_GAIN                  shader_injection[9][3]
+#define CUSTOM_SUN_REACH                       shader_injection[10][0]
+#define CUSTOM_SUN_FALLOFF                     shader_injection[10][1]
+#define CUSTOM_SUN_HALO                        shader_injection[10][2]
+#define CUSTOM_SUN_HALO_RADIUS                 shader_injection[10][3]
+#define CUSTOM_SUN_PROFILE                     shader_injection[11][0]
 
 #else
 
@@ -149,6 +164,11 @@ cbuffer shader_injection : register(b13) {
 #define CUSTOM_COPY_FULL_RES                   shader_injection.copy_full_res
 #define CUSTOM_DEBUG_VIEW                      shader_injection.debug_view
 #define CUSTOM_HIGHLIGHT_GAIN                  shader_injection.highlight_gain
+#define CUSTOM_SUN_REACH                       shader_injection.sun_reach
+#define CUSTOM_SUN_FALLOFF                     shader_injection.sun_falloff
+#define CUSTOM_SUN_HALO                        shader_injection.sun_halo
+#define CUSTOM_SUN_HALO_RADIUS                 shader_injection.sun_halo_radius
+#define CUSTOM_SUN_PROFILE                     shader_injection.sun_profile
 
 #endif
 

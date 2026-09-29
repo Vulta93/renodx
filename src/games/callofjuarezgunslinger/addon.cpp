@@ -94,9 +94,38 @@ void OnPresentFrameReset(reshade::api::command_queue* queue,
   final_pass_ran_this_frame = false;
 }
 
+// TEMPORARY: blend state of the sun-disc draw 0x795E3B26 (is it additive or alpha blended?).
+// Logged to ReShade.log as "SUNBLEND ..." (first 5 draws, then every 900th).
+std::atomic<uint32_t> tmp_states[256] = {};
+
+void OnBindPipelineStatesTemp(reshade::api::command_list*, uint32_t count, const reshade::api::dynamic_state* states,
+                              const uint32_t* values) {
+  for (uint32_t i = 0; i < count; ++i) {
+    auto st = static_cast<uint32_t>(states[i]);
+    if (st < 256) tmp_states[st] = values[i];
+  }
+}
+
+bool OnSunDiscDraw(reshade::api::command_list*) {
+  static std::atomic<uint32_t> count = 0;
+  uint32_t n = count++;
+  if (n < 5 || n % 900 == 0) {
+    using DS = reshade::api::dynamic_state;
+    auto st = [](DS d) { return tmp_states[static_cast<uint32_t>(d)].load(); };
+    std::stringstream ss;
+    ss << "SUNBLEND draw " << n << " blend_enable " << st(DS::blend_enable) << " color src/dst "
+       << st(DS::source_color_blend_factor) << "/" << st(DS::dest_color_blend_factor) << " alpha src/dst "
+       << st(DS::source_alpha_blend_factor) << "/" << st(DS::dest_alpha_blend_factor) << " write_mask "
+       << st(DS::render_target_write_mask) << " srgb_write " << st(DS::srgb_write_enable)
+       << " (factors: 0 zero, 1 one, 6 src_alpha, 7 1-src_alpha)";
+    reshade::log::message(reshade::log::level::info, ss.str().c_str());
+  }
+  return true;
+}
+
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x4003CC02, &OnFinalGammaDraw),
-    CustomShaderEntry(0x795E3B26),
+    CustomShaderEntryCallback(0x795E3B26, &OnSunDiscDraw),
     CustomShaderEntry(0x3848A019),
     CustomShaderEntry(0x41AE4161),
     CustomShaderEntryCallback(0x35B8A99A, &OnSceneCopyDraw),
@@ -494,6 +523,67 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "SunCoreShape",
+        .binding = &shader_injection.sun_profile,
+        .default_value = 50.f,
+        .label = "Sun Core Shape",
+        .section = "Sun (temporary)",
+        .tooltip = "Radial brightness of the sun disc: peak at the centre fading to the rim. 0 = broad dome, 100 = small hot core.",
+        .max = 100.f,
+        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return current_settings_mode >= 1; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "SunReach",
+        .binding = &shader_injection.sun_reach,
+        .default_value = 200.f,
+        .label = "Sun Mask Reach",
+        .section = "Sun (temporary)",
+        .tooltip = "How far the sun's soft brightening mask reaches beyond the disc (100 = current).",
+        .max = 300.0f,
+        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return current_settings_mode >= 1; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "SunFalloff",
+        .binding = &shader_injection.sun_falloff,
+        .default_value = 75.f,
+        .label = "Sun Mask Falloff",
+        .section = "Sun (temporary)",
+        .tooltip = "Shape of the sun mask edge (100 = current; lower = fuller and harder, higher = tighter and softer core).",
+        .min = 10.f,
+        .max = 300.0f,
+        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return current_settings_mode >= 1; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "SunHalo",
+        .binding = &shader_injection.sun_halo,
+        .default_value = 50.f,
+        .label = "Sun Halo",
+        .section = "Sun (temporary)",
+        .tooltip = "Strength of a wide faint glow around the sun in the sun's own colour (0 = off = current).",
+        .max = 100.0f,
+        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return current_settings_mode >= 1; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "SunHaloReach",
+        .binding = &shader_injection.sun_halo_radius,
+        .default_value = 100.f,
+        .label = "Sun Halo Reach",
+        .section = "Sun (temporary)",
+        .tooltip = "How far the halo reaches (100 = about 12% of the screen width).",
+        .max = 300.0f,
+        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return current_settings_mode >= 1; },
+    },
+    new renodx::utils::settings::Setting{
         .key = "FxHighlightGain",
         .binding = &shader_injection.highlight_gain,
         .default_value = 100.f,
@@ -513,7 +603,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Debug View (temporary)",
         .section = "Debug",
         .tooltip = "Raw float16 scene before the composite's clip: 1 = display-mapped, 2 = clipped like vanilla, 3 = false-colour map of values above white, 4 = where Extended differs from vanilla below white.",
-        .labels = {"Off", "Raw scene (display-mapped)", "Raw scene (clipped)", "Over-white map", "Extended vs vanilla diff"},
+        .labels = {"Off", "Raw scene (display-mapped)", "Raw scene (clipped)", "Over-white map", "Extended vs vanilla diff", "Curve slope (R|G|B bands)", "Sun sprite value"},
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
         .is_visible = []() { return current_settings_mode >= 2; },
     },
@@ -611,6 +701,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::present>(OnPresentFrameReset);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
+      reshade::register_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStatesTemp);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -800,6 +891,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::present>(OnPresentFrameReset);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
+      reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStatesTemp);
       reshade::unregister_addon(h_module);
       break;
   }

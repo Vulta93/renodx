@@ -161,8 +161,11 @@ float3 CoJDisplayMap(float3 c, float peak_ratio) {
   return c * (new_m / m);
 }
 
-float CoJSunMarker(float3 clr) {
-  return smoothstep(3.f, COJ_SUN_MARKER * 0.75f, max(clr.r, max(clr.g, clr.b)));
+// Sun detection without a marker: the sky has nothing above white of its own, so a SKY pixel
+// (alpha < 0, see the sky marker) above white is the sun sprite (vanilla value ~2.2 x white).
+// Clouds in front of the sun lower it continuously, so they occlude the boost naturally.
+float CoJSunMarker(float4 c) {
+  return smoothstep(1.05f, 1.8f, max(c.r, max(c.g, c.b))) * saturate(-c.a);
 }
 
 float4 main(float2 uv : TEXCOORD0
@@ -200,19 +203,78 @@ float4 main(float2 uv : TEXCOORD0
         float2(-1.f, 0.f), float2(-0.7071f, -0.7071f), float2(0.f, -1.f), float2(0.7071f, -0.7071f)};
     static const float ring_weight[4] = {0.9f, 0.7f, 0.45f, 0.25f};
     const float2 aspect = float2(1.f, 16.f / 9.f);
-    float sum = CoJSunMarker(clr);
+    float sum = CoJSunMarker(clr_a);
     float weight = 1.f;
     [unroll] for (int ring = 0; ring < 4; ++ring) {
-      float radius = 0.008f * (ring + 1);
+      float radius = 0.008f * (ring + 1) * CUSTOM_SUN_REACH;
       float ring_sum = 0.f;
       [unroll] for (int k = 0; k < 8; ++k) {
-        ring_sum += CoJSunMarker(tex2Dlod(s_clr, float4(uv + dirs[k] * aspect * radius, 0.f, 0.f)).rgb);
+        ring_sum += CoJSunMarker(tex2Dlod(s_clr, float4(uv + dirs[k] * aspect * radius, 0.f, 0.f)));
       }
       sum += ring_sum / 8.f * ring_weight[ring];
       weight += ring_weight[ring];
     }
-    float m = saturate(sum / weight * 1.6f);
+    float m = pow(saturate(sum / weight * 1.6f), max(0.1f, CUSTOM_SUN_FALLOFF));
     sun_mask = m * m * (3.f - 2.f * m);
+  }
+
+  // Sun core profile: the sprite is a FLAT-topped disc (measured), so a radial "distance from
+  // the centre" is synthesised from a Gaussian-weighted blur of the marker (4 rings x 12 taps,
+  // rotated per ring, centre excluded): ~1 at the disc centre, ~0.4 at its rim, smooth between.
+  // Only evaluated near the sun.
+  float sun_core = 0.f;
+  [branch] if (sun_mask > 0.f) {
+    const float2 paspect = float2(1.f, 16.f / 9.f);
+    float p_sum = 0.f;
+    float p_w = 0.f;
+    [unroll] for (int pr = 1; pr <= 4; ++pr) {
+      float rel = pr / 4.f;
+      float pradius = 0.032f * CUSTOM_SUN_REACH * rel;
+      float pw = rel * exp(-2.f * rel * rel);
+      float pring = 0.f;
+      [unroll] for (int pk = 0; pk < 12; ++pk) {
+        float ang = pk * (6.2831853f / 12.f) + pr * 2.3999632f;
+        pring += CoJSunMarker(tex2Dlod(s_clr, float4(uv + float2(cos(ang), sin(ang)) * paspect * pradius, 0.f, 0.f)));
+      }
+      p_sum += pring / 12.f * pw;
+      p_w += pw;
+    }
+    sun_core = p_sum / p_w;
+  }
+
+  // TEMPORARY sun halo test: a much wider, faint glow around the sun (SDR has a broad glare
+  // there that the HDR sun lacks). Wide blur of the same sun marker (6 rings x 8 taps, bell
+  // weights); the halo takes the sun's own hue (marker-weighted, normalised colour).
+  float halo_mask = 0.f;
+  float3 halo_col = 1.f;
+  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_SUN_BRIGHTNESS > 0.f && CUSTOM_SUN_HALO > 0.f) {
+    static const float2 hdirs[8] = {
+        float2(1.f, 0.f), float2(0.7071f, 0.7071f), float2(0.f, 1.f), float2(-0.7071f, 0.7071f),
+        float2(-1.f, 0.f), float2(-0.7071f, -0.7071f), float2(0.f, -1.f), float2(0.7071f, -0.7071f)};
+    static const float hring_weight[6] = {0.92f, 0.72f, 0.5f, 0.3f, 0.16f, 0.08f};
+    const float2 haspect = float2(1.f, 16.f / 9.f);
+    float mk0 = CoJSunMarker(clr_a);
+    float h_sum = mk0;
+    float h_w = 1.f;
+    float3 h_col = mk0 * clr / max(1e-4f, max(clr.r, max(clr.g, clr.b)));
+    [unroll] for (int hr = 0; hr < 6; ++hr) {
+      float hradius = 0.02f * (hr + 1) * CUSTOM_SUN_HALO_RADIUS;
+      float ring_m = 0.f;
+      float3 ring_c = 0.f;
+      [unroll] for (int hk = 0; hk < 8; ++hk) {
+        float4 hs4 = tex2Dlod(s_clr, float4(uv + hdirs[hk] * haspect * hradius, 0.f, 0.f));
+        float3 hs = hs4.rgb;
+        float hm = CoJSunMarker(hs4);
+        ring_m += hm;
+        ring_c += hm * hs / max(1e-4f, max(hs.r, max(hs.g, hs.b)));
+      }
+      h_sum += ring_m / 8.f * hring_weight[hr];
+      h_col += ring_c / 8.f * hring_weight[hr];
+      h_w += hring_weight[hr];
+    }
+    float hmask = saturate(h_sum / h_w);
+    halo_mask = hmask * hmask * (3.f - 2.f * hmask);
+    halo_col = h_col / max(1e-4f, h_sum);
   }
 
   // TEMPORARY debug views of the raw float16 scene (before the composite's clip / grade).
@@ -220,7 +282,33 @@ float4 main(float2 uv : TEXCOORD0
     float3 raw = clr + glow * (CONST_100.w * CUSTOM_GLOW_STRENGTH);
     float peak_r = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
     float3 dbg;
-    if (CUSTOM_DEBUG_VIEW < 1.5f) {
+    if (CUSTOM_DEBUG_VIEW > 5.5f) {
+      // Sun sprite value: brightest channel of the raw scene / 64 (the sun shader writes
+      // 64 x falloff^2 x colour). Drawn as a flat 1 + 4 * s (s clamped to 0..1.4): nits =
+      // 203 * (1 + 4 * s), so HDR Analysis "max" gives the centre value (s = (max/203 - 1) / 4).
+      // WIDE scale: nits = 203 * (1 + s / 4), s unclamped (up to ~22), so s = 4 * (max/203 - 1).
+      float sun_val = max(clr.r, max(clr.g, clr.b)) / COJ_SUN_MARKER;
+      // LOG version: nits = 203 * (1 + 1.25 * log10(1 + s)); s = 10^((nits/203 - 1)/1.25) - 1.
+      dbg = (1.f + 1.25f * log10(1.f + sun_val)).xxx;
+    } else if (CUSTOM_DEBUG_VIEW > 4.5f) {
+      // Curve LUT slope of the last segment (texel centres 30.5/32 -> 31.5/32, 1/31 apart in x),
+      // per channel: left third = R, middle = G, right = B, each drawn as a flat value
+      // 1 + 4 * slope (slope clamped to 0..1.4), i.e. nits = 203 * (1 + 4 * slope) at game white
+      // 203 nits. Top 3% of the screen: white = curve in gamma mode (f_curves_new.x > 0), black = linear.
+      float3 crv_top = float3(
+          tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).x,
+          tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).y,
+          tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).z);
+      float3 crv_prev = float3(
+          tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).x,
+          tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).y,
+          tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).z);
+      float3 crv_slope = clamp((crv_top - crv_prev) * 31.f, 0.f, 1.4f);
+      float band = (uv.x < 0.3333f) ? crv_slope.x : ((uv.x < 0.6667f) ? crv_slope.y : crv_slope.z);
+      float gamma_mode = (f_curves_new.x > 0.f) ? 1.f : 0.f;
+      float v = (uv.y < 0.03f) ? gamma_mode : (1.f + 4.f * band);
+      dbg = v.xxx;
+    } else if (CUSTOM_DEBUG_VIEW < 1.5f) {
       dbg = CoJDisplayMap(max(0, raw), peak_r);
     } else if (CUSTOM_DEBUG_VIEW < 2.5f) {
       dbg = saturate(raw);
@@ -307,8 +395,22 @@ float4 main(float2 uv : TEXCOORD0
   if (sun_mask > 0.f) {
     // Sun up to "Sun Brightness" x peak (relative to game white), keeping its hue.
     float peak_ratio = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-    float3 sun = color / max(1e-4f, max(color.r, max(color.g, color.b))) * peak_ratio * CUSTOM_SUN_BRIGHTNESS;
-    color = lerp(color, max(color, sun), sun_mask);
+    // Radial core: from the pixel's own (unmarked) level at the disc rim up to Sun Brightness x
+    // peak at the centre. Sun Core Shape sets the bell: 0 = broad dome, 100 = small hot core.
+    float mc = max(1e-4f, max(color.r, max(color.g, color.b)));
+    float t = saturate((sun_core - 0.4f) / 0.55f);
+    float shape = pow(t, lerp(0.5f, 3.f, saturate(CUSTOM_SUN_PROFILE)));
+    // Scaled by this pixel's own sun detection, so the sprite's soft edge and clouds in front of
+    // the sun fade the boost continuously (no cut-out).
+    float level = lerp(mc, max(mc, peak_ratio * CUSTOM_SUN_BRIGHTNESS), shape * CoJSunMarker(clr_a));
+    color = lerp(color, color * (level / mc), sun_mask);
+  }
+
+  if (halo_mask > 0.f) {
+    // 100% = up to half the peak (in game-white units) at the mask's maximum; not added on the
+    // sun core itself (already at its brightness).
+    float halo_peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+    color += halo_col * (halo_mask * (1.f - sun_mask) * CUSTOM_SUN_HALO * halo_peak * 0.5f);
   }
 
 #if COJ_OVERLAY
