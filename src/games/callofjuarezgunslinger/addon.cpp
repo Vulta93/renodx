@@ -56,7 +56,14 @@ bool OnSceneCopyDraw(reshade::api::command_list* cmd_list) {
   if (current_render_target.handle != 0u && !final_pass_ran_this_frame) {
     auto* device = cmd_list->get_device();
     auto res = device->get_resource_from_view(current_render_target);
-    if (res.handle != 0u && device->get_resource_desc(res).texture.width >= 1024) full_res = 1.f;
+    if (res.handle != 0u) {
+      auto desc = device->get_resource_desc(res);
+      if (desc.texture.width >= 1024) {
+        // 1 = copy into an 8-bit target (heat haze), 2 = copy into the upgraded float16 scene
+        // target #1 (damage "tear" refraction source, composite output).
+        full_res = (desc.texture.format == reshade::api::format::r16g16b16a16_float) ? 2.f : 1.f;
+      }
+    }
   }
   shader_injection.copy_full_res = full_res;
   return true;
@@ -93,6 +100,9 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x3848A019),
     CustomShaderEntry(0x41AE4161),
     CustomShaderEntryCallback(0x35B8A99A, &OnSceneCopyDraw),
+    CustomShaderEntry(0x03AF484E),
+    CustomShaderEntry(0x1CF69E72),
+    CustomShaderEntry(0x773CC21F),
     CustomShaderEntryCallback(0x001F451B, &OnCompositeDraw),
     CustomShaderEntryCallback(0x04E01654, &OnCompositeDraw),
     CustomShaderEntryCallback(0x07BB9390, &OnCompositeDraw),
