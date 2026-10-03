@@ -686,6 +686,13 @@ void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ToneMapPeakNits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapGameNits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapUINits", 203.f);
+  renodx::utils::settings::UpdateSetting("FxSkyHDRBoost", 0.f);
+  renodx::utils::settings::UpdateSetting("FxSunBrightness", 0.f);
+  renodx::utils::settings::UpdateSetting("SunHalo", 0.f);
+  renodx::utils::settings::UpdateSetting("FxHighlightGain", 100.f);
+  renodx::utils::settings::UpdateSetting("FxShadowLift", 0.f);
+  renodx::utils::settings::UpdateSetting("FxDepthOfField", 100.f);
+  renodx::utils::settings::UpdateSetting("FxGlow", 100.f);
 }
 
 bool initialized = false;

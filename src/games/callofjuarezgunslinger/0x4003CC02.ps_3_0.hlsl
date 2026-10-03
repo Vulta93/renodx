@@ -15,8 +15,9 @@ float4 main(float2 uv : TEXCOORD0) : COLOR {
   // colour normalised by its max channel and scale the result back linearly.
   float scale = max(1.f, max(linear_color.r, max(linear_color.g, linear_color.b)));
   // Shadow Lift: same mechanism as the game's brightness option (smaller exponent),
-  // white stays white. 100% = exponent x0.7, 250% = x0.25.
-  float gamma_exp = GAMMA.y * (1.f - 0.3f * clamp(CUSTOM_SHADOW_LIFT, 0.f, 2.5f));
+  // white stays white. 100% = exponent x0.7, 250% = x0.25. Vanilla mode leaves the game's exponent alone.
+  float shadow_lift = (RENODX_TONE_MAP_TYPE > 0.f) ? clamp(CUSTOM_SHADOW_LIFT, 0.f, 2.5f) : 0.f;
+  float gamma_exp = GAMMA.y * (1.f - 0.3f * shadow_lift);
   float3 encoded = renodx::math::SignPow(linear_color / scale, gamma_exp);
   float3 color = renodx::color::srgb::DecodeSafe(encoded) * scale;
   color = renodx::draw::RenderIntermediatePass(color);

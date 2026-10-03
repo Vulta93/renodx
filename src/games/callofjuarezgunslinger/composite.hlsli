@@ -363,7 +363,7 @@ float4 main(float2 uv : TEXCOORD0
   float glow_scale = CONST_100.w * (RENODX_TONE_MAP_TYPE > 0.f ? CUSTOM_GLOW_STRENGTH : 1.f);
   float3 color = clr;
 #if COJ_BLUR
-  color = saturate(lerp(color, blur.rgb, saturate(blur.a) * CUSTOM_DOF_STRENGTH));
+  color = saturate(lerp(color, blur.rgb, saturate(blur.a) * ((RENODX_TONE_MAP_TYPE > 0.f) ? CUSTOM_DOF_STRENGTH : 1.f)));
 #endif
   color = saturate(glow * glow_scale + color);
   float3 graded;
