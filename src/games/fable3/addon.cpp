@@ -7,6 +7,8 @@
 
 #define DEBUG_LEVEL_0
 
+#include <cfloat>
+
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
@@ -28,6 +30,24 @@ ShaderInjectData shader_injection;
 float current_settings_mode = 0;
 
 renodx::utils::settings::Settings settings = {
+    // Mouse guard. With the Display Proxy there are TWO ImGui contexts drawing this menu every frame: the real
+    // ReShade window (wide) and a second, narrow "RenoDX" window of the proxy runtime (not used). Both read the
+    // same mouse position, so dragging one slider also moved a slider of the narrow copy. This hidden, sticky
+    // entry runs first in every context and makes the narrow copy ignore the mouse.
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .label = "mouse guard",
+        .is_sticky = true,
+        .on_draw = []() {
+          if (ImGui::GetWindowSize().x < 600.f) {
+            ImGuiIO& io = ImGui::GetIO();
+            io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+            io.MouseClicked[0] = false;
+            io.MouseDoubleClicked[0] = false;
+          }
+          return false;
+        },
+    },
     new renodx::utils::settings::Setting{
         .key = "SettingsMode",
         .binding = &current_settings_mode,
