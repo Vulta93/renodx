@@ -2,6 +2,9 @@
   "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
   "id": "sleepingdogsde",
   "title": "Sleeping Dogs: Definitive Edition",
+  "compatibility": "in-progress",
+  "status": "experimental",
+  "summary": "HDR tone mapping for Sleeping Dogs: Definitive Edition (DX11) that keeps the vanilla look and extends the clipped highlights.",
   "deploy": {
     "steam_appid": 307690
   }
