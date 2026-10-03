@@ -7,8 +7,9 @@
 // (s_crv, optionally in gamma 2.2), levels, colorize and an overlay multiply.
 // The result is linear; the final pass 0x4003CC02 applies GAMMA.
 //
-// HDR: with the packed-depth target left 8-bit the lit scene is essentially SDR, so the
-// vanilla image is rebuilt exactly and its highlights are expanded (CoJExpandHDR).
+// HDR ("Extended"): the vanilla grade is rebuilt on the unclipped float16 scene (CoJGradeExt),
+// the sky's few over-white values are expanded (CoJExpandHDR, Sky HDR Boost) and the sun is
+// brightened separately.
 #include "./common.hlsli"
 
 static const float3 COJ_LUMA = float3(0.2125f, 0.7154f, 0.0721f);
@@ -151,7 +152,7 @@ float3 CoJExpandHDR(float3 sdr, float boost) {
   return sdr * (y_new / y);
 }
 
-// Display map for the debug views: exact up to game white (1.0), above it a Neutwo shoulder
+// Display map (Neutwo-style): exact up to game white (1.0), above it a Neutwo shoulder
 // (slope 1 at white) towards peak. Scales by the max channel, so hue is kept.
 float3 CoJDisplayMap(float3 c, float peak_ratio) {
   float m = max(c.r, max(c.g, c.b));
@@ -207,7 +208,14 @@ float4 main(float2 uv : TEXCOORD0
   // bell-shaped weights) into a smooth radial falloff: full boost in the core, fading
   // gradually through the rim into the sky with no plateau.
   float sun_mask = 0.f;
-  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_SUN_BRIGHTNESS > 0.f) {
+  // The sun blurs below only matter near the sun: the addon passes the sun sprite's screen position
+  // and disc radius (0 = no sun this frame). Farther away than the widest blur reach plus the disc
+  // radius every tap would read zero, so skip them (same result, a lot cheaper). Distances are in
+  // uv-x units with y scaled so they are round in pixels on a 16:9 screen, like the taps.
+  float sun_dist = length((uv - float2(CUSTOM_SUN_UV_X, CUSTOM_SUN_UV_Y)) * float2(1.f, 9.f / 16.f));
+  float sun_reach = max(0.032f * CUSTOM_SUN_REACH, (CUSTOM_SUN_HALO > 0.f) ? 0.12f * CUSTOM_SUN_HALO_RADIUS : 0.f);
+  bool sun_near = CUSTOM_SUN_DISC_RADIUS > 0.f && sun_dist < (sun_reach + CUSTOM_SUN_DISC_RADIUS) * 1.1f + 0.01f;
+  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_SUN_BRIGHTNESS > 0.f && sun_near) {
     static const float2 dirs[8] = {
         float2(1.f, 0.f), float2(0.7071f, 0.7071f), float2(0.f, 1.f), float2(-0.7071f, 0.7071f),
         float2(-1.f, 0.f), float2(-0.7071f, -0.7071f), float2(0.f, -1.f), float2(0.7071f, -0.7071f)};
@@ -262,12 +270,12 @@ float4 main(float2 uv : TEXCOORD0
     sun_core = p_sum / max(p_cover, 0.5f * p_w);
   }
 
-  // TEMPORARY sun halo test: a much wider, faint glow around the sun (SDR has a broad glare
+  // Sun halo: a much wider, faint glow around the sun (SDR has a broad glare
   // there that the HDR sun lacks). Wide blur of the same sun marker (6 rings x 8 taps, bell
   // weights); the halo takes the sun's own hue (marker-weighted, normalised colour).
   float halo_mask = 0.f;
   float3 halo_col = 1.f;
-  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_SUN_BRIGHTNESS > 0.f && CUSTOM_SUN_HALO > 0.f) {
+  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_SUN_BRIGHTNESS > 0.f && CUSTOM_SUN_HALO > 0.f && sun_near) {
     static const float2 hdirs[8] = {
         float2(1.f, 0.f), float2(0.7071f, 0.7071f), float2(0.f, 1.f), float2(-0.7071f, 0.7071f),
         float2(-1.f, 0.f), float2(-0.7071f, -0.7071f), float2(0.f, -1.f), float2(0.7071f, -0.7071f)};
@@ -299,64 +307,6 @@ float4 main(float2 uv : TEXCOORD0
     float hmask = saturate(h_sum / max(h_cover, 0.5f * h_w));
     halo_mask = hmask * hmask * (3.f - 2.f * hmask);
     halo_col = h_col / max(1e-4f, h_sum);
-  }
-
-  // TEMPORARY debug views of the raw float16 scene (before the composite's clip / grade).
-  if (RENODX_TONE_MAP_TYPE > 0.f && CUSTOM_DEBUG_VIEW > 0.5f) {
-    float3 raw = clr + glow * (CONST_100.w * CUSTOM_GLOW_STRENGTH);
-    float peak_r = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-    float3 dbg;
-    if (CUSTOM_DEBUG_VIEW > 5.5f) {
-      // Sun sprite value: brightest channel of the raw scene / 64 (the sun shader writes
-      // 64 x falloff^2 x colour). Drawn as a flat 1 + 4 * s (s clamped to 0..1.4): nits =
-      // 203 * (1 + 4 * s), so HDR Analysis "max" gives the centre value (s = (max/203 - 1) / 4).
-      // WIDE scale: nits = 203 * (1 + s / 4), s unclamped (up to ~22), so s = 4 * (max/203 - 1).
-      float sun_val = max(clr.r, max(clr.g, clr.b)) / COJ_SUN_MARKER;
-      // LOG version: nits = 203 * (1 + 1.25 * log10(1 + s)); s = 10^((nits/203 - 1)/1.25) - 1.
-      dbg = (1.f + 1.25f * log10(1.f + sun_val)).xxx;
-    } else if (CUSTOM_DEBUG_VIEW > 4.5f) {
-      // Curve LUT slope of the last segment (texel centres 30.5/32 -> 31.5/32, 1/31 apart in x),
-      // per channel: left third = R, middle = G, right = B, each drawn as a flat value
-      // 1 + 4 * slope (slope clamped to 0..1.4), i.e. nits = 203 * (1 + 4 * slope) at game white
-      // 203 nits. Top 3% of the screen: white = curve in gamma mode (f_curves_new.x > 0), black = linear.
-      float3 crv_top = float3(
-          tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).x,
-          tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).y,
-          tex2Dlod(s_crv, float4(0.984375f, 0.984375f, 0.f, 0.f)).z);
-      float3 crv_prev = float3(
-          tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).x,
-          tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).y,
-          tex2Dlod(s_crv, float4(0.953125f, 0.953125f, 0.f, 0.f)).z);
-      float3 crv_slope = clamp((crv_top - crv_prev) * 31.f, 0.f, 1.4f);
-      float band = (uv.x < 0.3333f) ? crv_slope.x : ((uv.x < 0.6667f) ? crv_slope.y : crv_slope.z);
-      float gamma_mode = (f_curves_new.x > 0.f) ? 1.f : 0.f;
-      float v = (uv.y < 0.03f) ? gamma_mode : (1.f + 4.f * band);
-      dbg = v.xxx;
-    } else if (CUSTOM_DEBUG_VIEW < 1.5f) {
-      dbg = CoJDisplayMap(max(0, raw), peak_r);
-    } else if (CUSTOM_DEBUG_VIEW < 2.5f) {
-      dbg = saturate(raw);
-    } else if (CUSTOM_DEBUG_VIEW > 3.5f) {
-      // Extended grade vs vanilla grade where the raw scene is <= white: should match (grey);
-      // yellow = differs > 2%, red = differs > 10% (a vanilla intermediate clip).
-      float3 v = CoJGrade(saturate(raw), 0.f);
-      float3 e = CoJGradeExt(min(max(0, raw), 1000.f), 0.f);
-      dbg = v * 0.3f;
-      if (max(raw.r, max(raw.g, raw.b)) <= 1.f) {
-        float d = max(abs(e.r - v.r), max(abs(e.g - v.g), abs(e.b - v.b)));
-        if (d > 0.1f) dbg = float3(1.f, 0.f, 0.f);
-        else if (d > 0.02f) dbg = float3(1.f, 1.f, 0.f);
-      }
-    } else {
-      float m = max(raw.r, max(raw.g, raw.b));
-      // dim clipped image; over-white pixels: green 1-1.5, yellow 1.5-3, red 3-16, magenta >16
-      dbg = saturate(raw) * 0.3f;
-      if (m > 16.f) dbg = float3(1.f, 0.f, 1.f);
-      else if (m > 3.f) dbg = float3(1.f, 0.f, 0.f);
-      else if (m > 1.5f) dbg = float3(1.f, 1.f, 0.f);
-      else if (m > 1.f) dbg = float3(0.f, 1.f, 0.f);
-    }
-    return float4(CoJEncodeHDR(dbg), 0.f);
   }
 
   // Vanilla composite (the game's clip at white is its only "tone mapping").
@@ -402,18 +352,6 @@ float4 main(float2 uv : TEXCOORD0
     graded = CoJGrade(color, noise);
   }
 
-  if (RENODX_TONE_MAP_TYPE > 0.f && RENODX_TONE_MAP_TYPE < 3.5f) {
-    // Expansion factor from the noise-free image: film grain near white is otherwise
-    // amplified by the steep part of the curve ("boiling" bright clouds).
-#if COJ_NOISE
-    float3 clean = CoJGrade(color, 0.f);
-#else
-    float3 clean = graded;
-#endif
-    float y_clean = renodx::color::y::from::BT709(clean);
-    float y_expanded = renodx::color::y::from::BT709(CoJExpandHDR(clean, lerp(CUSTOM_HDR_BOOST, CUSTOM_SKY_HDR_BOOST, sky_mask)));
-    graded *= (y_clean > 0.f) ? (y_expanded / y_clean) : 1.f;
-  }
   color = graded;
 
   if (sun_mask > 0.f) {

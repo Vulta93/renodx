@@ -8,7 +8,9 @@
 #define DEBUG_LEVEL_0
 
 #include <atomic>
-#include <sstream>
+#include <cfloat>
+#include <cmath>
+#include <iterator>
 
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
@@ -17,6 +19,7 @@
 
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
+#include "../../utils/bitwise.hpp"
 #include "../../utils/settings.hpp"
 #include "../../utils/shader.hpp"
 #include "./shared.h"
@@ -92,34 +95,66 @@ void OnPresentFrameReset(reshade::api::command_queue* queue,
                          const reshade::api::rect* dirty_rects) {
   composite_ran_this_frame = false;
   final_pass_ran_this_frame = false;
+  // No sun sprite seen yet this frame: the composite skips the sun blurs (radius 0 = no sun).
+  shader_injection.sun_disc_radius = 0.f;
 }
 
-// TEMPORARY: blend state of the sun-disc draw 0x795E3B26 (is it additive or alpha blended?).
-// Logged to ReShade.log as "SUNBLEND ..." (first 5 draws, then every 900th).
-std::atomic<uint32_t> tmp_states[256] = {};
+// Sun culling. The sun sprite 0x795E3B26 is drawn every frame, even when the sun is off screen or
+// behind the camera, and the composite's sun blurs are expensive. The sprite's vertex shader
+// 0xE0DD40E2 is: r0 = v0 * c4.xxyz + c4.zzzw; o0 = (c0..c3) . r0, so the quad centre projects through
+// the matrix rows c0..c3 and its half size comes from the scale in c4. Track the vertex constants
+// c0..c7 and, at the sun draw, hand the composite the sun's screen position and a conservative disc
+// radius (uv-x units, 16:9 pixel-round metric). The composite skips pixels farther away than the
+// blur reach plus this radius.
+float vs_constants[8 * 4] = {};
 
-void OnBindPipelineStatesTemp(reshade::api::command_list*, uint32_t count, const reshade::api::dynamic_state* states,
-                              const uint32_t* values) {
+void OnPushConstants(reshade::api::command_list*, reshade::api::shader_stage stages, reshade::api::pipeline_layout,
+                     uint32_t, uint32_t first, uint32_t count, const void* values) {
+  if (!renodx::utils::bitwise::HasFlag(stages, reshade::api::shader_stage::vertex)) return;
+  const auto* source = static_cast<const float*>(values);
   for (uint32_t i = 0; i < count; ++i) {
-    auto st = static_cast<uint32_t>(states[i]);
-    if (st < 256) tmp_states[st] = values[i];
+    const uint32_t index = first + i;
+    if (index < std::size(vs_constants)) vs_constants[index] = source[i];
   }
 }
 
-bool OnSunDiscDraw(reshade::api::command_list*) {
-  static std::atomic<uint32_t> count = 0;
-  uint32_t n = count++;
-  if (n < 5 || n % 900 == 0) {
-    using DS = reshade::api::dynamic_state;
-    auto st = [](DS d) { return tmp_states[static_cast<uint32_t>(d)].load(); };
-    std::stringstream ss;
-    ss << "SUNBLEND draw " << n << " blend_enable " << st(DS::blend_enable) << " color src/dst "
-       << st(DS::source_color_blend_factor) << "/" << st(DS::dest_color_blend_factor) << " alpha src/dst "
-       << st(DS::source_alpha_blend_factor) << "/" << st(DS::dest_alpha_blend_factor) << " write_mask "
-       << st(DS::render_target_write_mask) << " srgb_write " << st(DS::srgb_write_enable)
-       << " (factors: 0 zero, 1 one, 6 src_alpha, 7 1-src_alpha)";
-    reshade::log::message(reshade::log::level::info, ss.str().c_str());
+void UpdateSunScreenPosition() {
+  const float* c = vs_constants;  // row i of the matrix = c[i * 4 .. i * 4 + 3]; scale/offset = c[16..19]
+  // The quad is a huge distant billboard (c4 = 25000, 250000, 0, 1 in the log): assume its centre is
+  // v0 = (0, 0, 1, 1), i.e. r0 = (c4.z, c4.z, c4.y + c4.z, c4.z + c4.w).
+  const float centre[4] = {c[18], c[18], c[17] + c[18], c[18] + c[19]};
+  auto dot4 = [&](int row) {
+    return c[row * 4 + 0] * centre[0] + c[row * 4 + 1] * centre[1] + c[row * 4 + 2] * centre[2]
+           + c[row * 4 + 3] * centre[3];
+  };
+  const float clip_x = dot4(0);
+  const float clip_y = dot4(1);
+  const float clip_w = dot4(3);
+
+  float uv_x = 0.f;
+  float uv_y = 0.f;
+  float radius = 0.f;
+  if (clip_w > 1e-4f) {
+    const float ndc_x = clip_x / clip_w;
+    const float ndc_y = clip_y / clip_w;
+    uv_x = ndc_x * 0.5f + 0.5f;
+    uv_y = 0.5f - ndc_y * 0.5f;
+    // Half extent of the quad on screen (NDC): a unit step along v0.x / v0.y moves a corner by c4.x times
+    // that row's x / y entries (c0.x, c0.y for screen x; c1.x, c1.y for screen y).
+    const float half_x = std::fabs(c[16]) * (std::fabs(c[0]) + std::fabs(c[1])) / clip_w;
+    const float half_y = std::fabs(c[16]) * (std::fabs(c[4]) + std::fabs(c[5])) / clip_w;
+    radius = 1.25f * std::fmax(half_x * 0.5f, half_y * 0.5f * (9.f / 16.f));
+    radius = std::fmax(radius, 1e-3f);
   }
+  shader_injection.sun_uv_x = uv_x;
+  shader_injection.sun_uv_y = uv_y;
+  shader_injection.sun_disc_radius = radius;
+}
+
+// RenoDX runs the custom-shader callback from its own draw handler, so the sun's vertex constants have
+// already been pushed when OnSunDiscDraw runs and can be read there directly.
+bool OnSunDiscDraw(reshade::api::command_list*) {
+  UpdateSunScreenPosition();
   return true;
 }
 
@@ -202,6 +237,25 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 float current_settings_mode = 0;
 
 renodx::utils::settings::Settings settings = {
+    // Mouse guard. With the Display Proxy there are TWO ImGui contexts drawing this menu every frame: the real
+    // ReShade window (wide) and a second, narrow "RenoDX" window of the proxy runtime (about 286 px wide, not
+    // used). Both read the same mouse position, so a click on a button in the real menu also hit a slider of
+    // the narrow copy and moved it. This hidden, sticky entry runs first in every context and makes the narrow
+    // copy ignore the mouse.
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .label = "mouse guard",
+        .is_sticky = true,
+        .on_draw = []() {
+          if (ImGui::GetWindowSize().x < 600.f) {
+            ImGuiIO& io = ImGui::GetIO();
+            io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+            io.MouseClicked[0] = false;
+            io.MouseDoubleClicked[0] = false;
+          }
+          return false;
+        },
+    },
     new renodx::utils::settings::Setting{
         .key = "SettingsMode",
         .binding = &current_settings_mode,
@@ -216,14 +270,15 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapType",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 3.f,
+        .default_value = 1.f,
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .tooltip = "Sets the tone mapper type. Extended = the game's grade applied to the unclipped scene (HDR from real scene values). Only the sky uses Sky HDR Boost / HDR Highlight Start; World HDR Boost is unused.",
+        .tooltip = "Vanilla = the game's own look. Extended = the game's grade applied to the unclipped scene (HDR from real scene values). Only the sky uses Sky HDR Boost / HDR Highlight Start.",
         // ACES is not offered: it renders a white screen under DX9 / ps_3_0.
-        .labels = {"Vanilla", "None", "RenoDRT", "Extended"},
-        .parse = [](float value) { return value == 2.f ? 3.f : (value == 3.f ? 4.f : value); },
+        // Shader value 4 = Extended (the RenoDX library's own types 1..3 are unused here).
+        .labels = {"Vanilla", "Extended"},
+        .parse = [](float value) { return value >= 1.f ? 4.f : 0.f; },
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -269,17 +324,6 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
-        .key = "FxHDRBoost",
-        .binding = &shader_injection.hdr_boost,
-        .default_value = 10.f,
-        .label = "World HDR Boost",
-        .section = "Effects",
-        .tooltip = "How far above paper white the brightest parts of the world go (100 = Peak Brightness).",
-        .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
-        .parse = [](float value) { return value * 0.01f; },
-    },
-    new renodx::utils::settings::Setting{
         .key = "FxSkyHDRBoost",
         .binding = &shader_injection.sky_hdr_boost,
         .default_value = 22.f,
@@ -310,6 +354,17 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Brightness of the sun disc (100 = Peak Brightness, 0 = like the rest of the image).",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
+        .parse = [](float value) { return value * 0.01f; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "FxHighlightGain",
+        .binding = &shader_injection.highlight_gain,
+        .default_value = 100.f,
+        .label = "Highlight Gain",
+        .section = "Effects",
+        .tooltip = "Extended tone mapper only: scales the part of the image above game white (100 = the game's own values, higher = brighter highlights). Everything below white is unchanged.",
+        .max = 500.f,
+        .is_enabled = []() { return shader_injection.tone_map_type > 3.5f; },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
@@ -348,7 +403,7 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.sun_profile,
         .default_value = 50.f,
         .label = "Sun Core Shape",
-        .section = "Sun (temporary)",
+        .section = "Sun",
         .tooltip = "Radial brightness of the sun disc: peak at the centre fading to the rim. 0 = broad dome, 100 = small hot core.",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
@@ -360,7 +415,7 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.sun_reach,
         .default_value = 200.f,
         .label = "Sun Mask Reach",
-        .section = "Sun (temporary)",
+        .section = "Sun",
         .tooltip = "How far the sun's soft brightening mask reaches beyond the disc (100 = current).",
         .max = 300.0f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
@@ -372,7 +427,7 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.sun_falloff,
         .default_value = 75.f,
         .label = "Sun Mask Falloff",
-        .section = "Sun (temporary)",
+        .section = "Sun",
         .tooltip = "Shape of the sun mask edge (100 = current; lower = fuller and harder, higher = tighter and softer core).",
         .min = 10.f,
         .max = 300.0f,
@@ -385,7 +440,7 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.sun_halo,
         .default_value = 50.f,
         .label = "Sun Halo",
-        .section = "Sun (temporary)",
+        .section = "Sun",
         .tooltip = "Strength of a wide faint glow around the sun in the sun's own colour (0 = off = current).",
         .max = 100.0f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
@@ -397,36 +452,12 @@ renodx::utils::settings::Settings settings = {
         .binding = &shader_injection.sun_halo_radius,
         .default_value = 100.f,
         .label = "Sun Halo Reach",
-        .section = "Sun (temporary)",
+        .section = "Sun",
         .tooltip = "How far the halo reaches (100 = about 12% of the screen width).",
         .max = 300.0f,
         .is_enabled = []() { return shader_injection.tone_map_type > 0; },
         .parse = [](float value) { return value * 0.01f; },
         .is_visible = []() { return current_settings_mode >= 1; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "FxHighlightGain",
-        .binding = &shader_injection.highlight_gain,
-        .default_value = 100.f,
-        .label = "Highlight Gain",
-        .section = "Effects",
-        .tooltip = "Extended tone mapper only: scales the part of the image above game white (100 = the game's own values, higher = brighter highlights). Everything below white is unchanged.",
-        .max = 500.f,
-        .is_enabled = []() { return shader_injection.tone_map_type > 3.5f; },
-        .parse = [](float value) { return value * 0.01f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "DebugView",
-        .binding = &shader_injection.debug_view,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .can_reset = true,
-        .label = "Debug View (temporary)",
-        .section = "Debug",
-        .tooltip = "Raw float16 scene before the composite's clip: 1 = display-mapped, 2 = clipped like vanilla, 3 = false-colour map of values above white, 4 = where Extended differs from vanilla below white.",
-        .labels = {"Off", "Raw scene (display-mapped)", "Raw scene (clipped)", "Over-white map", "Extended vs vanilla diff", "Curve slope (R|G|B bands)", "Sun sprite value"},
-        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
-        .is_visible = []() { return current_settings_mode >= 2; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainCustomColorSpace",
@@ -528,8 +559,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::present>(OnPresentFrameReset);
+      reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
-      reshade::register_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStatesTemp);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -663,26 +694,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           settings.push_back(setting);
         }
 
-        // DEBUG: global toggle (needs a game restart) to test what the upgrade changes.
-        {
-          auto* setting = new renodx::utils::settings::Setting{
-              .key = "DebugUpgradeTargets",
-              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 1.f,
-              .label = "DEBUG: Upgrade Render Targets (restart)",
-              .section = "Debug",
-              .labels = {"Off", "On"},
-              .is_global = true,
-          };
-          renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, setting);
-          settings.push_back(setting);
-          if (setting->GetValue() == 0.f) {
-            reshade::log::message(reshade::log::level::info, "callofjuarezgunslinger: DEBUG render target upgrades OFF");
-            initialized = true;
-            break;
-          }
-        }
-
         // Full-resolution intermediates are D3DFMT_A8R8G8B8 (as in Bound in Blood). Upgrade only
         // output-sized targets: "output ratio" also catches smaller buffers that rely on
         // 8-bit clamping and tints the whole image pink.
@@ -718,8 +729,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::present>(OnPresentFrameReset);
+      reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
-      reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(OnBindPipelineStatesTemp);
       reshade::unregister_addon(h_module);
       break;
   }

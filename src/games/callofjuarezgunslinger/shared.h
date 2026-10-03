@@ -42,7 +42,7 @@ struct ShaderInjectData {
   float swap_chain_encoding;
   float swap_chain_encoding_color_space;
   float glow_strength;
-  float hdr_boost;
+  float padding1;
 
   float highlight_start;
   float sun_brightness;
@@ -51,7 +51,7 @@ struct ShaderInjectData {
 
   float sky_hdr_boost;
   float copy_full_res;
-  float debug_view;
+  float padding0;
   float highlight_gain;
 
   float sun_reach;
@@ -60,9 +60,9 @@ struct ShaderInjectData {
   float sun_halo_radius;
 
   float sun_profile;
-  float padding3;
-  float padding4;
-  float padding5;
+  float sun_uv_x;
+  float sun_uv_y;
+  float sun_disc_radius;
 };
 
 #ifndef __cplusplus
@@ -101,20 +101,21 @@ float4 shader_injection[12] : register(c50);
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection[7][0]
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection[7][1]
 #define CUSTOM_GLOW_STRENGTH                   shader_injection[7][2]
-#define CUSTOM_HDR_BOOST                       shader_injection[7][3]
 #define CUSTOM_HIGHLIGHT_START                 shader_injection[8][0]
 #define CUSTOM_SHADOW_LIFT                     shader_injection[8][2]
 #define CUSTOM_DOF_STRENGTH                    shader_injection[8][3]
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection[8][1]
 #define CUSTOM_SKY_HDR_BOOST                   shader_injection[9][0]
 #define CUSTOM_COPY_FULL_RES                   shader_injection[9][1]
-#define CUSTOM_DEBUG_VIEW                      shader_injection[9][2]
 #define CUSTOM_HIGHLIGHT_GAIN                  shader_injection[9][3]
 #define CUSTOM_SUN_REACH                       shader_injection[10][0]
 #define CUSTOM_SUN_FALLOFF                     shader_injection[10][1]
 #define CUSTOM_SUN_HALO                        shader_injection[10][2]
 #define CUSTOM_SUN_HALO_RADIUS                 shader_injection[10][3]
 #define CUSTOM_SUN_PROFILE                     shader_injection[11][0]
+#define CUSTOM_SUN_UV_X                        shader_injection[11][1]
+#define CUSTOM_SUN_UV_Y                        shader_injection[11][2]
+#define CUSTOM_SUN_DISC_RADIUS                 shader_injection[11][3]
 
 #else
 
@@ -155,20 +156,21 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection.swap_chain_encoding
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
 #define CUSTOM_GLOW_STRENGTH                   shader_injection.glow_strength
-#define CUSTOM_HDR_BOOST                       shader_injection.hdr_boost
 #define CUSTOM_HIGHLIGHT_START                 shader_injection.highlight_start
 #define CUSTOM_SHADOW_LIFT                     shader_injection.shadow_lift
 #define CUSTOM_DOF_STRENGTH                    shader_injection.dof_strength
 #define CUSTOM_SUN_BRIGHTNESS                  shader_injection.sun_brightness
 #define CUSTOM_SKY_HDR_BOOST                   shader_injection.sky_hdr_boost
 #define CUSTOM_COPY_FULL_RES                   shader_injection.copy_full_res
-#define CUSTOM_DEBUG_VIEW                      shader_injection.debug_view
 #define CUSTOM_HIGHLIGHT_GAIN                  shader_injection.highlight_gain
 #define CUSTOM_SUN_REACH                       shader_injection.sun_reach
 #define CUSTOM_SUN_FALLOFF                     shader_injection.sun_falloff
 #define CUSTOM_SUN_HALO                        shader_injection.sun_halo
 #define CUSTOM_SUN_HALO_RADIUS                 shader_injection.sun_halo_radius
 #define CUSTOM_SUN_PROFILE                     shader_injection.sun_profile
+#define CUSTOM_SUN_UV_X                        shader_injection.sun_uv_x
+#define CUSTOM_SUN_UV_Y                        shader_injection.sun_uv_y
+#define CUSTOM_SUN_DISC_RADIUS                 shader_injection.sun_disc_radius
 
 #endif
 
