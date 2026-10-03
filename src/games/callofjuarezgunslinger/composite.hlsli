@@ -164,9 +164,19 @@ float3 CoJDisplayMap(float3 c, float peak_ratio) {
 // Sun detection without a marker: the sky has nothing above white of its own, so a SKY pixel
 // (alpha < 0, see the sky marker) above white is the sun sprite (vanilla value ~2.2 x white).
 // Clouds in front of the sun lower it continuously, so they occlude the boost naturally.
-float CoJSunMarker(float4 c) {
-  return smoothstep(1.05f, 1.8f, max(c.r, max(c.g, c.b))) * saturate(-c.a);
+float CoJSkyCover(float4 c) {
+  return saturate(-c.a);
 }
+
+float CoJSunMarker(float4 c) {
+  return smoothstep(1.05f, 1.8f, max(c.r, max(c.g, c.b))) * CoJSkyCover(c);
+}
+
+// The sun blurs below use few taps over a wide radius. A world object in front of the sun (the
+// gun) punches a hole in the marker, and every tap that lands on it makes a visible step: ghost
+// copies of the gun's outline. So each blur is divided by the SKY weight it collected instead of
+// the full kernel weight: the sun carries on behind the occluder. Floor 0.5 of the kernel weight
+// keeps the result continuous (and bounded) where almost nothing is sky.
 
 float4 main(float2 uv : TEXCOORD0
 #if COJ_NOISE
@@ -204,17 +214,22 @@ float4 main(float2 uv : TEXCOORD0
     static const float ring_weight[4] = {0.9f, 0.7f, 0.45f, 0.25f};
     const float2 aspect = float2(1.f, 16.f / 9.f);
     float sum = CoJSunMarker(clr_a);
+    float cover = CoJSkyCover(clr_a);
     float weight = 1.f;
     [unroll] for (int ring = 0; ring < 4; ++ring) {
       float radius = 0.008f * (ring + 1) * CUSTOM_SUN_REACH;
       float ring_sum = 0.f;
+      float ring_cover = 0.f;
       [unroll] for (int k = 0; k < 8; ++k) {
-        ring_sum += CoJSunMarker(tex2Dlod(s_clr, float4(uv + dirs[k] * aspect * radius, 0.f, 0.f)));
+        float4 tap = tex2Dlod(s_clr, float4(uv + dirs[k] * aspect * radius, 0.f, 0.f));
+        ring_sum += CoJSunMarker(tap);
+        ring_cover += CoJSkyCover(tap);
       }
       sum += ring_sum / 8.f * ring_weight[ring];
+      cover += ring_cover / 8.f * ring_weight[ring];
       weight += ring_weight[ring];
     }
-    float m = pow(saturate(sum / weight * 1.6f), max(0.1f, CUSTOM_SUN_FALLOFF));
+    float m = pow(saturate(sum / max(cover, 0.5f * weight) * 1.6f), max(0.1f, CUSTOM_SUN_FALLOFF));
     sun_mask = m * m * (3.f - 2.f * m);
   }
 
@@ -226,20 +241,25 @@ float4 main(float2 uv : TEXCOORD0
   [branch] if (sun_mask > 0.f) {
     const float2 paspect = float2(1.f, 16.f / 9.f);
     float p_sum = 0.f;
+    float p_cover = 0.f;
     float p_w = 0.f;
     [unroll] for (int pr = 1; pr <= 4; ++pr) {
       float rel = pr / 4.f;
       float pradius = 0.032f * CUSTOM_SUN_REACH * rel;
       float pw = rel * exp(-2.f * rel * rel);
       float pring = 0.f;
+      float pring_cover = 0.f;
       [unroll] for (int pk = 0; pk < 12; ++pk) {
         float ang = pk * (6.2831853f / 12.f) + pr * 2.3999632f;
-        pring += CoJSunMarker(tex2Dlod(s_clr, float4(uv + float2(cos(ang), sin(ang)) * paspect * pradius, 0.f, 0.f)));
+        float4 ptap = tex2Dlod(s_clr, float4(uv + float2(cos(ang), sin(ang)) * paspect * pradius, 0.f, 0.f));
+        pring += CoJSunMarker(ptap);
+        pring_cover += CoJSkyCover(ptap);
       }
       p_sum += pring / 12.f * pw;
+      p_cover += pring_cover / 12.f * pw;
       p_w += pw;
     }
-    sun_core = p_sum / p_w;
+    sun_core = p_sum / max(p_cover, 0.5f * p_w);
   }
 
   // TEMPORARY sun halo test: a much wider, faint glow around the sun (SDR has a broad glare
@@ -255,24 +275,28 @@ float4 main(float2 uv : TEXCOORD0
     const float2 haspect = float2(1.f, 16.f / 9.f);
     float mk0 = CoJSunMarker(clr_a);
     float h_sum = mk0;
+    float h_cover = CoJSkyCover(clr_a);
     float h_w = 1.f;
     float3 h_col = mk0 * clr / max(1e-4f, max(clr.r, max(clr.g, clr.b)));
     [unroll] for (int hr = 0; hr < 6; ++hr) {
       float hradius = 0.02f * (hr + 1) * CUSTOM_SUN_HALO_RADIUS;
       float ring_m = 0.f;
+      float ring_cov = 0.f;
       float3 ring_c = 0.f;
       [unroll] for (int hk = 0; hk < 8; ++hk) {
         float4 hs4 = tex2Dlod(s_clr, float4(uv + hdirs[hk] * haspect * hradius, 0.f, 0.f));
         float3 hs = hs4.rgb;
         float hm = CoJSunMarker(hs4);
         ring_m += hm;
+        ring_cov += CoJSkyCover(hs4);
         ring_c += hm * hs / max(1e-4f, max(hs.r, max(hs.g, hs.b)));
       }
       h_sum += ring_m / 8.f * hring_weight[hr];
+      h_cover += ring_cov / 8.f * hring_weight[hr];
       h_col += ring_c / 8.f * hring_weight[hr];
       h_w += hring_weight[hr];
     }
-    float hmask = saturate(h_sum / h_w);
+    float hmask = saturate(h_sum / max(h_cover, 0.5f * h_w));
     halo_mask = hmask * hmask * (3.f - 2.f * hmask);
     halo_col = h_col / max(1e-4f, h_sum);
   }
@@ -408,9 +432,10 @@ float4 main(float2 uv : TEXCOORD0
 
   if (halo_mask > 0.f) {
     // 100% = up to half the peak (in game-white units) at the mask's maximum; not added on the
-    // sun core itself (already at its brightness).
+    // sun core itself (already at its brightness). Sky pixels only: on world pixels (the gun) the
+    // sparse-tap halo showed as pale blocks on the dark surface.
     float halo_peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-    color += halo_col * (halo_mask * (1.f - sun_mask) * CUSTOM_SUN_HALO * halo_peak * 0.5f);
+    color += halo_col * (halo_mask * (1.f - sun_mask) * CoJSkyCover(clr_a) * CUSTOM_SUN_HALO * halo_peak * 0.5f);
   }
 
 #if COJ_OVERLAY
