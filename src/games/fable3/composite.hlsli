@@ -9,6 +9,35 @@
 // pow(x, g_GlobalGammaAdjustment). Reconstructed 1:1 from the ps_3_0 disassembly; the RENODX_EFFECT_* switches only skip
 // parts of it.
 
+// Vanilla+ highlight expansion. The driver is the brightest channel of the RAW HDR scene colour (before the game's exposure and tone
+// curve). Measured in game (debug false-colour view): ordinary surfaces sit below 1, sunlit cloth and fountain spray reach 2-4, the sky
+// 2-5 and thin specular edges 6-8, so there is no brightness threshold that separates one kind of highlight from another. The curve is
+// therefore a single smooth climb: up to the knee the image is exactly vanilla, above it the brightest channel of the vanilla result
+// moves toward the display peak, slowly saturating:
+//   u = max(driver - knee, 0) / range;  r = u^2 / (1 + u^2) * weight;  max' = max + (peak - max) * r
+// r is 0 with zero slope at the knee (C1), monotonic, and max' never exceeds the peak. Scaling the whole colour by max'/max keeps the
+// vanilla hue ratios. Values are in the game's linear space where 1.0 = Game Brightness; peak = Peak / Game Brightness.
+// weight protects what is close to the camera (the player characters are always there, and in the raw scene their sunlit cloth is as
+// bright as the sky, so brightness cannot tell them apart; scene alpha does not mark them either): 0 up to NEAR_PROTECT_START
+// view-depth units, 1 from NEAR_PROTECT_END, smooth in between. The sky (depth >= 200) and
+// distant objects get the full lift. Known cost: effects very close to the camera (own spells, a nearby campfire) stay vanilla.
+// Without a depth buffer (the dialogue composite) nothing is lifted.
+// Rejected drivers (all tried in game): exposed scene luminance (never reached the knee), vanilla output brightness (the sky is always
+// 1.0), raw brightness with a high threshold (kills the little range the game has) and with neutral-colour rejection (also rejects
+// white spray).
+static const float NEAR_PROTECT_START = 8.f;
+static const float NEAR_PROTECT_END = 12.f;
+
+float3 ExpandVanillaHighlights(float3 vanilla_linear, float driver, float weight) {
+  float range = max(RENODX_HIGHLIGHT_RANGE, 1e-3f);
+  float u = max(driver - RENODX_HIGHLIGHT_KNEE, 0.f) / range;
+  float expansion = (u * u) / (1.f + u * u) * weight;
+  float max_channel = max(vanilla_linear.r, max(vanilla_linear.g, vanilla_linear.b));
+  float peak = max(RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS, 1.f);
+  float expanded_max = max_channel + (peak - max_channel) * expansion;
+  return vanilla_linear * (expanded_max / max(max_channel, 1e-6f));
+}
+
 float4 main(float2 uv : TEXCOORD0) : COLOR {
   static const float3 LUMA_WEIGHTS = float3(0.2125f, 0.7154f, 0.0721f);
   static const float3 EDGE_LUMA_WEIGHTS = float3(0.212f, 0.716f, 0.072f);
@@ -117,5 +146,33 @@ float4 main(float2 uv : TEXCOORD0) : COLOR {
   float3 vanilla_encoded = saturate(pow(max(blended, 0.f), g_GlobalGammaAdjustment.x));
   float3 vanilla_linear = renodx::color::gamma::DecodeSafe(vanilla_encoded, 2.2f);
 
-  return renodx::draw::RenderIntermediatePass(float4(vanilla_linear, 1.f));
+  [branch]
+  if (RENODX_TONE_MAP_TYPE == 0.f) {
+    return renodx::draw::RenderIntermediatePass(float4(vanilla_linear, 1.f));
+  }
+
+  // Vanilla+: the vanilla image below the knee, highlights extended toward the peak. No ToneMapPass (no RenoDRT, no grading).
+  [branch]
+  if (RENODX_TONE_MAP_TYPE == 4.f) {
+    float driver = max(color.r, max(color.g, color.b));
+#ifdef FABLE3_HAS_DOF
+    float near_weight = smoothstep(NEAR_PROTECT_START, NEAR_PROTECT_END, view_depth);
+#else
+    float near_weight = 0.f;
+#endif
+    return renodx::draw::RenderIntermediatePass(float4(ExpandVanillaHighlights(vanilla_linear, driver, near_weight), 1.f));
+  }
+
+  // HDR bridge. Signals (see fable3/README.md):
+  //   untonemapped = scene colour with the game's adaptive exposure applied, before the tone curve and before the per-channel clip.
+  //                  The curve texture stores a gain (mapped luma / luma) that depends on luma; its first texel is the gain at
+  //                  luma ~0, i.e. the exposure part of the curve without the highlight compression.
+  //   graded_sdr   = the complete vanilla result (curve, per-channel clip, bloom, saturation, gamma) decoded back to linear.
+  // neutral_sdr is left to the two-argument ToneMapPass (RenoDRT neutral SDR): the ratio graded_sdr / neutral_sdr carries the
+  // vanilla look onto the unclipped scene, then ToneMapPass maps it to the user's peak / diffuse white.
+  float exposure_gain = tex2Dlod(g_ToneMapSampler, float4(0.f, 0.f, 0.f, 0.f)).x * g_SaturationBrightnessBaseAndOffset.y;
+  float3 untonemapped = color * exposure_gain;
+
+  float3 hdr_color = renodx::draw::ToneMapPass(untonemapped, vanilla_linear);
+  return renodx::draw::RenderIntermediatePass(float4(hdr_color, 1.f));
 }

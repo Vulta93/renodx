@@ -84,13 +84,18 @@ struct ShaderInjectData {
   float effect_antialiasing;
   float effect_displacement;
   float padding1;
+
+  float highlight_knee;
+  float highlight_range;
+  float padding2;
+  float padding3;
 };
 
 #ifndef __cplusplus
 #if (__SHADER_TARGET_MAJOR == 3)
 
-// c200..c208: the game uses c0-c136 as its own constant block (including c100-c108), so the injection lives above it.
-float4 shader_injection[9] : register(c200);
+// c200..c209: the game uses c0-c136 as its own constant block (including c100-c108), so the injection lives above it.
+float4 shader_injection[10] : register(c200);
 
 #define RENODX_PEAK_WHITE_NITS               shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS            shader_injection[0][1]
@@ -127,6 +132,8 @@ float4 shader_injection[9] : register(c200);
 #define RENODX_EFFECT_DUST                     shader_injection[8][0]
 #define RENODX_EFFECT_ANTIALIASING             shader_injection[8][1]
 #define RENODX_EFFECT_DISPLACEMENT             shader_injection[8][2]
+#define RENODX_HIGHLIGHT_KNEE                  shader_injection[9][0]
+#define RENODX_HIGHLIGHT_RANGE                 shader_injection[9][1]
 
 #define RENODX_RENO_DRT_TONE_MAP_METHOD renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 #else
@@ -175,6 +182,8 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_EFFECT_DUST                     shader_injection.effect_dust
 #define RENODX_EFFECT_ANTIALIASING             shader_injection.effect_antialiasing
 #define RENODX_EFFECT_DISPLACEMENT             shader_injection.effect_displacement
+#define RENODX_HIGHLIGHT_KNEE                  shader_injection.highlight_knee
+#define RENODX_HIGHLIGHT_RANGE                 shader_injection.highlight_range
 #define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 
 #endif
