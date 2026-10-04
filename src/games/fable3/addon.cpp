@@ -446,6 +446,20 @@ renodx::utils::settings::Settings settings = {
           });
         },
     },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Modder Preference",
+        .section = "Presets",
+        .tooltip = "RenoDRT with the modder's preferred grading: Exposure 1.10, Highlights 55, Scene Grading 45. Peak, Game and UI brightness are left as they are.",
+        .on_change = []() {
+          renodx::utils::settings::UpdateSettings({
+              {"ToneMapType", 1.f},
+              {"ColorGradeExposure", 1.1f},
+              {"ColorGradeHighlights", 55.f},
+              {"ColorGradeScene", 45.f},
+          });
+        },
+    },
 };
 
 void OnPresetOff() {
