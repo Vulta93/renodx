@@ -46,6 +46,26 @@ struct ShaderInjectData {
 };
 
 #ifndef __cplusplus
+#if (__SHADER_TARGET_MAJOR == 3)
+
+// ps_3_0 passes drawn by the addon itself (scene finish pass): constants c50..c57, uploaded from ShaderInjectData.
+float4 shader_injection[8] : register(c50);
+
+#define RENODX_PEAK_WHITE_NITS                 shader_injection[0][0]
+#define RENODX_DIFFUSE_WHITE_NITS              shader_injection[0][1]
+#define RENODX_GRAPHICS_WHITE_NITS             shader_injection[0][2]
+#define RENODX_COLOR_GRADE_STRENGTH            shader_injection[0][3]
+#define RENODX_TONE_MAP_TYPE                   shader_injection[1][0]
+#define RENODX_GAMMA_CORRECTION                shader_injection[5][0]
+#define RENODX_INTERMEDIATE_ENCODING           shader_injection[5][2]
+#define RENODX_SWAP_CHAIN_DECODING             shader_injection[6][0]
+#define RENODX_SWAP_CHAIN_GAMMA_CORRECTION     shader_injection[6][1]
+#define RENODX_SWAP_CHAIN_CUSTOM_COLOR_SPACE   shader_injection[6][2]
+#define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection[6][3]
+#define RENODX_SWAP_CHAIN_ENCODING             shader_injection[7][0]
+#define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection[7][1]
+
+#else
 #if ((__SHADER_TARGET_MAJOR == 5 && __SHADER_TARGET_MINOR >= 1) || __SHADER_TARGET_MAJOR >= 6)
 cbuffer shader_injection : register(b13, space50) {
 #elif (__SHADER_TARGET_MAJOR < 5) || ((__SHADER_TARGET_MAJOR == 5) && (__SHADER_TARGET_MINOR < 1))
@@ -67,6 +87,7 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection.swap_chain_clamp_color_space
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection.swap_chain_encoding
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
+#endif  // __SHADER_TARGET_MAJOR == 3
 
 #include "../../shaders/renodx.hlsl"
 

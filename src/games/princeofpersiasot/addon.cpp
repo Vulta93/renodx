@@ -23,6 +23,8 @@
 
 namespace {
 
+ShaderInjectData shader_injection;
+
 // The glow chain starts with StretchRect(backbuffer -> 512x512 texture). With the Display Proxy the game renders into a
 // float16 clone of the backbuffer, but RenoDX's copy_texture_region redirect only handles texture_2d/texture_3d
 // resources, and the D3D9 swapchain backbuffer is a `surface`. The copy therefore read the original backbuffer, which
@@ -96,10 +98,196 @@ bool OnCopyBackBufferSurface(
   return handled;
 }
 
+// ---- Scene finish pass (game-local; there is no scene shader to replace) ----
+// Frame order (trace + Devkit): 3D scene -> marker draw (vs 0x859585C3 = clip-space colour quad, ps 0x9A0AF728 =
+// 20-byte "colour only" ps_1_1) -> HUD / menu draws -> glow chain (scene + HUD) -> a few more overlay draws.
+// The scene and the HUD share the backbuffer, so right before the first marker draw of a frame we copy the backbuffer
+// clone and redraw it through scene_finish_ps (RenderIntermediatePass: Game Brightness relative to UI Brightness).
+// Everything drawn afterwards keeps UI Brightness. Native D3D9 calls, state saved/restored with a state block.
+constexpr uint32_t kMarkerVertexShader = 0x859585C3;
+constexpr uint32_t kMarkerPixelShader = 0x9A0AF728;
+
+struct SceneFinishPass {
+  IDirect3DDevice9* device = nullptr;
+  IDirect3DVertexShader9* vertex_shader = nullptr;
+  IDirect3DPixelShader9* pixel_shader = nullptr;
+  IDirect3DVertexDeclaration9* vertex_declaration = nullptr;
+  IDirect3DStateBlock9* state_block = nullptr;
+  IDirect3DTexture9* scene_copy = nullptr;
+  UINT width = 0;
+  UINT height = 0;
+  D3DFORMAT format = D3DFMT_UNKNOWN;
+  uint64_t back_buffer = 0;
+  bool done_this_frame = false;
+
+  template <typename T>
+  static void SafeRelease(T*& object) {
+    if (object != nullptr) {
+      object->Release();
+      object = nullptr;
+    }
+  }
+
+  void Release() {
+    SafeRelease(scene_copy);
+    SafeRelease(state_block);
+    SafeRelease(vertex_declaration);
+    SafeRelease(pixel_shader);
+    SafeRelease(vertex_shader);
+    device = nullptr;
+    width = 0;
+    height = 0;
+    format = D3DFMT_UNKNOWN;
+  }
+
+  bool EnsureResources(IDirect3DDevice9* native_device, const D3DSURFACE_DESC& desc) {
+    if (device != native_device) Release();
+    device = native_device;
+    if (vertex_shader == nullptr
+        && FAILED(device->CreateVertexShader(reinterpret_cast<const DWORD*>(__scene_finish_vs.data()), &vertex_shader))) {
+      return false;
+    }
+    if (pixel_shader == nullptr
+        && FAILED(device->CreatePixelShader(reinterpret_cast<const DWORD*>(__scene_finish_ps.data()), &pixel_shader))) {
+      return false;
+    }
+    if (vertex_declaration == nullptr) {
+      const D3DVERTEXELEMENT9 elements[] = {
+          {0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
+          D3DDECL_END(),
+      };
+      if (FAILED(device->CreateVertexDeclaration(elements, &vertex_declaration))) return false;
+    }
+    if (state_block == nullptr && FAILED(device->CreateStateBlock(D3DSBT_ALL, &state_block))) return false;
+    if (scene_copy != nullptr && (width != desc.Width || height != desc.Height || format != desc.Format)) {
+      SafeRelease(scene_copy);
+    }
+    if (scene_copy == nullptr) {
+      if (FAILED(device->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT,
+                                       &scene_copy, nullptr))) {
+        return false;
+      }
+      width = desc.Width;
+      height = desc.Height;
+      format = desc.Format;
+    }
+    return true;
+  }
+
+  void Run(reshade::api::device* reshade_device) {
+    reshade::api::resource clone = {0u};
+    renodx::utils::resource::GetResourceInfo({back_buffer}, [&](const renodx::utils::resource::ResourceInfo& info) {
+      if (info.clone_enabled) clone = info.clone;
+    });
+    if (clone.handle == 0u) return;
+
+    auto* native_device = reinterpret_cast<IDirect3DDevice9*>(reshade_device->get_native());
+    IDirect3DSurface9* clone_surface = GetD3D9Surface(clone);
+    if (clone_surface == nullptr) return;
+
+    // Only when the game is drawing into the backbuffer (clone) right now.
+    IDirect3DSurface9* current_target = nullptr;
+    native_device->GetRenderTarget(0, &current_target);
+    const bool is_back_buffer = (current_target == clone_surface);
+    SafeRelease(current_target);
+
+    D3DSURFACE_DESC desc = {};
+    IDirect3DSurface9* copy_surface = nullptr;
+    if (is_back_buffer
+        && SUCCEEDED(clone_surface->GetDesc(&desc))
+        && EnsureResources(native_device, desc)
+        && SUCCEEDED(scene_copy->GetSurfaceLevel(0, &copy_surface))
+        && SUCCEEDED(native_device->StretchRect(clone_surface, nullptr, copy_surface, nullptr, D3DTEXF_POINT))
+        && SUCCEEDED(state_block->Capture())) {
+      const D3DVIEWPORT9 viewport = {0, 0, width, height, 0.f, 1.f};
+      native_device->SetViewport(&viewport);
+      native_device->SetVertexDeclaration(vertex_declaration);
+      native_device->SetVertexShader(vertex_shader);
+      native_device->SetPixelShader(pixel_shader);
+      native_device->SetTexture(0, scene_copy);
+      native_device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+      native_device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+      native_device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+      native_device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+      native_device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+      native_device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+      native_device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+      native_device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+      native_device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+      native_device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+      native_device->SetPixelShaderConstantF(50, reinterpret_cast<const float*>(&shader_injection), sizeof(shader_injection) / 16);
+      const float params[4] = {1.f / static_cast<float>(width), 1.f / static_cast<float>(height), 0.f, 0.f};
+      native_device->SetPixelShaderConstantF(49, params, 1);
+      const float vertices[4][4] = {
+          {-1.f, 1.f, 0.f, 1.f},
+          {1.f, 1.f, 0.f, 1.f},
+          {-1.f, -1.f, 0.f, 1.f},
+          {1.f, -1.f, 0.f, 1.f},
+      };
+      native_device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(vertices[0]));
+      state_block->Apply();
+    }
+    SafeRelease(copy_surface);
+    SafeRelease(clone_surface);
+  }
+};
+
+SceneFinishPass scene_finish;
+
+bool IsSceneFinishMarker(reshade::api::command_list* cmd_list) {
+  if (scene_finish.done_this_frame) return false;
+  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d9) return false;
+  auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+  if (state == nullptr) return false;
+  if (renodx::utils::shader::GetCurrentPixelShaderHash(renodx::utils::shader::GetCurrentPixelState(state)) != kMarkerPixelShader) {
+    return false;
+  }
+  return renodx::utils::shader::GetCurrentVertexShaderHash(state) == kMarkerVertexShader;
+}
+
+void OnSceneFinishCheck(reshade::api::command_list* cmd_list) {
+  if (!IsSceneFinishMarker(cmd_list)) return;
+  scene_finish.done_this_frame = true;
+  scene_finish.Run(cmd_list->get_device());
+}
+
+bool OnSceneFinishDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
+  OnSceneFinishCheck(cmd_list);
+  return false;
+}
+
+bool OnSceneFinishDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+  OnSceneFinishCheck(cmd_list);
+  return false;
+}
+
+void OnSceneFinishPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain, const reshade::api::rect*,
+                          const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+  if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d9) return;
+  scene_finish.back_buffer = swapchain->get_current_back_buffer().handle;
+  scene_finish.done_this_frame = false;
+}
+
+// D3DPOOL_DEFAULT textures and state blocks must be released before IDirect3DDevice9::Reset.
+void OnSceneFinishDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
+  if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d9) return;
+  scene_finish.Release();
+}
+
+void OnSceneFinishDestroyDevice(reshade::api::device* device) {
+  if (device->get_api() != reshade::api::device_api::d3d9) return;
+  scene_finish.Release();
+}
+
 // No game shader is replaced yet: the whole frame is fixed-function plus ps_1_1 helpers.
 renodx::mods::shader::CustomShaders custom_shaders = {};
-
-ShaderInjectData shader_injection;
 
 float current_settings_mode = 0;
 
@@ -142,12 +330,22 @@ renodx::utils::settings::Settings settings = {
         .max = 4000.f,
     },
     new renodx::utils::settings::Setting{
+        .key = "ToneMapGameNits",
+        .binding = &shader_injection.diffuse_white_nits,
+        .default_value = 203.f,
+        .label = "Game Brightness",
+        .section = "Tone Mapping",
+        .tooltip = "Sets the value of 100% white in nits",
+        .min = 48.f,
+        .max = 500.f,
+    },
+    new renodx::utils::settings::Setting{
         .key = "ToneMapUINits",
         .binding = &shader_injection.graphics_white_nits,
         .default_value = 203.f,
-        .label = "Brightness",
+        .label = "UI Brightness",
         .section = "Tone Mapping",
-        .tooltip = "Sets the brightness of white in nits. The game draws the scene and the HUD into the same buffer, so this scales both.",
+        .tooltip = "Sets the brightness of UI and HUD elements in nits",
         .min = 48.f,
         .max = 500.f,
     },
@@ -213,6 +411,7 @@ renodx::utils::settings::Settings settings = {
 
 void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ToneMapPeakNits", 203.f);
+  renodx::utils::settings::UpdateSetting("ToneMapGameNits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapUINits", 203.f);
 }
 
@@ -228,6 +427,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyBackBufferSurface);
+      reshade::register_event<reshade::addon_event::draw>(OnSceneFinishDraw);
+      reshade::register_event<reshade::addon_event::draw_indexed>(OnSceneFinishDrawIndexed);
+      reshade::register_event<reshade::addon_event::present>(OnSceneFinishPresent);
+      reshade::register_event<reshade::addon_event::destroy_swapchain>(OnSceneFinishDestroySwapchain);
+      reshade::register_event<reshade::addon_event::destroy_device>(OnSceneFinishDestroyDevice);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -346,6 +550,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyBackBufferSurface);
+      reshade::unregister_event<reshade::addon_event::draw>(OnSceneFinishDraw);
+      reshade::unregister_event<reshade::addon_event::draw_indexed>(OnSceneFinishDrawIndexed);
+      reshade::unregister_event<reshade::addon_event::present>(OnSceneFinishPresent);
+      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnSceneFinishDestroySwapchain);
+      reshade::unregister_event<reshade::addon_event::destroy_device>(OnSceneFinishDestroyDevice);
       reshade::unregister_addon(h_module);
       break;
   }
