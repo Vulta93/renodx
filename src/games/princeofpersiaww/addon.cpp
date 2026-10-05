@@ -732,6 +732,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           settings.push_back(setting);
         }
 
+        settings.push_back(new renodx::utils::settings::Setting{
+            .value_type = renodx::utils::settings::SettingValueType::TEXT,
+            .label = "The game's own Gamma, Brightness and Contrast options have no effect with this mod"
+                     " (the HDR output does not apply them)."
+                     " Use Game Brightness, UI Brightness and the Color Grading sliders here instead.",
+            .section = "Notes",
+        });
+
         // The scene render target (3840x2160) and the glow chain targets (512 px down to 8 px) are D3DFMT_A8R8G8B8,
         // which clipped every blend at 1.0. Float16 keeps the game's own above-white blending (fires, lanterns, lit
         // decals: up to ~2x encoded measured before the glow) and keeps StretchRect copies between them and the
