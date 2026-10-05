@@ -319,6 +319,20 @@ renodx::utils::settings::Settings settings = {
         .is_global = true,
     },
     new renodx::utils::settings::Setting{
+        .key = "ToneMapType",
+        .binding = &shader_injection.tone_map_type,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        .default_value = 3.f,
+        .can_reset = true,
+        .label = "Tone Mapper",
+        .section = "Tone Mapping",
+        .tooltip = "Sets the tone mapper type (3D scene only). Vanilla clips like the original 8-bit image.",
+        .labels = {"Vanilla", "None", "RenoDRT", "Neutwo"},
+        // ACES is left out: it renders white on ps_3_0 (see clivebarkersjericho). Neutwo = 5 exists only in
+        // scene_finish_ps. PsychoV was evaluated and dropped: it whitens and flattens this game's coloured highlights.
+        .parse = [](float value) { return value == 2.f ? 3.f : (value == 3.f ? 5.f : value); },
+    },
+    new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",
         .binding = &shader_injection.peak_white_nits,
         .default_value = 1000.f,
@@ -410,6 +424,7 @@ renodx::utils::settings::Settings settings = {
 };
 
 void OnPresetOff() {
+  renodx::utils::settings::UpdateSetting("ToneMapType", 0.f);
   renodx::utils::settings::UpdateSetting("ToneMapPeakNits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapGameNits", 203.f);
   renodx::utils::settings::UpdateSetting("ToneMapUINits", 203.f);
