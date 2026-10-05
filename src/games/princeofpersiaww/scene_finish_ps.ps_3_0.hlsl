@@ -1,17 +1,17 @@
-#include "./shared.h"
+#include "./common.hlsli"
 
-// Scene finish pass, drawn by the addon in place of the game's scene blit (render-target texture -> backbuffer,
-// ps_1_1 0x2059E26C), the last draw before the glow and the HUD.
-// Input: the scene texture (sRGB-encoded SDR values in a float16 target) and the blit's constant c0.
-// There is no game tone mapper: vanilla simply clipped at the 8-bit targets.
+// Scene pass 2, drawn by the addon after the game's glow B / blur effects and before the HUD.
+// Inputs: graded_texture = the game's result of its effects on the SDR scene (sRGB-encoded), scene_texture = the
+// HDR scene saved before the blit. The HDR scene is rebuilt on top of the game's SDR result with
+// renodx::tonemap::UpgradeToneMap(untonemapped, neutral_sdr, graded_sdr) (graded SDR bridge, handle-sdr-tonemap-lut):
+// the game's look and effects come from graded_sdr, the range above SDR from untonemapped - neutral_sdr.
 // Output: tone mapped scene in the intermediate encoding at Game Brightness relative to UI Brightness, so the HUD
 // drawn afterwards stays at UI Brightness (SwapChainPass scales everything by UI Brightness).
-// Pattern: clivebarkersjericho Output_*.ps_3_0 (Vanilla = clip like the 8-bit target, otherwise ToneMapPass).
 static const float TONE_MAP_TYPE_NEUTWO = 5.f;  // addon-only value, not a renodx::draw type
+static const float SCENE_MAX_WHITE = 7.5f;      // see the Neutwo branch
 
-sampler2D scene_texture : register(s0);
-float4 scene_finish_params : register(c49);  // xy = 1 / render target size
-float4 game_blit_c0 : register(c48);         // c0 of the original blit
+sampler2D graded_texture : register(s0);
+sampler2D scene_texture : register(s1);
 
 // User sliders for the None / Neutwo paths, with the same slider mapping as ToneMapPass
 // (flare curve, Blowout -> dechroma, Highlight Saturation -> blowout). Pattern: games/batmanaa/common.hlsli.
@@ -32,32 +32,46 @@ float3 ApplyUserGrading(float3 color) {
 }
 
 float4 main(float2 vpos : VPOS) : COLOR {
-  const float4 scene = tex2Dlod(scene_texture, float4((vpos + 0.5f) * scene_finish_params.xy, 0.f, 0.f));
-  // Original blit (ps_1_1 0x2059E26C): r0 = t0 * c0 + (t0 - c0), without the 8-bit clamp.
-  const float4 color = scene * game_blit_c0 + (scene - game_blit_c0);
-  const float3 untonemapped = renodx::color::srgb::DecodeSafe(color.rgb);
+  const float4 graded = tex2Dlod(graded_texture, float4(ScenePassUV(vpos), 0.f, 0.f));
+  const float3 graded_sdr = renodx::color::srgb::DecodeSafe(graded.rgb);
 
   float3 tonemapped;
   [branch]
   if (RENODX_TONE_MAP_TYPE == renodx::draw::TONE_MAP_TYPE_VANILLA) {
-    tonemapped = saturate(untonemapped);
-  } else if (RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_NEUTWO) {
-    // Neutwo: near-identity up to about half of peak, then rolls off to peak; hue kept (max-channel scale).
-    // The game's highlights are SDR colours pushed past white by additive blending, mostly 1-4x paper white,
-    // so this keeps the "None" look and only protects against clipping at peak. Pattern: games/batmanaa/common.hlsli.
-    // Peak relative to SDR white, moved into the pre-gamma-correction domain (pattern: games/rotsp/common.hlsl).
-    float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-    [branch]
-    if (RENODX_GAMMA_CORRECTION != 0.f) {
-      peak = renodx::color::correct::Gamma(peak, RENODX_GAMMA_CORRECTION > 0.f, RENODX_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f);
-    }
-    tonemapped = renodx::tonemap::neutwo::MaxChannel(max(0, ApplyUserGrading(untonemapped)), peak);
-  } else if (RENODX_TONE_MAP_TYPE == renodx::draw::TONE_MAP_TYPE_UNTONEMAPPED) {
-    tonemapped = ApplyUserGrading(untonemapped);
+    // The game's own SDR result, clipped like the original 8-bit target.
+    tonemapped = saturate(graded_sdr);
   } else {
-    // RenoDRT: ToneMapPass applies the same user sliders itself (BuildConfig reads RENODX_TONE_MAP_*).
-    tonemapped = renodx::draw::ToneMapPass(untonemapped);
+    const float3 untonemapped = SceneUntonemapped(scene_texture, vpos);
+    const float3 untonemapped_graded =
+        renodx::tonemap::UpgradeToneMap(untonemapped, SceneNeutralSDR(untonemapped), graded_sdr, 1.f);
+
+    [branch]
+    if (RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_NEUTWO) {
+      // Neutwo with a white clip (pattern: games/batmanaa/common.hlsli): identity-like up to the brightest value
+      // the game produces and reaching Peak exactly there, so it only compresses what would exceed the display.
+      // SCENE_MAX_WHITE = the brightest steady highlight the game produces, relative to SDR white: fire cores on
+      // the ship deck measured with Tone Mapper None, Peak 10000: up to ~1100 nits luminance / ~1350 nits max
+      // channel at 203 nits Game Brightness (~5.5-6.7x), plus margin. Transient additive stacks (flaming arrows,
+      // up to ~8800 nits: sprites piling up in the float16 target, vanilla clipped them at white) are deliberately
+      // not part of the range; they exceed Peak and are clamped by SwapChainPass instead of compressing the fire.
+      // When Peak is at or above SCENE_MAX_WHITE nothing is compressed (clip = peak).
+      // Both values are moved into the pre-gamma-correction domain (pattern: games/rotsp/common.hlsl).
+      float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+      float clip = max(SCENE_MAX_WHITE, peak);
+      [branch]
+      if (RENODX_GAMMA_CORRECTION != 0.f) {
+        const float gamma = RENODX_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f;
+        peak = renodx::color::correct::Gamma(peak, true, gamma);
+        clip = renodx::color::correct::Gamma(clip, true, gamma);
+      }
+      tonemapped = renodx::tonemap::neutwo::MaxChannel(max(0, ApplyUserGrading(untonemapped_graded)), peak, clip);
+    } else if (RENODX_TONE_MAP_TYPE == renodx::draw::TONE_MAP_TYPE_UNTONEMAPPED) {
+      tonemapped = ApplyUserGrading(untonemapped_graded);
+    } else {
+      // RenoDRT: ToneMapPass applies the same user sliders itself (BuildConfig reads RENODX_TONE_MAP_*).
+      tonemapped = renodx::draw::ToneMapPass(untonemapped_graded);
+    }
   }
 
-  return float4(renodx::draw::RenderIntermediatePass(tonemapped), color.a);
+  return float4(renodx::draw::RenderIntermediatePass(tonemapped), graded.a);
 }
