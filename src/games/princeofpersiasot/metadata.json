@@ -1,0 +1,16 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "princeofpersiasot",
+  "title": "Prince of Persia: The Sands of Time",
+  "status": "experimental",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "deploy": {
+    "game_exe": "gpp.exe",
+    "api": "d3d9",
+    "architecture": [
+      "x86"
+    ]
+  }
+}
