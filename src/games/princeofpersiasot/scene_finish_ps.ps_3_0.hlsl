@@ -12,6 +12,24 @@ static const float TONE_MAP_TYPE_NEUTWO = 5.f;  // addon-only value, not a renod
 sampler2D scene_texture : register(s0);
 float4 scene_finish_params : register(c49);  // xy = 1 / render target size
 
+// User sliders for the None / Neutwo paths, with the same slider mapping as ToneMapPass
+// (flare curve, Blowout -> dechroma, Highlight Saturation -> blowout). Pattern: games/batmanaa/common.hlsli.
+float3 ApplyUserGrading(float3 color) {
+  const renodx::color::grade::Config config = renodx::color::grade::config::Create(
+      RENODX_TONE_MAP_EXPOSURE,
+      RENODX_TONE_MAP_HIGHLIGHTS,
+      RENODX_TONE_MAP_SHADOWS,
+      RENODX_TONE_MAP_CONTRAST,
+      0.10f * pow(RENODX_TONE_MAP_FLARE, 10.f),
+      RENODX_TONE_MAP_SATURATION,
+      RENODX_TONE_MAP_BLOWOUT,
+      0.f,
+      color,
+      renodx::color::grade::config::hue_correction_type::INPUT,
+      -1.f * (RENODX_TONE_MAP_HIGHLIGHT_SATURATION - 1.f));
+  return renodx::color::grade::config::ApplyUserColorGrading(color, config);
+}
+
 float4 main(float2 vpos : VPOS) : COLOR {
   const float4 color = tex2Dlod(scene_texture, float4((vpos + 0.5f) * scene_finish_params.xy, 0.f, 0.f));
   const float3 untonemapped = renodx::color::srgb::DecodeSafe(color.rgb);
@@ -30,8 +48,11 @@ float4 main(float2 vpos : VPOS) : COLOR {
     if (RENODX_GAMMA_CORRECTION != 0.f) {
       peak = renodx::color::correct::Gamma(peak, RENODX_GAMMA_CORRECTION > 0.f, RENODX_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f);
     }
-    tonemapped = renodx::tonemap::neutwo::MaxChannel(max(0, untonemapped), peak);
+    tonemapped = renodx::tonemap::neutwo::MaxChannel(max(0, ApplyUserGrading(untonemapped)), peak);
+  } else if (RENODX_TONE_MAP_TYPE == renodx::draw::TONE_MAP_TYPE_UNTONEMAPPED) {
+    tonemapped = ApplyUserGrading(untonemapped);
   } else {
+    // RenoDRT: ToneMapPass applies the same user sliders itself (BuildConfig reads RENODX_TONE_MAP_*).
     tonemapped = renodx::draw::ToneMapPass(untonemapped);
   }
 
