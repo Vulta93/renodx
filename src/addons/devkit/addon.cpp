@@ -4397,6 +4397,13 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   if (!used_create_desc) {
     tracked_desc.back_buffer = device->get_resource_desc(swapchain->get_current_back_buffer());
     tracked_desc.back_buffer_count = swapchain->get_back_buffer_count();
+  } else {
+    // LOCAL (wolfensteintno): OpenGL can hand over a stale create desc from a helper window; trust the real back buffer size.
+    const auto back_buffer_desc = device->get_resource_desc(swapchain->get_current_back_buffer());
+    if (back_buffer_desc.texture.width != 0u && back_buffer_desc.texture.height != 0u) {
+      tracked_desc.back_buffer.texture.width = back_buffer_desc.texture.width;
+      tracked_desc.back_buffer.texture.height = back_buffer_desc.texture.height;
+    }
   }
 
   const bool is_flip = IsFlipSwapchainPresentMode(tracked_desc.present_mode);
