@@ -53,7 +53,7 @@ Established with the RenoDX Devkit (snapshots, vs_1_1/ps_1_1 disassembly) and on
   one buffer, the HUD is fixed-function), so this is a small, game-local addition.
 - On the first marker draw of each frame (both hashes must match; the pixel shader is reused later) the addon copies the
   backbuffer clone into a float16 texture, saves the D3D9 state in a `D3DSBT_ALL` state block, redraws the scene with
-  `scene_finish_vs.vs_3_0` + `scene_finish_ps.ps_3_0` (sRGB decode → tone mapper → user grading →
+  `scene_finish_vs.vs_3_0` + `scene_finish_ps.ps_3_0` (sRGB decode → Color Grading (Vanilla: clip at 1.0) →
   `renodx::draw::RenderIntermediatePass`) and restores the state.
 - Everything drawn afterwards (HUD, menus, fades) stays at UI Brightness; `SwapChainPass` scales by UI white.
 - SM3 constants follow the DX9 pattern of `batmanaa`: `float4 shader_injection[8] : register(c50)`, uploaded by the addon.
@@ -69,7 +69,7 @@ Established with the RenoDX Devkit (snapshots, vs_1_1/ps_1_1 disassembly) and on
     white scaled by the max channel, hue kept; `scene_bridge_ps`). The glow runs exactly as in vanilla.
   - **bridge out** — before the first draw after the glow composite (`0x80AAE9DF`; fallback at present):
     `scene_upgrade_ps` scales the frame by HDR / SDR luminance of the saved frame (`renodx::color::correct::Luminance`),
-    so the composite's mix carries over to the HDR values.
+    so the composite's mix carries over to the HDR values. The Roll-off tone mapper is applied here too (see 5).
 - The bridge-out position matters: run at present, it re-sharpened the pause screen's blur layers (sharp white flames
   over the blurred background, white → red → white while the blur faded in). Run right after the composite, the later
   overlays blend over HDR the way they blend over SDR in vanilla; the pause screen matches the SDR original
@@ -78,48 +78,61 @@ Established with the RenoDX Devkit (snapshots, vs_1_1/ps_1_1 disassembly) and on
   blend proportions and was verified with the ramp.
 - Ramp result, Tone Mapper None: every position within 1–2% of the prediction.
 
-### 5. Tone mapping (3D scene only)
+### 5. Tone mapping
 | Tone mapper | Notes |
 |---|---|
 | Vanilla | Clips at 1.0 like the original 8-bit game, for A/B comparison. |
 | None | Untonemapped; anything above Peak is clamped by `SwapChainPass`. |
-| RenoDRT | `ToneMapPass`. |
-| PsychoV (`psychotm_test17`) | Whitened and flattened the coloured highlights (saturation 0.88 → 0.68, measured before the bridge). Evaluated and dropped. |
-| **Neutwo (default)** | `renodx::tonemap::neutwo::MaxChannel(color, peak, clip)`, hue kept. |
+| **Roll-off (default)** | `renodx::tonemap::ExponentialRollOff(max_channel, 0.6 × peak, peak, clip)` on the max channel, colour scaled (hue kept); applied after the glow composite. |
 
-- **Neutwo white clip.** `SCENE_MAX_WHITE = 20` (×203 ≈ 4060 nits) is the brightest steady highlight the game produces:
-  the courtyard fire measured with Tone Mapper None, Peak 10000, Game Brightness 203, default grading — its frame
-  maximum ranged ~2600–3750 nits max channel (CLL) / ~1550–2300 nits luminance; 20× adds a little margin. Rare one-frame
-  spikes (up to ~4600 CLL) are not part of the range; they are clamped at Peak. `clip = max(SCENE_MAX_WHITE, peak)`, so
-  with Peak at or above ~4060 nits Neutwo is the identity (it never expands). Peak and clip are moved into the
-  pre-gamma-correction domain.
-- Measured at Peak 1360, Game Brightness 203:
-  - ramp with Neutwo: average 980 nits (predicted 992), 4× white 680 (682), 10× 1125 (1142), 15× 1299 (1275);
-  - courtyard fire, same camera: whole-image average 11.2 / 11.5 / 11.5 / 11.2 nits (Vanilla / None / RenoDRT / Neutwo).
-    Neutwo matches None up to the 99.5th percentile (~100 nits) and rolls off above it as predicted (99.99th percentile:
-    None 1856, Neutwo 1054, predicted 1154; the fire flickers between screenshots).
-- ACES is left out (it renders white on ps_3_0).
+- **Where it runs.** Roll-off is applied in `scene_upgrade_ps` (bridge out), on the final frame after the glow composite;
+  the scene pass only grades. The glow composite blends its blur over small highlights and scales them down by a fixed
+  factor (test pattern of squares on black, any strength: 8 px → 0.39×, 32 px → 0.47×, 128 px → 0.97×), so a curve that
+  reaches Peak in the scene pass leaves small highlights far below Peak.
+- **Which max channel.** The max channel is taken in the swap chain encoding colour space (BT.2020 for HDR10), where
+  `SwapChainPass` clamps at Peak. Measured in BT.709, an orange flame's red at Peak is only ~0.73× Peak in BT.2020: the
+  fire topped out at ~1000 nits max channel with Peak 1360 while None reached the clamp.
+- **Parameters.** Identity up to 0.6 × Peak. White clip = 20 × Game Brightness (~4060 nits at 203), the brightest
+  steady highlight the game produces: the courtyard fire measured on the final output with Tone Mapper None, Peak 10000,
+  default grading — frame maximum ~2600–3750 nits max channel (CLL) / ~1550–2300 nits luminance over several
+  screenshots, plus a little margin. Rare one-frame spikes (up to ~4600 CLL) are left out; they are clamped at Peak.
+  `clip = max(white clip, peak)`. The frame is linear, gamma-corrected and relative to UI Brightness at that point, so
+  the parameters are converted to that unit (and into the pre-swap-chain-gamma domain if Display Output Gamma
+  Correction is on).
+- **Measured at Peak 1360, Game Brightness 203** (HDR screenshots decoded: PQ → nits, BT.2020 → BT.709):
+  - ramp 0 → 20× white: every position within 1–1.5% of the prediction (1000 nits → 973, 1360 → 1163, 3000 → 1353);
+  - squares test pattern: within 1% of the prediction after the glow (20× white: 8 px 1145, 32 px 1230, 128 px 1345);
+  - fire, same camera, three screenshots each: brightest pixel 814–872 nits (None) / 770–807 (Roll-off); pixels above
+    600 nits 2161–4593 / 2402–3210; pixels at the clamp 1558–2822 / 7–481; core green ÷ red 0.28–0.30 / 0.27–0.29;
+    whole-image average 13.6–13.8 nits for both.
+- **Evaluated and dropped:** ACES (renders white on ps_3_0); PsychoV `psychotm_test17` (whitened and flattened the
+  coloured highlights, saturation 0.88 → 0.68); RenoDRT `ToneMapPass` and Neutwo `neutwo::MaxChannel(color, peak, clip)`:
+  both ran in the scene pass, before the glow composite (Neutwo also on the BT.709 max channel) — at Peak 1360 the fire's
+  brightest pixel was 533–591 nits with Neutwo against 833–867 with None.
 
 ### 6. Settings
 - Peak, Game and UI Brightness, Gamma Correction (scene, 2.2), Tone Mapper.
 - Color Grading: Exposure, Highlights, Shadows, Contrast, Saturation, Highlight Saturation, Blowout, Flare — the same
-  mapping as `ToneMapPass` (RenoDRT) and `renodx::color::grade::config::ApplyUserColorGrading` (None / Neutwo); disabled in
-  Vanilla.
+  slider mapping as `ToneMapPass`, applied with `renodx::color::grade::config::ApplyUserColorGrading` in the scene pass;
+  disabled in Vanilla.
 - Display Output (advanced): keep its Gamma Correction at None — the scene pass already applies the 2.2 correction.
 - Display Proxy "mouse guard": with the proxy two ImGui contexts draw the menu; a hidden sticky setting stops a click from
   landing in both.
 
 ## Testing
 Palace, courtyard fire, windows room, outdoor sky, dark areas, HUD, pause / profile / main menus, loading screens, in-game
-cutscenes, pre-rendered videos, ReShade overlay open/close, tone mapper A/B with measurements, test ramp (None and
-Neutwo), pause screen against an SDR screenshot.
+cutscenes, pre-rendered videos, ReShade overlay open/close, tone mapper A/B with measurements (same camera, decoded
+HDR screenshots), test ramp and squares test pattern (temporary debug options, removed), pause screen against an SDR
+screenshot.
 
 ## Known behaviour and limitations
 - Pre-rendered videos, main menu and loading screens follow UI Brightness (intended; the videos are very low resolution and
   have no marker draw).
 - The glow on thin bright shapes (windows) flickers when the camera moves — same in the original game.
-- The glow is built from the tone-mapped scene after the scene pass (through the SDR bridge), so it is not tone mapped
-  itself.
+- Roll-off runs only in frames where the glow chain runs (every gameplay frame); without it the frame is clamped at
+  Peak like None.
+- Roll-off also sees the HUD drawn before the glow; it is far below the roll-off start unless Peak is set below
+  ~1.7× UI Brightness.
 - Hint text drawn over very bright areas (e.g. the 20× test ramp) looks pale; in normal play it looks like vanilla.
 - Not tested yet: the dagger's time effects (rewind, slow motion).
 
