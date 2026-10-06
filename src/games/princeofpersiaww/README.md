@@ -30,10 +30,18 @@ own blending (fires, lanterns, lit decals). ps_1_x shaders clamp their output to
    - pass 2 (`scene_finish_ps`, at the first draw after glow B, or at the final copy): HDR is rebuilt on top of the
      game's result with `renodx::tonemap::UpgradeToneMap(untonemapped, neutral_sdr, graded_sdr)`, then tone mapped and
      written with `RenderIntermediatePass`, so the HUD drawn afterwards follows UI Brightness.
-4. **Tone Mapper**: Vanilla (original clip), None, RenoDRT, **Neutwo** (default). Neutwo uses a white clip at the
-   game's measured steady maximum (`SCENE_MAX_WHITE = 7.5` × SDR white, fire cores) and is the identity when Peak is
-   at or above it. Flaming-arrow pile-ups (additive sprites stacking in float16, up to ~8800 nits) are deliberately
-   outside that range and are clamped at Peak.
+4. **Tone Mapper**: Vanilla (original clip), None, **Roll-off** (default).
+   Roll-off = `renodx::tonemap::ExponentialRollOff(max_channel, 0.6 × peak, peak, clip)`, colour scaled by the max
+   channel (hue kept); identity up to 0.6 × Peak. White clip = 7.5 × Game Brightness (~1520 nits at 203), the game's
+   measured steady maximum (fire cores: ~1100 nits luminance / ~1350 nits max channel with None, Peak 10000);
+   `clip = max(white clip, peak)`. Flaming-arrow pile-ups (additive sprites stacking in float16, up to ~8800 nits) are
+   deliberately outside that range and are clamped at Peak.
+   It is applied to the final linear values after `RenderIntermediatePass`, with the max channel taken in the swap
+   chain encoding colour space (BT.2020 for HDR10), where `SwapChainPass` clamps at Peak. Measured on the BT.709 max
+   channel, an orange flame's red at Peak is only ~0.73 × Peak in BT.2020 (found in the SoT mod: the fire stayed ~27%
+   below Tone Mapper None). Same implementation as the SoT mod.
+   Dropped: RenoDRT (compressed the fire early, max channel 450–580 nits at Peak 1360) and Neutwo (replaced by
+   Roll-off; it scaled by the BT.709 max channel).
 5. PsychoV: not used — the game has no tone curve to match (hard clip at 8-bit targets).
 
 ## Settings notes
@@ -47,10 +55,9 @@ own blending (fires, lanterns, lit decals). ps_1_x shaders clamp their output to
 - Runtime: HUD present; Game and UI Brightness independent; menus and cutscenes normal.
 - avg luminance ≈ 14 nits for Vanilla / None / RenoDRT / Neutwo at the same spot (mid-tones unchanged).
 - Deterministic ramp test (temporary debug mode, 0 → 20× white, Peak 1360): None avg 1109 nits (predicted 1116),
-  Neutwo 1014 (predicted 1018) with the game's glow on.
+  Neutwo 1014 (predicted 1018) with the game's glow on (before Roll-off replaced Neutwo).
 - Water reflections, ripples/heat haze, water near bright lights and splashes: identical in SDR and HDR.
 
 ## Known limitations / open
 
-- RenoDRT compresses the fire well below Peak (not the default).
 - Not yet tested: dagger time powers (rewind / slow motion), smoke-heavy areas, pre-rendered videos, loading screens.
