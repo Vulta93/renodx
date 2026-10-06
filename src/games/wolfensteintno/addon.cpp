@@ -7,6 +7,9 @@
 
 #define DEBUG_LEVEL_0
 
+#include <sstream>
+#include <string>
+
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
@@ -20,6 +23,7 @@
 namespace {
 
 renodx::mods::shader::CustomShaders custom_shaders = {
+    CustomShaderEntry(0xA85A9FE0),  // main post-process + colour LUT (GLSL)
     // CustomShaderEntry(0x00000000),
     // CustomSwapchainShader(0x00000000),
     // BypassShaderEntry(0x00000000),
@@ -395,6 +399,141 @@ void OnPresent(reshade::api::command_queue* queue,
   }
 }
 
+// RENODX DEBUG (temporary): one-frame trace of render-target binds, copies and resolves. Hold F9 in game.
+namespace trace {
+bool active = false;
+int draws = 0;
+int cooldown = 0;
+uint64_t back_buffer_handle = 0;
+
+void Log(const std::string& message) {
+  reshade::log::message(reshade::log::level::info, ("WOLFTRACE " + message).c_str());
+}
+
+std::string Describe(reshade::api::device* device, reshade::api::resource resource) {
+  std::stringstream s;
+  s << std::hex << resource.handle << std::dec;
+  if (resource.handle == back_buffer_handle) s << "(BACKBUFFER)";
+  const auto desc = device->get_resource_desc(resource);
+  s << "[" << desc.texture.width << "x" << desc.texture.height << " " << desc.texture.format
+    << " samples=" << desc.texture.samples << "]";
+  return s.str();
+}
+
+void FlushDraws() {
+  if (draws > 0) Log("  ... " + std::to_string(draws) + " draws");
+  draws = 0;
+}
+
+bool IsActive(reshade::api::command_list* cmd_list) {
+  return active && cmd_list->get_device()->get_api() == reshade::api::device_api::opengl;
+}
+
+void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain, const reshade::api::rect*,
+               const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+  auto* device = swapchain->get_device();
+  if (device->get_api() != reshade::api::device_api::opengl) return;
+  if (active) {
+    FlushDraws();
+    Log("END FRAME");
+    active = false;
+    cooldown = 120;
+    return;
+  }
+  if (cooldown > 0) {
+    --cooldown;
+    return;
+  }
+  if ((GetAsyncKeyState(VK_F9) & 0x8000) != 0) {
+    active = true;
+    draws = 0;
+    back_buffer_handle = swapchain->get_current_back_buffer().handle;
+    Log("BEGIN FRAME back buffer=" + Describe(device, swapchain->get_current_back_buffer()));
+  }
+}
+
+void OnBindRenderTargets(reshade::api::command_list* cmd_list, uint32_t count, const reshade::api::resource_view* rtvs,
+                         reshade::api::resource_view) {
+  if (!IsActive(cmd_list)) return;
+  FlushDraws();
+  auto* device = cmd_list->get_device();
+  std::string message = "BIND RT x" + std::to_string(count);
+  if (count > 0 && rtvs[0].handle != 0u) {
+    message += " -> " + Describe(device, device->get_resource_from_view(rtvs[0]));
+  }
+  Log(message);
+}
+
+bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
+  if (IsActive(cmd_list)) ++draws;
+  return false;
+}
+
+bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
+  if (IsActive(cmd_list)) ++draws;
+  return false;
+}
+
+bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource source, reshade::api::resource dest) {
+  if (!IsActive(cmd_list)) return false;
+  FlushDraws();
+  auto* device = cmd_list->get_device();
+  Log("COPY_RESOURCE " + Describe(device, source) + " -> " + Describe(device, dest));
+  return false;
+}
+
+bool OnCopyTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t,
+                         const reshade::api::subresource_box*, reshade::api::resource dest, uint32_t,
+                         const reshade::api::subresource_box*, reshade::api::filter_mode) {
+  if (!IsActive(cmd_list)) return false;
+  FlushDraws();
+  auto* device = cmd_list->get_device();
+  Log("COPY_TEXTURE_REGION " + Describe(device, source) + " -> " + Describe(device, dest));
+  return false;
+}
+
+bool OnResolveTextureRegion(reshade::api::command_list* cmd_list, reshade::api::resource source, uint32_t,
+                            const reshade::api::subresource_box*, reshade::api::resource dest, uint32_t, uint32_t,
+                            uint32_t, uint32_t, reshade::api::format) {
+  if (!IsActive(cmd_list)) return false;
+  FlushDraws();
+  auto* device = cmd_list->get_device();
+  Log("RESOLVE " + Describe(device, source) + " -> " + Describe(device, dest));
+  return false;
+}
+
+bool OnClearRenderTargetView(reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, const float*,
+                             uint32_t, const reshade::api::rect*) {
+  if (!IsActive(cmd_list)) return false;
+  FlushDraws();
+  auto* device = cmd_list->get_device();
+  Log("CLEAR RTV " + Describe(device, device->get_resource_from_view(rtv)));
+  return false;
+}
+
+void Register(bool attach) {
+  if (attach) {
+    reshade::register_event<reshade::addon_event::present>(OnPresent);
+    reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
+    reshade::register_event<reshade::addon_event::draw>(OnDraw);
+    reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+    reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
+    reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+    reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+    reshade::register_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+  } else {
+    reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+    reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
+    reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
+    reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
+    reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
+    reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+    reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+    reshade::unregister_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+  }
+}
+}  // namespace trace
+
 bool initialized = false;
 
 }  // namespace
@@ -406,6 +545,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
+      trace::Register(true);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -597,11 +737,31 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           }
         }
 
+        {
+          // Wolfenstein creates its full-screen render targets (scene colour 0xFBF, half/quarter res) before the swapchain
+          // exists, so a back-buffer size match ("Output size") misses them and the scene stays 8-bit. Match the screen's
+          // aspect ratio instead: full/half/quarter res + glare chain, but not the 8192x8192 virtual-texture caches,
+          // the colour LUTs (256x16, 256x1) or other non-screen-shaped targets.
+          const float screen_aspect_ratio = static_cast<float>(GetSystemMetrics(SM_CXSCREEN))
+                                            / static_cast<float>(GetSystemMetrics(SM_CYSCREEN));
+          renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+              .old_format = reshade::api::format::r8g8b8a8_unorm,
+              .new_format = reshade::api::format::r16g16b16a16_float,
+              // OpenGL: clone + redirect leaves the 3D scene black; upgrade the texture itself at creation instead.
+              .use_resource_view_cloning = false,
+              .aspect_ratio = screen_aspect_ratio,
+              .aspect_ratio_tolerance = 0.01f,
+              .min_dimensions = {.width = 400, .height = 200},
+              .usage_include = reshade::api::resource_usage::render_target,
+          });
+        }
+
         initialized = true;
       }
 
       break;
     case DLL_PROCESS_DETACH:
+      trace::Register(false);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_addon(h_module);
       break;
