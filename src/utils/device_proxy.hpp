@@ -13,12 +13,14 @@
 #include <windef.h>
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <include/reshade_api_device.hpp>
 #include <include/reshade_api_format.hpp>
 #include <memory>
+#include <sstream>
 #include <unordered_map>
 
 #include <include/reshade.hpp>
@@ -135,6 +137,8 @@ struct ProxySharedResourceSource {
   reshade::api::resource_usage initial_state = reshade::api::resource_usage::undefined;
 };
 static std::unordered_map<uint64_t, ProxySharedResourcePair> proxy_shared_resources_by_clone;
+// LOCAL (wolfensteintno): GL memory objects backing host shared textures imported from D3D11, keyed by host resource handle.
+static std::unordered_map<uint64_t, uint32_t> opengl_memory_objects_by_host_resource;
 
 // Methods
 static void DestroyProxySharedResourcesForHandle(uint64_t handle);
@@ -213,9 +217,37 @@ static void ResetProxySwapchainCloneResources(reshade::api::swapchain* swapchain
   }
 }
 
+// LOCAL (wolfensteintno): resolved at runtime because this header must not add an opengl32.lib link dependency.
+// Requires a current GL context (wglGetProcAddress is context-dependent).
+template <typename FunctionPointer>
+static FunctionPointer GetOpenGLFunction(const char* name) {
+  auto* opengl_module = GetModuleHandleW(L"opengl32.dll");
+  if (opengl_module == nullptr) return nullptr;
+  using WglGetProcAddress = PROC(WINAPI*)(LPCSTR);
+  auto* wgl_get_proc_address = reinterpret_cast<WglGetProcAddress>(GetProcAddress(opengl_module, "wglGetProcAddress"));
+  PROC address = nullptr;
+  if (wgl_get_proc_address != nullptr) {
+    address = wgl_get_proc_address(name);
+  }
+  // wglGetProcAddress returns nullptr (or small sentinel values) for OpenGL 1.1 exports.
+  if (reinterpret_cast<uintptr_t>(address) <= 3u || reinterpret_cast<intptr_t>(address) == -1) {
+    address = GetProcAddress(opengl_module, name);
+  }
+  return reinterpret_cast<FunctionPointer>(address);
+}
+
 static void DestroyProxySharedResourcePair(ProxySharedResourcePair& pair) {
   if (pair.host_shared_resource.handle != 0u && proxied_device_reshade != nullptr) {
     proxied_device_reshade->destroy_resource(pair.host_shared_resource);
+    if (auto memory_object = opengl_memory_objects_by_host_resource.find(pair.host_shared_resource.handle);
+        memory_object != opengl_memory_objects_by_host_resource.end()) {
+      using DeleteMemoryObjects = void(WINAPI*)(int32_t, const uint32_t*);
+      auto* delete_memory_objects = GetOpenGLFunction<DeleteMemoryObjects>("glDeleteMemoryObjectsEXT");
+      if (delete_memory_objects != nullptr) {
+        delete_memory_objects(1, &memory_object->second);
+      }
+      opengl_memory_objects_by_host_resource.erase(memory_object);
+    }
     pair.host_shared_resource = {0u};
   }
 
@@ -802,12 +834,113 @@ static ProxySharedResourcePair GetProxySharedResourcePair(
   }
 
   void* host_shared_handle = new_shared_handle;
-  if (!source_resource_info.device->create_resource(
-          new_desc,
-          nullptr,
-          source_resource_info.initial_state,
-          &new_host_shared_resource,
-          &host_shared_handle)) {
+  bool host_shared_resource_created = false;
+  if (source_resource_info.device->get_api() == reshade::api::device_api::opengl) {
+    // LOCAL (wolfensteintno): ReShade's OpenGL create_resource imports every shared handle as OPAQUE_WIN32 (Vulkan memory)
+    // and sizes it with a Vulkan query. This handle is a D3D11 texture: importing it with that type is undefined and the
+    // NVIDIA driver terminates the process. Import it as GL_HANDLE_TYPE_D3D11_IMAGE_EXT instead (EXT_external_objects_win32).
+    constexpr uint32_t OPENGL_TEXTURE_2D = 0x0DE1u;
+    constexpr uint32_t OPENGL_TEXTURE_BINDING_2D = 0x8069u;
+    constexpr uint32_t OPENGL_DEDICATED_MEMORY_OBJECT_EXT = 0x9581u;
+    constexpr uint32_t OPENGL_HANDLE_TYPE_D3D11_IMAGE_EXT = 0x958Bu;
+
+    uint32_t internal_format = 0u;
+    switch (new_desc.texture.format) {
+      case reshade::api::format::r16g16b16a16_float:
+        internal_format = 0x881Au;  // GL_RGBA16F
+        break;
+      case reshade::api::format::r10g10b10a2_unorm:
+        internal_format = 0x8059u;  // GL_RGB10_A2
+        break;
+      case reshade::api::format::r8g8b8a8_unorm:
+        internal_format = 0x8058u;  // GL_RGBA8
+        break;
+      default:
+        break;
+    }
+
+    using CreateMemoryObjects = void(WINAPI*)(int32_t, uint32_t*);
+    using MemoryObjectParameteriv = void(WINAPI*)(uint32_t, uint32_t, const int32_t*);
+    using ImportMemoryWin32Handle = void(WINAPI*)(uint32_t, uint64_t, uint32_t, void*);
+    using TexStorageMem2D = void(WINAPI*)(uint32_t, int32_t, uint32_t, int32_t, int32_t, uint32_t, uint64_t);
+    using GenTextures = void(WINAPI*)(int32_t, uint32_t*);
+    using BindTexture = void(WINAPI*)(uint32_t, uint32_t);
+    using GetIntegerv = void(WINAPI*)(uint32_t, int32_t*);
+    using GetError = uint32_t(WINAPI*)();
+    using DeleteTextures = void(WINAPI*)(int32_t, const uint32_t*);
+    using DeleteMemoryObjects = void(WINAPI*)(int32_t, const uint32_t*);
+    auto* create_memory_objects = GetOpenGLFunction<CreateMemoryObjects>("glCreateMemoryObjectsEXT");
+    auto* memory_object_parameteriv = GetOpenGLFunction<MemoryObjectParameteriv>("glMemoryObjectParameterivEXT");
+    auto* import_memory_win32_handle = GetOpenGLFunction<ImportMemoryWin32Handle>("glImportMemoryWin32HandleEXT");
+    auto* tex_storage_mem_2d = GetOpenGLFunction<TexStorageMem2D>("glTexStorageMem2DEXT");
+    auto* gen_textures = GetOpenGLFunction<GenTextures>("glGenTextures");
+    auto* bind_texture = GetOpenGLFunction<BindTexture>("glBindTexture");
+    auto* get_integerv = GetOpenGLFunction<GetIntegerv>("glGetIntegerv");
+    auto* get_error = GetOpenGLFunction<GetError>("glGetError");
+    auto* delete_textures = GetOpenGLFunction<DeleteTextures>("glDeleteTextures");
+    auto* delete_memory_objects = GetOpenGLFunction<DeleteMemoryObjects>("glDeleteMemoryObjectsEXT");
+
+    const bool functions_available = create_memory_objects != nullptr && memory_object_parameteriv != nullptr
+                                     && import_memory_win32_handle != nullptr && tex_storage_mem_2d != nullptr
+                                     && gen_textures != nullptr && bind_texture != nullptr
+                                     && get_integerv != nullptr && get_error != nullptr
+                                     && delete_textures != nullptr && delete_memory_objects != nullptr;
+    if (functions_available && internal_format != 0u) {
+      // Drain errors left by the game so the check below only sees ours (bounded: no context can report errors forever).
+      for (int drained_errors = 0; drained_errors < 16; ++drained_errors) {
+        if (get_error() == 0u) break;
+      }
+      uint32_t memory_object = 0u;
+      create_memory_objects(1, &memory_object);
+      const int32_t dedicated_memory = 1;
+      memory_object_parameteriv(memory_object, OPENGL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated_memory);
+      // Size 0: the D3D11 allocation is padded, so its real size is unknown here. NVIDIA rejects the unpadded
+      // width*height*bpp at glTexStorageMem2DEXT (GL_INVALID_VALUE) and accepts 0 for a dedicated D3D11 image.
+      import_memory_win32_handle(memory_object, 0u, OPENGL_HANDLE_TYPE_D3D11_IMAGE_EXT, new_shared_handle);
+
+      uint32_t texture = 0u;
+      gen_textures(1, &texture);
+      int32_t previous_texture_binding = 0;
+      get_integerv(OPENGL_TEXTURE_BINDING_2D, &previous_texture_binding);
+      bind_texture(OPENGL_TEXTURE_2D, texture);
+      tex_storage_mem_2d(
+          OPENGL_TEXTURE_2D,
+          std::max<int32_t>(1, new_desc.texture.levels),
+          internal_format,
+          static_cast<int32_t>(new_desc.texture.width),
+          static_cast<int32_t>(new_desc.texture.height),
+          memory_object,
+          0u);
+      bind_texture(OPENGL_TEXTURE_2D, static_cast<uint32_t>(previous_texture_binding));
+
+      if (const uint32_t import_error = get_error(); import_error == 0u) {
+        // ReShade's OpenGL resource handles pack the texture target above the object name.
+        new_host_shared_resource = {(static_cast<uint64_t>(OPENGL_TEXTURE_2D) << 40u) | texture};
+        opengl_memory_objects_by_host_resource[new_host_shared_resource.handle] = memory_object;
+        host_shared_resource_created = true;
+      } else {
+        std::stringstream s;
+        s << "utils::device_proxy::GetProxySharedResourcePair(OpenGL D3D11 image import failed: gl_error=0x";
+        s << std::hex << import_error << std::dec << ", " << new_desc.texture.width << "x" << new_desc.texture.height << ")";
+        reshade::log::message(reshade::log::level::error, s.str().c_str());
+        delete_textures(1, &texture);
+        delete_memory_objects(1, &memory_object);
+      }
+    } else {
+      std::stringstream s;
+      s << "utils::device_proxy::GetProxySharedResourcePair(OpenGL D3D11 image import unavailable: functions="
+        << functions_available << ", format=" << new_desc.texture.format << ")";
+      reshade::log::message(reshade::log::level::error, s.str().c_str());
+    }
+  } else {
+    host_shared_resource_created = source_resource_info.device->create_resource(
+        new_desc,
+        nullptr,
+        source_resource_info.initial_state,
+        &new_host_shared_resource,
+        &host_shared_handle);
+  }
+  if (!host_shared_resource_created) {
     proxy_device_reshade->destroy_resource(new_proxy_resource);
     std::stringstream s;
     s << "utils::device_proxy::GetProxySharedResourcePair(create host shared resource failed: ";
