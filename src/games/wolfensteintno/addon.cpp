@@ -583,7 +583,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                 .old_format = format,
                 .new_format = reshade::api::format::r16g16b16a16_float,
                 .ignore_size = (value == UPGRADE_TYPE_ANY),
-                .use_resource_view_cloning = true,
+                // OpenGL: clone + redirect leaves the 3D scene black; upgrade the texture itself at creation instead.
+                .use_resource_view_cloning = false,
                 .aspect_ratio = static_cast<float>((value == UPGRADE_TYPE_OUTPUT_RATIO)
                                                        ? renodx::mods::swapchain::SwapChainUpgradeTarget::BACK_BUFFER
                                                        : renodx::mods::swapchain::SwapChainUpgradeTarget::ANY),
