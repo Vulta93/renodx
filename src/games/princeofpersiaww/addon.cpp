@@ -416,15 +416,17 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapType",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 3.f,
+        .default_value = 2.f,
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .tooltip = "Sets the tone mapper type (3D scene only). Vanilla clips like the original 8-bit image.",
-        .labels = {"Vanilla", "None", "RenoDRT", "Neutwo"},
-        // ACES is left out: it renders white on ps_3_0 (see clivebarkersjericho). Neutwo = 5 exists only in
-        // scene_finish_ps. No PsychoV: the game has no tone curve to match (hard clip at 8-bit targets).
-        .parse = [](float value) { return value == 2.f ? 3.f : (value == 3.f ? 5.f : value); },
+        .tooltip = "Sets the tone mapper type (3D scene only). Vanilla clips like the original 8-bit image;\n"
+                   "None clips at Peak; Roll-off compresses only the highlights above 60% of Peak.",
+        .labels = {"Vanilla", "None", "Roll-off"},
+        // Roll-off = 4 exists only in scene_finish_ps. Left out: ACES (renders white on ps_3_0, see
+        // clivebarkersjericho), PsychoV (the game has no tone curve to match: hard clip at 8-bit targets). Dropped:
+        // RenoDRT (compressed the fire well below Peak) and Neutwo (replaced by Roll-off, as in the SoT mod).
+        .parse = [](float value) { return value == 2.f ? 4.f : value; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",

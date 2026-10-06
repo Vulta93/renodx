@@ -7,13 +7,12 @@
 // the game's look and effects come from graded_sdr, the range above SDR from untonemapped - neutral_sdr.
 // Output: tone mapped scene in the intermediate encoding at Game Brightness relative to UI Brightness, so the HUD
 // drawn afterwards stays at UI Brightness (SwapChainPass scales everything by UI Brightness).
-static const float TONE_MAP_TYPE_NEUTWO = 5.f;  // addon-only value, not a renodx::draw type
-static const float SCENE_MAX_WHITE = 7.5f;      // see the Neutwo branch
+static const float TONE_MAP_TYPE_ROLLOFF = 4.f;  // addon-only value (renodx::draw uses 0-3)
 
 sampler2D graded_texture : register(s0);
 sampler2D scene_texture : register(s1);
 
-// User sliders for the None / Neutwo paths, with the same slider mapping as ToneMapPass
+// Color Grading sliders, with the same slider mapping as renodx::draw::ToneMapPass
 // (flare curve, Blowout -> dechroma, Highlight Saturation -> blowout). Pattern: games/batmanaa/common.hlsli.
 float3 ApplyUserGrading(float3 color) {
   const renodx::color::grade::Config config = renodx::color::grade::config::Create(
@@ -42,36 +41,41 @@ float4 main(float2 vpos : VPOS) : COLOR {
     tonemapped = saturate(graded_sdr);
   } else {
     const float3 untonemapped = SceneUntonemapped(scene_texture, vpos);
-    const float3 untonemapped_graded =
-        renodx::tonemap::UpgradeToneMap(untonemapped, SceneNeutralSDR(untonemapped), graded_sdr, 1.f);
+    tonemapped = ApplyUserGrading(
+        renodx::tonemap::UpgradeToneMap(untonemapped, SceneNeutralSDR(untonemapped), graded_sdr, 1.f));
+  }
+  float3 output = renodx::draw::RenderIntermediatePass(tonemapped);
 
+  // Tone Mapper Roll-off (pattern: games/princeofpersiasot/scene_upgrade_ps): exponential roll-off
+  // (renodx::tonemap::ExponentialRollOff, clip version) on the max channel, colour scaled so hue is kept: identity up
+  // to 0.6x Peak, Peak at the white clip (or Peak when higher). White clip: 7.5x Game Brightness (~1520 nits at 203),
+  // the brightest steady highlight the game produces: fire cores on the ship deck measured with Tone Mapper None, Peak
+  // 10000: up to ~1100 nits luminance / ~1350 nits max channel at 203 nits Game Brightness, plus margin. Transient
+  // additive stacks (flaming arrows, up to ~8800 nits: sprites piling up in the float16 target, vanilla clipped them at
+  // white) are deliberately left out; they are clamped at Peak by SwapChainPass.
+  // Applied to the final linear values (after gamma correction, relative to UI Brightness) with the max channel taken
+  // in the swap chain encoding colour space (BT.2020 for HDR10), exactly where SwapChainPass clamps at Peak. On the
+  // BT.709 max channel an orange flame's red at Peak is only ~0.73x Peak in BT.2020 (measured in the SoT mod: fire
+  // capped ~27% below Tone Mapper None).
+  [branch]
+  if (RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_ROLLOFF) {
+    float3 color = max(0, renodx::draw::DecodeColor(output, RENODX_INTERMEDIATE_ENCODING));
+    float peak = RENODX_PEAK_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
+    float clip = max(7.5f * RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS, peak);
+    float rolloff_start = 0.6f * peak;
     [branch]
-    if (RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_NEUTWO) {
-      // Neutwo with a white clip (pattern: games/batmanaa/common.hlsli): identity-like up to the brightest value
-      // the game produces and reaching Peak exactly there, so it only compresses what would exceed the display.
-      // SCENE_MAX_WHITE = the brightest steady highlight the game produces, relative to SDR white: fire cores on
-      // the ship deck measured with Tone Mapper None, Peak 10000: up to ~1100 nits luminance / ~1350 nits max
-      // channel at 203 nits Game Brightness (~5.5-6.7x), plus margin. Transient additive stacks (flaming arrows,
-      // up to ~8800 nits: sprites piling up in the float16 target, vanilla clipped them at white) are deliberately
-      // not part of the range; they exceed Peak and are clamped by SwapChainPass instead of compressing the fire.
-      // When Peak is at or above SCENE_MAX_WHITE nothing is compressed (clip = peak).
-      // Both values are moved into the pre-gamma-correction domain (pattern: games/rotsp/common.hlsl).
-      float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-      float clip = max(SCENE_MAX_WHITE, peak);
-      [branch]
-      if (RENODX_GAMMA_CORRECTION != 0.f) {
-        const float gamma = RENODX_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f;
-        peak = renodx::color::correct::Gamma(peak, true, gamma);
-        clip = renodx::color::correct::Gamma(clip, true, gamma);
-      }
-      tonemapped = renodx::tonemap::neutwo::MaxChannel(max(0, ApplyUserGrading(untonemapped_graded)), peak, clip);
-    } else if (RENODX_TONE_MAP_TYPE == renodx::draw::TONE_MAP_TYPE_UNTONEMAPPED) {
-      tonemapped = ApplyUserGrading(untonemapped_graded);
-    } else {
-      // RenoDRT: ToneMapPass applies the same user sliders itself (BuildConfig reads RENODX_TONE_MAP_*).
-      tonemapped = renodx::draw::ToneMapPass(untonemapped_graded);
+    if (RENODX_SWAP_CHAIN_GAMMA_CORRECTION != 0.f) {
+      const float gamma = RENODX_SWAP_CHAIN_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f;
+      peak = renodx::color::correct::Gamma(peak, true, gamma);
+      clip = renodx::color::correct::Gamma(clip, true, gamma);
+      rolloff_start = renodx::color::correct::Gamma(rolloff_start, true, gamma);
     }
+    const float max_channel = renodx::math::Max(renodx::color::convert::ColorSpaces(
+        color, renodx::color::convert::COLOR_SPACE_BT709, RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE));
+    const float new_max = renodx::tonemap::ExponentialRollOff(max_channel, rolloff_start, peak, clip);
+    color *= max_channel != 0 ? (new_max / max_channel) : 1.f;
+    output = renodx::draw::EncodeColor(color, RENODX_INTERMEDIATE_ENCODING);
   }
 
-  return float4(renodx::draw::RenderIntermediatePass(tonemapped), graded.a);
+  return float4(output, graded.a);
 }
