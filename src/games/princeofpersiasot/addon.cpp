@@ -46,6 +46,9 @@ IDirect3DSurface9* GetD3D9Surface(reshade::api::resource resource) {
   }
 }
 
+// Defined after the scene passes: bridge-in before the game copies the backbuffer into its glow chain.
+void BeforeBackBufferCopy(IDirect3DDevice9* native_device);
+
 bool OnCopyBackBufferSurface(
     reshade::api::command_list* cmd_list,
     reshade::api::resource source,
@@ -71,6 +74,8 @@ bool OnCopyBackBufferSurface(
   renodx::utils::resource::GetResourceInfo(dest, [&](const renodx::utils::resource::ResourceInfo& info) {
     if (info.clone_enabled && info.clone.handle != 0u) dest_target = info.clone;
   });
+
+  BeforeBackBufferCopy(reinterpret_cast<IDirect3DDevice9*>(device->get_native()));
 
   IDirect3DSurface9* src_surface = GetD3D9Surface(source_clone);
   IDirect3DSurface9* dst_surface = GetD3D9Surface(dest_target);
@@ -98,27 +103,45 @@ bool OnCopyBackBufferSurface(
   return handled;
 }
 
-// ---- Scene finish pass (game-local; there is no scene shader to replace) ----
+// ---- Scene passes (game-local; there is no scene shader to replace) ----
 // Frame order (trace + Devkit): 3D scene -> marker draw (vs 0x859585C3 = clip-space colour quad, ps 0x9A0AF728 =
-// 20-byte "colour only" ps_1_1) -> HUD / menu draws -> glow chain (scene + HUD) -> a few more overlay draws.
-// The scene and the HUD share the backbuffer, so right before the first marker draw of a frame we copy the backbuffer
-// clone and redraw it through scene_finish_ps (RenderIntermediatePass: Game Brightness relative to UI Brightness).
-// Everything drawn afterwards keeps UI Brightness. Native D3D9 calls, state saved/restored with a state block.
+// 20-byte "colour only" ps_1_1) -> HUD / menu draws -> glow chain: StretchRect backbuffer -> 512, ps_1_1 blur steps
+// down to 8 px, 3 additive draws (0xABB07F2E) and a 512 px blur blended at ~41% (0x80AAE9DF) onto the backbuffer.
+// ps_1_1 clamps at white, so this cut every highlight to ~42% of its above-white part (measured with a test ramp)
+// -> overlay draws: menu text, and on the pause screen blur layers drawn from the glow textures (8/32/64 px).
+// Passes:
+//   scene pass, right before the first marker draw of a frame: the backbuffer clone is copied and redrawn through
+//     scene_finish_ps (tone mapper + RenderIntermediatePass: Game Brightness relative to UI Brightness). The HUD,
+//     fades and pause dimming drawn afterwards land on the HDR scene and keep UI Brightness;
+//   bridge in (graded SDR bridge, handle-sdr-tonemap-lut), right before the game copies the backbuffer into its glow
+//     chain: the HDR frame is saved (hdr_scene) and the backbuffer gets its SDR version (scene_bridge_ps), so the
+//     glow and its composite run exactly as in vanilla;
+//   bridge out, before the first draw after the glow composite (fallback: present): scene_upgrade_ps scales the
+//     frame by HDR / SDR luminance of the saved frame. The overlays drawn later (pause blur, menu text) then blend
+//     over HDR; restoring at present instead re-sharpened the pause blur (sharp white flames over it).
+// Native D3D9 calls, state saved/restored with a state block.
 constexpr uint32_t kMarkerVertexShader = 0x859585C3;
 constexpr uint32_t kMarkerPixelShader = 0x9A0AF728;
+// Last glow-chain draw: blends the 512 px blur over the backbuffer (ps_1_1, SRCALPHA / INVSRCALPHA).
+constexpr uint32_t kGlowCompositePixelShader = 0x80AAE9DF;
 
 struct SceneFinishPass {
   IDirect3DDevice9* device = nullptr;
   IDirect3DVertexShader9* vertex_shader = nullptr;
-  IDirect3DPixelShader9* pixel_shader = nullptr;
+  IDirect3DPixelShader9* pixel_shader = nullptr;          // scene pass: scene_finish_ps
+  IDirect3DPixelShader9* bridge_pixel_shader = nullptr;   // bridge in: scene_bridge_ps (SDR frame for the glow)
+  IDirect3DPixelShader9* upgrade_pixel_shader = nullptr;  // bridge out: scene_upgrade_ps (HDR rebuilt after the glow)
   IDirect3DVertexDeclaration9* vertex_declaration = nullptr;
   IDirect3DStateBlock9* state_block = nullptr;
-  IDirect3DTexture9* scene_copy = nullptr;
+  IDirect3DTexture9* scene_copy = nullptr;  // copy of the backbuffer clone read by the passes
+  IDirect3DTexture9* hdr_scene = nullptr;   // HDR frame saved by the bridge-in pass
   UINT width = 0;
   UINT height = 0;
   D3DFORMAT format = D3DFMT_UNKNOWN;
   uint64_t back_buffer = 0;
-  bool done_this_frame = false;
+  bool done_this_frame = false;  // the marker draw was seen this frame
+  bool hdr_valid = false;        // the bridge-in pass ran this frame
+  bool composite_drawn = false;  // the glow composite was drawn after the bridge-in pass
 
   template <typename T>
   static void SafeRelease(T*& object) {
@@ -129,15 +152,20 @@ struct SceneFinishPass {
   }
 
   void Release() {
+    SafeRelease(hdr_scene);
     SafeRelease(scene_copy);
     SafeRelease(state_block);
     SafeRelease(vertex_declaration);
+    SafeRelease(upgrade_pixel_shader);
+    SafeRelease(bridge_pixel_shader);
     SafeRelease(pixel_shader);
     SafeRelease(vertex_shader);
     device = nullptr;
     width = 0;
     height = 0;
     format = D3DFMT_UNKNOWN;
+    hdr_valid = false;
+    composite_drawn = false;
   }
 
   bool EnsureResources(IDirect3DDevice9* native_device, const D3DSURFACE_DESC& desc) {
@@ -151,6 +179,14 @@ struct SceneFinishPass {
         && FAILED(device->CreatePixelShader(reinterpret_cast<const DWORD*>(__scene_finish_ps.data()), &pixel_shader))) {
       return false;
     }
+    if (bridge_pixel_shader == nullptr
+        && FAILED(device->CreatePixelShader(reinterpret_cast<const DWORD*>(__scene_bridge_ps.data()), &bridge_pixel_shader))) {
+      return false;
+    }
+    if (upgrade_pixel_shader == nullptr
+        && FAILED(device->CreatePixelShader(reinterpret_cast<const DWORD*>(__scene_upgrade_ps.data()), &upgrade_pixel_shader))) {
+      return false;
+    }
     if (vertex_declaration == nullptr) {
       const D3DVERTEXELEMENT9 elements[] = {
           {0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
@@ -159,30 +195,82 @@ struct SceneFinishPass {
       if (FAILED(device->CreateVertexDeclaration(elements, &vertex_declaration))) return false;
     }
     if (state_block == nullptr && FAILED(device->CreateStateBlock(D3DSBT_ALL, &state_block))) return false;
-    if (scene_copy != nullptr && (width != desc.Width || height != desc.Height || format != desc.Format)) {
+    if (width != desc.Width || height != desc.Height || format != desc.Format) {
       SafeRelease(scene_copy);
+      SafeRelease(hdr_scene);
     }
-    if (scene_copy == nullptr) {
-      if (FAILED(device->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT,
-                                       &scene_copy, nullptr))) {
-        return false;
-      }
-      width = desc.Width;
-      height = desc.Height;
-      format = desc.Format;
+    // Same size and format as the backbuffer clone (float16).
+    if (scene_copy == nullptr
+        && FAILED(device->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT,
+                                        &scene_copy, nullptr))) {
+      return false;
     }
+    if (hdr_scene == nullptr
+        && FAILED(device->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET, desc.Format, D3DPOOL_DEFAULT,
+                                        &hdr_scene, nullptr))) {
+      return false;
+    }
+    width = desc.Width;
+    height = desc.Height;
+    format = desc.Format;
     return true;
   }
 
-  void Run(reshade::api::device* reshade_device) {
+  IDirect3DSurface9* GetBackBufferClone() const {
     reshade::api::resource clone = {0u};
     renodx::utils::resource::GetResourceInfo({back_buffer}, [&](const renodx::utils::resource::ResourceInfo& info) {
       if (info.clone_enabled) clone = info.clone;
     });
-    if (clone.handle == 0u) return;
+    if (clone.handle == 0u) return nullptr;
+    return GetD3D9Surface(clone);
+  }
 
+  // Common state for both full-screen passes (after state_block->Capture()).
+  void SetPassState(IDirect3DDevice9* native_device, IDirect3DPixelShader9* shader) const {
+    const D3DVIEWPORT9 viewport = {0, 0, width, height, 0.f, 1.f};
+    native_device->SetViewport(&viewport);
+    native_device->SetVertexDeclaration(vertex_declaration);
+    native_device->SetVertexShader(vertex_shader);
+    native_device->SetPixelShader(shader);
+    for (DWORD sampler = 0; sampler < 2; ++sampler) {
+      native_device->SetSamplerState(sampler, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+      native_device->SetSamplerState(sampler, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+      native_device->SetSamplerState(sampler, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+      native_device->SetSamplerState(sampler, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+      native_device->SetSamplerState(sampler, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+      native_device->SetSamplerState(sampler, D3DSAMP_SRGBTEXTURE, FALSE);
+    }
+    native_device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    native_device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    native_device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    native_device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    native_device->SetRenderState(D3DRS_COLORWRITEENABLE1, 0xF);
+    native_device->SetPixelShaderConstantF(50, reinterpret_cast<const float*>(&shader_injection), sizeof(shader_injection) / 16);
+    const float params[4] = {1.f / static_cast<float>(width), 1.f / static_cast<float>(height), 0.f, 0.f};
+    native_device->SetPixelShaderConstantF(49, params, 1);
+  }
+
+  static void DrawFullScreen(IDirect3DDevice9* native_device) {
+    const float vertices[4][4] = {
+        {-1.f, 1.f, 0.f, 1.f},
+        {1.f, 1.f, 0.f, 1.f},
+        {-1.f, -1.f, 0.f, 1.f},
+        {1.f, -1.f, 0.f, 1.f},
+    };
+    native_device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(vertices[0]));
+  }
+
+  // Scene pass, at the marker draw: tone mapped HDR scene into the backbuffer clone.
+  void Run(reshade::api::device* reshade_device) {
     auto* native_device = reinterpret_cast<IDirect3DDevice9*>(reshade_device->get_native());
-    IDirect3DSurface9* clone_surface = GetD3D9Surface(clone);
+    IDirect3DSurface9* clone_surface = GetBackBufferClone();
     if (clone_surface == nullptr) return;
 
     // Only when the game is drawing into the backbuffer (clone) right now.
@@ -199,40 +287,74 @@ struct SceneFinishPass {
         && SUCCEEDED(scene_copy->GetSurfaceLevel(0, &copy_surface))
         && SUCCEEDED(native_device->StretchRect(clone_surface, nullptr, copy_surface, nullptr, D3DTEXF_POINT))
         && SUCCEEDED(state_block->Capture())) {
-      const D3DVIEWPORT9 viewport = {0, 0, width, height, 0.f, 1.f};
-      native_device->SetViewport(&viewport);
-      native_device->SetVertexDeclaration(vertex_declaration);
-      native_device->SetVertexShader(vertex_shader);
-      native_device->SetPixelShader(pixel_shader);
+      SetPassState(native_device, pixel_shader);
       native_device->SetTexture(0, scene_copy);
-      native_device->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-      native_device->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-      native_device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-      native_device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-      native_device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-      native_device->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
-      native_device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
-      native_device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-      native_device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-      native_device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-      native_device->SetPixelShaderConstantF(50, reinterpret_cast<const float*>(&shader_injection), sizeof(shader_injection) / 16);
-      const float params[4] = {1.f / static_cast<float>(width), 1.f / static_cast<float>(height), 0.f, 0.f};
-      native_device->SetPixelShaderConstantF(49, params, 1);
-      const float vertices[4][4] = {
-          {-1.f, 1.f, 0.f, 1.f},
-          {1.f, 1.f, 0.f, 1.f},
-          {-1.f, -1.f, 0.f, 1.f},
-          {1.f, -1.f, 0.f, 1.f},
-      };
-      native_device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(vertices[0]));
+      DrawFullScreen(native_device);
       state_block->Apply();
+    }
+    SafeRelease(copy_surface);
+    SafeRelease(clone_surface);
+  }
+
+  // Draws `shader` full screen into the backbuffer clone, reading scene_copy (s0) and hdr_scene (s1).
+  // State blocks do not capture render targets: RT0 is set to the clone and the previous RT0 put back.
+  void DrawIntoClone(IDirect3DDevice9* native_device, IDirect3DSurface9* clone_surface, IDirect3DPixelShader9* shader) {
+    IDirect3DSurface9* saved_target = nullptr;
+    native_device->GetRenderTarget(0, &saved_target);
+    if (SUCCEEDED(state_block->Capture())) {
+      if (SUCCEEDED(native_device->SetRenderTarget(0, clone_surface))) {
+        SetPassState(native_device, shader);
+        native_device->SetTexture(0, scene_copy);
+        native_device->SetTexture(1, hdr_scene);
+        DrawFullScreen(native_device);
+        if (saved_target != nullptr) native_device->SetRenderTarget(0, saved_target);
+      }
+      state_block->Apply();  // after SetRenderTarget, which resets the viewport
+    }
+    SafeRelease(saved_target);
+  }
+
+  bool MatchesResources(IDirect3DDevice9* native_device, IDirect3DSurface9* clone_surface) const {
+    D3DSURFACE_DESC desc = {};
+    return native_device == device && scene_copy != nullptr && hdr_scene != nullptr
+           && SUCCEEDED(clone_surface->GetDesc(&desc))
+           && desc.Width == width && desc.Height == height && desc.Format == format;
+  }
+
+  // Bridge in, right before the game copies the backbuffer into its glow chain (after the scene pass): save the HDR
+  // frame (scene + HUD + fades) and replace it with its SDR version.
+  void RunBridgeIn(IDirect3DDevice9* native_device) {
+    if (!done_this_frame || hdr_valid) return;
+    IDirect3DSurface9* clone_surface = GetBackBufferClone();
+    if (clone_surface == nullptr) return;
+    IDirect3DSurface9* copy_surface = nullptr;
+    IDirect3DSurface9* hdr_surface = nullptr;
+    if (MatchesResources(native_device, clone_surface)
+        && SUCCEEDED(hdr_scene->GetSurfaceLevel(0, &hdr_surface))
+        && SUCCEEDED(scene_copy->GetSurfaceLevel(0, &copy_surface))
+        && SUCCEEDED(native_device->StretchRect(clone_surface, nullptr, hdr_surface, nullptr, D3DTEXF_POINT))
+        && SUCCEEDED(native_device->StretchRect(clone_surface, nullptr, copy_surface, nullptr, D3DTEXF_POINT))) {
+      DrawIntoClone(native_device, clone_surface, bridge_pixel_shader);
+      hdr_valid = true;
+    }
+    SafeRelease(hdr_surface);
+    SafeRelease(copy_surface);
+    SafeRelease(clone_surface);
+  }
+
+  // Bridge out, right after the glow composite (fallback: present): rebuild the HDR range on top of the frame.
+  void RunUpgrade(reshade::api::device* reshade_device) {
+    if (!hdr_valid) return;
+    hdr_valid = false;
+    composite_drawn = false;
+    auto* native_device = reinterpret_cast<IDirect3DDevice9*>(reshade_device->get_native());
+    IDirect3DSurface9* clone_surface = GetBackBufferClone();
+    if (clone_surface == nullptr) return;
+    IDirect3DSurface9* copy_surface = nullptr;
+    if (MatchesResources(native_device, clone_surface)
+        && SUCCEEDED(scene_copy->GetSurfaceLevel(0, &copy_surface))
+        && SUCCEEDED(native_device->StretchRect(clone_surface, nullptr, copy_surface, nullptr, D3DTEXF_POINT))) {
+      DrawIntoClone(native_device, clone_surface, upgrade_pixel_shader);
     }
     SafeRelease(copy_surface);
     SafeRelease(clone_surface);
@@ -240,6 +362,10 @@ struct SceneFinishPass {
 };
 
 SceneFinishPass scene_finish;
+
+void BeforeBackBufferCopy(IDirect3DDevice9* native_device) {
+  scene_finish.RunBridgeIn(native_device);
+}
 
 bool IsSceneFinishMarker(reshade::api::command_list* cmd_list) {
   if (scene_finish.done_this_frame) return false;
@@ -253,6 +379,21 @@ bool IsSceneFinishMarker(reshade::api::command_list* cmd_list) {
 }
 
 void OnSceneFinishCheck(reshade::api::command_list* cmd_list) {
+  if (scene_finish.hdr_valid) {
+    // Bridge out right after the glow composite (before the next draw), so everything drawn later (pause-menu blur
+    // layers built from the glow textures, menu text) blends over the HDR frame, as it blends over SDR in vanilla.
+    if (scene_finish.composite_drawn) {
+      scene_finish.RunUpgrade(cmd_list->get_device());
+      return;
+    }
+    auto* state = renodx::utils::shader::GetCurrentState(cmd_list);
+    if (state != nullptr
+        && renodx::utils::shader::GetCurrentPixelShaderHash(renodx::utils::shader::GetCurrentPixelState(state))
+               == kGlowCompositePixelShader) {
+      scene_finish.composite_drawn = true;
+    }
+    return;
+  }
   if (!IsSceneFinishMarker(cmd_list)) return;
   scene_finish.done_this_frame = true;
   scene_finish.Run(cmd_list->get_device());
@@ -271,6 +412,9 @@ bool OnSceneFinishDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, ui
 void OnSceneFinishPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain, const reshade::api::rect*,
                           const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
   if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d9) return;
+  // Fallback when nothing is drawn after the glow composite. Registered before RenoDX's swapchain/proxy handlers, so
+  // the upgrade lands before the Display Proxy copies the frame.
+  scene_finish.RunUpgrade(swapchain->get_device());
   scene_finish.back_buffer = swapchain->get_current_back_buffer().handle;
   scene_finish.done_this_frame = false;
 }
