@@ -55,6 +55,7 @@ in vec4 gl_FragCoord;
 out vec4 out_FragColor0;
 
 void main() {
+	vec3 pre_curve = vec3( 0.0 );
 	vec2 viewTexCoord = screenPosToTexcoord( gl_FragCoord.xy, _fa_[0 ] );
 	vec2 windowTexCoord = screenPosToTexcoord( gl_FragCoord.xy, _fa_[1 ] );
 	windowTexCoord.y = 1.0 - windowTexCoord.y;
@@ -170,6 +171,8 @@ void main() {
 	{
 		vec3 tmpCol = vec3( dot3( final.xyz, vec3( 0.33, 0.59, 0.11 ) ) );
 		final.xyz = mix( final.xyz, tmpCol, _fa_[17 ].x );
+		// RENODX MEASURE: raw signal before the 1D curve (which clamps at 1.0 through texture addressing).
+		pre_curve = final.xyz;
 		tmpCol.x = h4tex2D( samp_cbconversionlut, vec2( final.x, 0.0 ) ).x;
 		tmpCol.y = h4tex2D( samp_cbconversionlut, vec2( final.y, 0.0 ) ).y;
 		tmpCol.z = h4tex2D( samp_cbconversionlut, vec2( final.z, 0.0 ) ).z;
@@ -206,6 +209,8 @@ void main() {
 		vec3 resCol = mix( resCol0, resCol1, tcBFrac );
 		final.xyz = resCol + above_white;
 	};
+	// RENODX MEASURE: output the pre-curve signal; tiny graded term keeps every uniform in use.
+	final.xyz = pre_curve + final.xyz * 1e-6;
 	out_FragColor0.xyz = final.xyz;
 	out_FragColor0.w = 1.0;
 	if ( _fa_[24 ].x == 1.0 ) {
