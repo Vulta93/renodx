@@ -111,14 +111,15 @@ bool OnCopyBackBufferSurface(
 // -> overlay draws: menu text, and on the pause screen blur layers drawn from the glow textures (8/32/64 px).
 // Passes:
 //   scene pass, right before the first marker draw of a frame: the backbuffer clone is copied and redrawn through
-//     scene_finish_ps (tone mapper + RenderIntermediatePass: Game Brightness relative to UI Brightness). The HUD,
+//     scene_finish_ps (Color Grading + RenderIntermediatePass: Game Brightness relative to UI Brightness). The HUD,
 //     fades and pause dimming drawn afterwards land on the HDR scene and keep UI Brightness;
 //   bridge in (graded SDR bridge, handle-sdr-tonemap-lut), right before the game copies the backbuffer into its glow
 //     chain: the HDR frame is saved (hdr_scene) and the backbuffer gets its SDR version (scene_bridge_ps), so the
 //     glow and its composite run exactly as in vanilla;
 //   bridge out, before the first draw after the glow composite (fallback: present): scene_upgrade_ps scales the
-//     frame by HDR / SDR luminance of the saved frame. The overlays drawn later (pause blur, menu text) then blend
-//     over HDR; restoring at present instead re-sharpened the pause blur (sharp white flames over it).
+//     frame by HDR / SDR luminance of the saved frame and applies the Roll-off tone mapper. The overlays drawn later
+//     (pause blur, menu text) then blend over HDR; restoring at present instead re-sharpened the pause blur (sharp
+//     white flames over it).
 // Native D3D9 calls, state saved/restored with a state block.
 constexpr uint32_t kMarkerVertexShader = 0x859585C3;
 constexpr uint32_t kMarkerPixelShader = 0x9A0AF728;
@@ -267,7 +268,7 @@ struct SceneFinishPass {
     native_device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(vertices[0]));
   }
 
-  // Scene pass, at the marker draw: tone mapped HDR scene into the backbuffer clone.
+  // Scene pass, at the marker draw: graded HDR scene into the backbuffer clone.
   void Run(reshade::api::device* reshade_device) {
     auto* native_device = reinterpret_cast<IDirect3DDevice9*>(reshade_device->get_native());
     IDirect3DSurface9* clone_surface = GetBackBufferClone();
@@ -466,15 +467,17 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapType",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 3.f,
+        .default_value = 2.f,
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .tooltip = "Sets the tone mapper type (3D scene only). Vanilla clips like the original 8-bit image.",
-        .labels = {"Vanilla", "None", "RenoDRT", "Neutwo"},
-        // ACES is left out: it renders white on ps_3_0 (see clivebarkersjericho). Neutwo = 5 exists only in
-        // scene_finish_ps. PsychoV was evaluated and dropped: it whitens and flattens this game's coloured highlights.
-        .parse = [](float value) { return value == 2.f ? 3.f : (value == 3.f ? 5.f : value); },
+        .tooltip = "Sets the tone mapper type. Vanilla clips like the original 8-bit image; None clips at Peak;\n"
+                   "Roll-off compresses only the highlights above 60% of Peak.",
+        .labels = {"Vanilla", "None", "Roll-off"},
+        // Roll-off = 4 exists only in this mod (scene_upgrade_ps). Evaluated and dropped: ACES (renders white on
+        // ps_3_0, see clivebarkersjericho), PsychoV (whitens and flattens the coloured highlights), RenoDRT and Neutwo
+        // (scene pass, before the glow composite; Neutwo also on the BT.709 max channel: fire well below None).
+        .parse = [](float value) { return value == 2.f ? 4.f : value; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",

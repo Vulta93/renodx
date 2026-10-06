@@ -6,6 +6,9 @@
 // Shared by the three addon-drawn passes (see addon.cpp, "Scene passes").
 float4 scene_pass_params : register(c49);  // xy = 1 / render target size
 
+// Addon-only tone mapper value (renodx::draw uses 0-3); see the ToneMapType setting in addon.cpp.
+static const float TONE_MAP_TYPE_ROLLOFF = 4.f;
+
 float2 ScenePassUV(float2 vpos) {
   return (vpos + 0.5f) * scene_pass_params.xy;
 }
