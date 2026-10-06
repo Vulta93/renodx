@@ -55,7 +55,8 @@ in vec4 gl_FragCoord;
 out vec4 out_FragColor0;
 
 void main() {
-	vec3 pre_curve = vec3( 0.0 );
+	// RENODX: max-channel factor of the HDR scene (>= 1), see bridge in / out below.
+	float renodx_scene_max = 1.0;
 	vec2 viewTexCoord = screenPosToTexcoord( gl_FragCoord.xy, _fa_[0 ] );
 	vec2 windowTexCoord = screenPosToTexcoord( gl_FragCoord.xy, _fa_[1 ] );
 	windowTexCoord.y = 1.0 - windowTexCoord.y;
@@ -171,8 +172,10 @@ void main() {
 	{
 		vec3 tmpCol = vec3( dot3( final.xyz, vec3( 0.33, 0.59, 0.11 ) ) );
 		final.xyz = mix( final.xyz, tmpCol, _fa_[17 ].x );
-		// RENODX MEASURE: raw signal before the 1D curve (which clamps at 1.0 through texture addressing).
-		pre_curve = final.xyz;
+		// RENODX bridge in: identical to vanilla for every pixel <= 1.0. Above white the colour is divided by its
+		// max channel (hue kept), so the game's curve, overlay, grain and LUT see the SDR range they expect.
+		renodx_scene_max = max( 1.0, max( final.x, max( final.y, final.z ) ) );
+		final.xyz /= renodx_scene_max;
 		tmpCol.x = h4tex2D( samp_cbconversionlut, vec2( final.x, 0.0 ) ).x;
 		tmpCol.y = h4tex2D( samp_cbconversionlut, vec2( final.y, 0.0 ) ).y;
 		tmpCol.z = h4tex2D( samp_cbconversionlut, vec2( final.z, 0.0 ) ).z;
@@ -196,8 +199,6 @@ void main() {
 	{
 		float ccTexDim = 16.0; float ccDim = 16.0;
 		vec2 duvCC = vec2( 1.0 / ( ccTexDim * ccTexDim ), 1.0 / ccTexDim );
-		// RENODX PROOF: keep what the scene holds above white (the game clamps it away here).
-		vec3 above_white = max( final.xyz - 1.0, vec3( 0.0 ) );
 		vec3 tmp = saturate( final.xyz ) * ( ccDim - 1.0 );
 		vec2 tcRG = tmp.xy * vec2( 1.0 / ( ccTexDim * ccTexDim ), ( 1.0 / ccTexDim ) ) + ( 0.5 * duvCC );
 		float tcB = tmp.z;
@@ -207,10 +208,10 @@ void main() {
 		vec3 resCol0 = tex2Dlod( samp_dynamiccc, vec4( tcRG.x + tcB0, tcRG.y, 0, 0 ) ).xyz;
 		vec3 resCol1 = tex2Dlod( samp_dynamiccc, vec4( tcRG.x + tcB1, tcRG.y, 0, 0 ) ).xyz;
 		vec3 resCol = mix( resCol0, resCol1, tcBFrac );
-		final.xyz = resCol + above_white;
+		// RENODX bridge out: the graded SDR result scaled back up by the same factor. In this gamma-encoded space
+		// (x^(1/2.2)) a scale is the same as scaling the linear colour, so this restores the HDR range on the grade.
+		final.xyz = resCol * renodx_scene_max;
 	};
-	// RENODX MEASURE: output the pre-curve signal; tiny graded term keeps every uniform in use.
-	final.xyz = pre_curve + final.xyz * 1e-6;
 	out_FragColor0.xyz = final.xyz;
 	out_FragColor0.w = 1.0;
 	if ( _fa_[24 ].x == 1.0 ) {
