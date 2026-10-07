@@ -2,8 +2,8 @@
 
 // Display Proxy output (D3D11 side). The game (OpenGL) leaves its frame gamma-encoded with the HDR range above 1.0
 // (max-channel bridge in 0xA85A9FE0.frag.glsl); the HUD is drawn on top of it before this pass.
-// Tone mapping runs here because RenoDX's HLSL library is not available to the game's GLSL shaders.
-// Tone Mapper values (settings order in addon.cpp): 0 = Vanilla, 1 = None, 2 = Roll-off.
+// Tone Mapper values (settings order in addon.cpp): 0 = Vanilla, 1 = None, 2 = Roll-off (here),
+// 3 = PsychoV (tone mapped in 0xA85A9FE0.frag.glsl; only SwapChainPass runs here, like None).
 static const float TONE_MAP_TYPE_VANILLA = 0.f;
 static const float TONE_MAP_TYPE_ROLLOFF = 2.f;
 

@@ -60,8 +60,8 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        // Values match swap_chain_proxy_pixel_shader (0 Vanilla, 1 None, 2 Roll-off).
-        .labels = {"Vanilla", "None", "Roll-off"},
+        // 0 Vanilla, 1 None, 2 Roll-off (swap_chain_proxy_pixel_shader), 3 PsychoV (0xA85A9FE0.frag.glsl).
+        .labels = {"Vanilla", "None", "Roll-off", "PsychoV"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -249,7 +249,8 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .tooltip = "Adds or removes highlight color.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
+        // Not wired: PsychoV-17 has no highlight-saturation input (Blowout drives its bleaching).
+        .is_enabled = []() { return false; },
         .parse = [](float value) { return value * 0.02f; },
         .is_visible = []() { return current_settings_mode >= 1; },
     },
@@ -271,7 +272,8 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .tooltip = "Flare/Glare Compensation",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type == 3; },
+        // Not wired: PsychoV-17 has no flare input.
+        .is_enabled = []() { return false; },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
