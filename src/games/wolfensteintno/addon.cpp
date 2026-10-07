@@ -60,8 +60,9 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        // 0 Vanilla, 1 None, 2 Roll-off (swap_chain_proxy_pixel_shader), 3 PsychoV (0xA85A9FE0.frag.glsl).
-        .labels = {"Vanilla", "None", "Roll-off", "PsychoV"},
+        // 0 Vanilla (clipped like the game's 8-bit buffers), 1 None (untonemapped, clamped at Peak),
+        // 2 PsychoV-17 (0xA85A9FE0.frag.glsl).
+        .labels = {"Vanilla", "None", "PsychoV"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{

@@ -106,8 +106,8 @@ layout( std140 ) uniform RenoDXShaderInjection {
 #define RENODX_TONE_MAP_BLOWOUT      shader_injection.tone_map_blowout
 #define RENODX_TONE_MAP_HUE_CORRECTION shader_injection.tone_map_hue_correction
 
-// Tone Mapper values (addon.cpp ToneMapType): 0 Vanilla, 1 None, 2 Roll-off (Display Proxy shader), 3 PsychoV (here).
-#define TONE_MAP_TYPE_PSYCHOV 3.0
+// Tone Mapper values (addon.cpp ToneMapType): 0 Vanilla, 1 None, 2 PsychoV (here).
+#define TONE_MAP_TYPE_PSYCHOV 2.0
 
 // renodx::draw::DecodeColor / EncodeColor for the encodings the intermediate can use (draw.hlsl; sign-preserving
 // DecodeSafe / EncodeSafe). 0 none, 1 sRGB, 2 gamma 2.2, 3 gamma 2.4.
