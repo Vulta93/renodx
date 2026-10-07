@@ -50,6 +50,69 @@ uniform sampler2D samp_screenoverlay;
 uniform sampler2D samp_grainmap;
 uniform sampler2D samp_dynamiccc;
 
+// RENODX: settings. Mirrors ShaderInjectData in shared.h field for field (32 floats). RenoDX pushes it through
+// ReShade's OpenGL push-constant path, which uploads a UBO at binding 0 (the layout param's binding); an unbound uniform
+// block also defaults to binding 0. std140 packs float members 4 bytes apart, matching the C++ struct.
+struct ShaderInjectData {
+	float peak_white_nits;
+	float diffuse_white_nits;
+	float graphics_white_nits;
+	float color_grade_strength;
+	float tone_map_type;
+	float tone_map_exposure;
+	float tone_map_highlights;
+	float tone_map_shadows;
+	float tone_map_contrast;
+	float tone_map_saturation;
+	float tone_map_highlight_saturation;
+	float tone_map_blowout;
+	float tone_map_flare;
+	float tone_map_hue_correction;
+	float tone_map_hue_shift;
+	float tone_map_working_color_space;
+	float tone_map_clamp_color_space;
+	float tone_map_clamp_peak;
+	float tone_map_hue_processor;
+	float tone_map_per_channel;
+	float gamma_correction;
+	float intermediate_scaling;
+	float intermediate_encoding;
+	float intermediate_color_space;
+	float swap_chain_decoding;
+	float swap_chain_gamma_correction;
+	float swap_chain_custom_color_space;
+	float swap_chain_clamp_color_space;
+	float swap_chain_encoding;
+	float swap_chain_encoding_color_space;
+	float custom_flip_uv_y;
+	float padding0;
+};
+layout( std140 ) uniform RenoDXShaderInjection {
+	ShaderInjectData shader_injection;
+};
+
+#define RENODX_TONE_MAP_TYPE         shader_injection.tone_map_type
+#define RENODX_DIFFUSE_WHITE_NITS    shader_injection.diffuse_white_nits
+#define RENODX_GRAPHICS_WHITE_NITS   shader_injection.graphics_white_nits
+#define RENODX_INTERMEDIATE_ENCODING shader_injection.intermediate_encoding
+
+// renodx::draw::DecodeColor / EncodeColor for the encodings the intermediate can use (draw.hlsl; sign-preserving
+// DecodeSafe / EncodeSafe). 0 none, 1 sRGB, 2 gamma 2.2, 3 gamma 2.4.
+vec3 renodx_srgb_decode( vec3 c ) { return mix( c / 12.92, pow( ( c + 0.055 ) / 1.055, vec3( 2.4 ) ), step( vec3( 0.04045 ), c ) ); }
+vec3 renodx_srgb_encode( vec3 c ) { return mix( c * 12.92, 1.055 * pow( c, vec3( 1.0 / 2.4 ) ) - 0.055, step( vec3( 0.0031308 ), c ) ); }
+vec3 renodx_decode( vec3 c, float encoding ) {
+	if ( encoding == 1.0 ) return sign( c ) * renodx_srgb_decode( abs( c ) );
+	if ( encoding == 2.0 ) return sign( c ) * pow( abs( c ), vec3( 2.2 ) );
+	if ( encoding == 3.0 ) return sign( c ) * pow( abs( c ), vec3( 2.4 ) );
+	return c;
+}
+vec3 renodx_encode( vec3 c, float encoding ) {
+	if ( encoding == 1.0 ) return sign( c ) * renodx_srgb_encode( abs( c ) );
+	if ( encoding == 2.0 ) return sign( c ) * pow( abs( c ), vec3( 1.0 / 2.2 ) );
+	if ( encoding == 3.0 ) return sign( c ) * pow( abs( c ), vec3( 1.0 / 2.4 ) );
+	return c;
+}
+
 in vec4 gl_FragCoord;
 
 out vec4 out_FragColor0;
@@ -212,6 +275,12 @@ void main() {
 		// (x^(1/2.2)) a scale is the same as scaling the linear colour, so this restores the HDR range on the grade.
 		final.xyz = resCol * renodx_scene_max;
 	};
+	// RENODX: Game Brightness. The HUD is drawn on top of this output and the Display Proxy scales the whole frame by
+	// UI Brightness (graphics white), so the scene alone is scaled by Game / UI in linear light here
+	// (renodx::draw::RenderIntermediatePass convention). Not in Vanilla.
+	if ( RENODX_TONE_MAP_TYPE != 0.0 ) {
+		final.xyz = renodx_encode( renodx_decode( final.xyz, RENODX_INTERMEDIATE_ENCODING ) * ( RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS ), RENODX_INTERMEDIATE_ENCODING );
+	}
 	out_FragColor0.xyz = final.xyz;
 	out_FragColor0.w = 1.0;
 	if ( _fa_[24 ].x == 1.0 ) {
