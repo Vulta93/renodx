@@ -7,6 +7,7 @@
 
 #define DEBUG_LEVEL_0
 
+#include <cstddef>
 #include <cstring>
 #include <exception>
 #include <mutex>
@@ -32,6 +33,22 @@
 #include "./shared.h"
 
 namespace {
+
+// The GLSL composite 0xA85A9FE0 reads these ShaderInjectData fields by explicit byte offset (layout(offset = N) in its
+// RenoDXShaderInjection block). Update both sides together.
+static_assert(sizeof(ShaderInjectData) % 16 == 0, "std140 uniform block size must be a multiple of 16 bytes");
+static_assert(offsetof(ShaderInjectData, peak_white_nits) == 0);
+static_assert(offsetof(ShaderInjectData, diffuse_white_nits) == 4);
+static_assert(offsetof(ShaderInjectData, graphics_white_nits) == 8);
+static_assert(offsetof(ShaderInjectData, tone_map_type) == 16);
+static_assert(offsetof(ShaderInjectData, tone_map_exposure) == 20);
+static_assert(offsetof(ShaderInjectData, tone_map_highlights) == 24);
+static_assert(offsetof(ShaderInjectData, tone_map_shadows) == 28);
+static_assert(offsetof(ShaderInjectData, tone_map_contrast) == 32);
+static_assert(offsetof(ShaderInjectData, tone_map_saturation) == 36);
+static_assert(offsetof(ShaderInjectData, tone_map_blowout) == 44);
+static_assert(offsetof(ShaderInjectData, tone_map_hue_correction) == 52);
+static_assert(offsetof(ShaderInjectData, intermediate_encoding) == 88);
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xA85A9FE0),  // main post-process + colour LUT (GLSL)

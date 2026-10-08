@@ -1,6 +1,8 @@
 #version 150
 // RENODX: floatBitsToUint (GLSL 3.30) is used by the PsychoV port below (psycho17_CopySign).
 #extension GL_ARB_shader_bit_encoding : require
+// RENODX: explicit uniform-block member offsets (GLSL 4.40 core; NVIDIA exposes it on this 4.3 context).
+#extension GL_ARB_enhanced_layouts : require
 
 void clip( float v ) { if ( v < 0.0 ) { discard; } }
 void clip( vec2 v ) { if ( any( lessThan( v, vec2( 0.0 ) ) ) ) { discard; } }
@@ -52,46 +54,24 @@ uniform sampler2D samp_screenoverlay;
 uniform sampler2D samp_grainmap;
 uniform sampler2D samp_dynamiccc;
 
-// RENODX: settings. Mirrors ShaderInjectData in shared.h field for field (32 floats). RenoDX pushes it through
-// ReShade's OpenGL push-constant path, which uploads a UBO at binding 0 (the layout param's binding); an unbound uniform
-// block also defaults to binding 0. std140 packs float members 4 bytes apart, matching the C++ struct.
-struct ShaderInjectData {
-	float peak_white_nits;
-	float diffuse_white_nits;
-	float graphics_white_nits;
-	float color_grade_strength;
-	float tone_map_type;
-	float tone_map_exposure;
-	float tone_map_highlights;
-	float tone_map_shadows;
-	float tone_map_contrast;
-	float tone_map_saturation;
-	float tone_map_highlight_saturation;
-	float tone_map_blowout;
-	float tone_map_flare;
-	float tone_map_hue_correction;
-	float tone_map_hue_shift;
-	float tone_map_working_color_space;
-	float tone_map_clamp_color_space;
-	float tone_map_clamp_peak;
-	float tone_map_hue_processor;
-	float tone_map_per_channel;
-	float gamma_correction;
-	float intermediate_scaling;
-	float intermediate_encoding;
-	float intermediate_color_space;
-	float swap_chain_decoding;
-	float swap_chain_gamma_correction;
-	float swap_chain_custom_color_space;
-	float swap_chain_clamp_color_space;
-	float swap_chain_encoding;
-	float swap_chain_encoding_color_space;
-	float custom_flip_uv_y;
-	float padding0;
-};
+// RENODX: settings. RenoDX pushes ShaderInjectData (shared.h) through ReShade's OpenGL push-constant path, which uploads
+// it as a UBO at binding 0 (the layout param's binding); an unbound uniform block also defaults to binding 0. Only the
+// fields used here are declared, each at its byte offset in ShaderInjectData; addon.cpp static_asserts the same offsets,
+// so a change to shared.h that would move them fails the build instead of silently feeding wrong values.
 layout( std140 ) uniform RenoDXShaderInjection {
-	ShaderInjectData shader_injection;
-};
+	layout( offset = 0 ) float peak_white_nits;
+	layout( offset = 4 ) float diffuse_white_nits;
+	layout( offset = 8 ) float graphics_white_nits;
+	layout( offset = 16 ) float tone_map_type;
+	layout( offset = 20 ) float tone_map_exposure;
+	layout( offset = 24 ) float tone_map_highlights;
+	layout( offset = 28 ) float tone_map_shadows;
+	layout( offset = 32 ) float tone_map_contrast;
+	layout( offset = 36 ) float tone_map_saturation;
+	layout( offset = 44 ) float tone_map_blowout;
+	layout( offset = 52 ) float tone_map_hue_correction;
+	layout( offset = 88 ) float intermediate_encoding;
+} shader_injection;
 
 #define RENODX_TONE_MAP_TYPE         shader_injection.tone_map_type
 #define RENODX_PEAK_WHITE_NITS       shader_injection.peak_white_nits
