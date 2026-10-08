@@ -1492,7 +1492,10 @@ void main() {
 		float tempLum = dot( final.xyz, vec3( 0.3, 0.59, 0.11 ) );
 		tempLum = saturate( ( tempLum * _fa_[22 ].z ) + _fa_[22 ].w );
 		grain *= tempLum;
-		final.xyz += grain;
+		// RENODX: the bridge scales this pixel back up by renodx_scene_max after the LUT, which would scale the grain with
+		// it (about +-7% noise on every highlight). Vanilla clipped everything above white after the grain, so its
+		// highlights had none. Dividing keeps it identical up to white and fades it out above.
+		final.xyz += grain / renodx_scene_max;
 		if ( _fa_[23 ].x == 1.0 ) {
 			final.xyz = vec3( tempLum );
 		}
