@@ -132,41 +132,6 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ToneMapScaling",
-        .binding = &shader_injection.tone_map_per_channel,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Scaling",
-        .section = "Tone Mapping",
-        .tooltip = "Luminance scales colors consistently while per-channel saturates and blows out sooner",
-        .labels = {"Luminance", "Per Channel"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .is_visible = []() { return current_settings_mode >= 2; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ToneMapWorkingColorSpace",
-        .binding = &shader_injection.tone_map_working_color_space,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Working Color Space",
-        .section = "Tone Mapping",
-        .labels = {"BT709", "BT2020", "AP1"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .is_visible = []() { return current_settings_mode >= 2; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ToneMapHueProcessor",
-        .binding = &shader_injection.tone_map_hue_processor,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Hue Processor",
-        .section = "Tone Mapping",
-        .tooltip = "Selects hue processor",
-        .labels = {"OKLab", "ICtCp", "darkTable UCS"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .is_visible = []() { return current_settings_mode >= 2; },
-    },
-    new renodx::utils::settings::Setting{
         .key = "ToneMapHueCorrection",
         .binding = &shader_injection.tone_map_hue_correction,
         .default_value = 100.f,
@@ -175,47 +140,8 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Hue retention strength.",
         .min = 0.f,
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
+        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },  // PsychoV only (0xA85A9FE0)
         .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ToneMapHueShift",
-        .binding = &shader_injection.tone_map_hue_shift,
-        .default_value = 50.f,
-        .label = "Hue Shift",
-        .section = "Tone Mapping",
-        .tooltip = "Hue-shift emulation strength.",
-        .min = 0.f,
-        .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return current_settings_mode >= 1; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ToneMapClampColorSpace",
-        .binding = &shader_injection.tone_map_clamp_color_space,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Clamp Color Space",
-        .section = "Tone Mapping",
-        .tooltip = "Hue-shift emulation strength.",
-        .labels = {"None", "BT709", "BT2020", "AP1"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) { return value - 1.f; },
-        .is_visible = []() { return current_settings_mode >= 2; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ToneMapClampPeak",
-        .binding = &shader_injection.tone_map_clamp_peak,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Clamp Peak",
-        .section = "Tone Mapping",
-        .tooltip = "Hue-shift emulation strength.",
-        .labels = {"None", "BT709", "BT2020", "AP1"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) { return value - 1.f; },
         .is_visible = []() { return current_settings_mode >= 2; },
     },
     new renodx::utils::settings::Setting{
@@ -224,6 +150,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Exposure",
         .section = "Color Grading",
+        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },  // PsychoV only (0xA85A9FE0)
         .max = 2.f,
         .format = "%.2f",
         .is_visible = []() { return current_settings_mode >= 1; },
@@ -234,6 +161,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 50.f,
         .label = "Highlights",
         .section = "Color Grading",
+        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },  // PsychoV only (0xA85A9FE0)
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
         .is_visible = []() { return current_settings_mode >= 1; },
@@ -244,6 +172,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 50.f,
         .label = "Shadows",
         .section = "Color Grading",
+        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },  // PsychoV only (0xA85A9FE0)
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
         .is_visible = []() { return current_settings_mode >= 1; },
@@ -254,6 +183,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 50.f,
         .label = "Contrast",
         .section = "Color Grading",
+        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },  // PsychoV only (0xA85A9FE0)
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
     },
@@ -263,54 +193,9 @@ renodx::utils::settings::Settings settings = {
         .default_value = 50.f,
         .label = "Saturation",
         .section = "Color Grading",
+        .is_enabled = []() { return shader_injection.tone_map_type == 2.f; },  // PsychoV only (0xA85A9FE0)
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ColorGradeHighlightSaturation",
-        .binding = &shader_injection.tone_map_highlight_saturation,
-        .default_value = 50.f,
-        .label = "Highlight Saturation",
-        .section = "Color Grading",
-        .tooltip = "Adds or removes highlight color.",
-        .max = 100.f,
-        // Not wired: PsychoV-17 has no highlight-saturation input (Blowout drives its bleaching).
-        .is_enabled = []() { return false; },
-        .parse = [](float value) { return value * 0.02f; },
-        .is_visible = []() { return current_settings_mode >= 1; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ColorGradeBlowout",
-        .binding = &shader_injection.tone_map_blowout,
-        .default_value = 0.f,
-        .label = "Blowout",
-        .section = "Color Grading",
-        .tooltip = "Controls highlight desaturation due to overexposure.",
-        .max = 100.f,
-        .parse = [](float value) { return value * 0.01f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ColorGradeFlare",
-        .binding = &shader_injection.tone_map_flare,
-        .default_value = 0.f,
-        .label = "Flare",
-        .section = "Color Grading",
-        .tooltip = "Flare/Glare Compensation",
-        .max = 100.f,
-        // Not wired: PsychoV-17 has no flare input.
-        .is_enabled = []() { return false; },
-        .parse = [](float value) { return value * 0.02f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "ColorGradeScene",
-        .binding = &shader_injection.color_grade_strength,
-        .default_value = 100.f,
-        .label = "Scene Grading",
-        .section = "Color Grading",
-        .tooltip = "Scene grading as applied by the game",
-        .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type > 0; },
-        .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
         .key = "SwapChainCustomColorSpace",
@@ -888,10 +773,39 @@ std::vector<renodx::utils::detour::Export> wgl_swap_buffers_detours = {
 // the overlay key and take the same mouse input, so a click on the visible overlay also hit a different control in the
 // invisible one (other settings changing, effects switching on and being saved to the shared preset). Keep the
 // invisible overlay closed.
+// ReShade lets only the first runtime registered for a window block the game's input (runtime.cpp
+// _primary_input_handler), which is the OpenGL one. So while the visible proxy overlay is open, the OpenGL runtime is
+// asked to block input every frame: block_input_next_frame() from the present event, which ReShade fires right before
+// that runtime's GUI pass applies the flag (opengl_hooks_wgl.cpp).
+reshade::api::effect_runtime* opengl_runtime = nullptr;
+bool proxy_overlay_open = false;
+
 bool OnReShadeOpenOverlay(reshade::api::effect_runtime* runtime, bool open, reshade::api::input_source source) {
+  if (runtime->get_device()->get_api() != reshade::api::device_api::opengl) {
+    proxy_overlay_open = open;
+    return false;
+  }
   if (!open) return false;
-  if (runtime->get_device()->get_api() != reshade::api::device_api::opengl) return false;
   return renodx::mods::swapchain::use_device_proxy && !renodx::utils::device_proxy::device_proxy_creation_failed;
+}
+
+void OnInitEffectRuntime(reshade::api::effect_runtime* runtime) {
+  if (runtime->get_device()->get_api() == reshade::api::device_api::opengl) {
+    opengl_runtime = runtime;
+  }
+}
+
+void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
+  if (runtime == opengl_runtime) {
+    opengl_runtime = nullptr;
+  }
+}
+
+void OnPresentBlockGameInput(reshade::api::command_queue* queue, reshade::api::swapchain*, const reshade::api::rect*,
+                             const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+  if (!proxy_overlay_open || opengl_runtime == nullptr) return;
+  if (queue->get_device()->get_api() != reshade::api::device_api::opengl) return;
+  opengl_runtime->block_input_next_frame();
 }
 
 // Scene upgrades by exact size, as fractions of the window's client area (the game sizes its render targets from it, and
@@ -962,6 +876,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowSize);
       reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReShadeOpenOverlay);
+      reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+      reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+      reshade::register_event<reshade::addon_event::present>(OnPresentBlockGameInput);
       trace::Register(true);
 
       if (!initialized) {
@@ -1197,6 +1114,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowSize);
       reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReShadeOpenOverlay);
+      reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+      reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+      reshade::unregister_event<reshade::addon_event::present>(OnPresentBlockGameInput);
       trace::Register(false);
       if (original_wgl_swap_buffers != nullptr) {
         // Never let an exception leave DllMain.
