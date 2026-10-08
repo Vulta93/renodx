@@ -7,7 +7,10 @@
 
 #define DEBUG_LEVEL_0
 
+#include <cmath>
 #include <cstring>
+#include <exception>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -20,7 +23,12 @@
 
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
+#include "../../utils/bitwise.hpp"
+#include "../../utils/data.hpp"
+#include "../../utils/detour.hpp"
+#include "../../utils/device_proxy.hpp"
 #include "../../utils/hash.hpp"
+#include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
 #include "./shared.h"
 
@@ -798,6 +806,64 @@ void Register(bool enable) {
 }
 }  // namespace gl_probe
 
+// With the Display Proxy the frame reaches the screen through the D3D11 HDR swap chain, presented from ReShade's
+// present event. The game renders into the proxy clone, so its own GL back buffer only holds stale ReShade overlay
+// pixels, yet the real SwapBuffers still presents that buffer to the same window. In the game's topmost "fullscreen
+// windowed" mode the driver shows it instead of the proxy output (black screen with the ReShade overlay burned in).
+// ReShade calls the system opengl32 wglSwapBuffers directly, after its present event (opengl_hooks_wgl.cpp), so
+// skipping that call drops only the game's GL present. If the proxy could not be created, the game presents as usual.
+using WglSwapBuffersFunction = BOOL(WINAPI*)(HDC);
+WglSwapBuffersFunction original_wgl_swap_buffers = nullptr;
+
+BOOL WINAPI OnWglSwapBuffers(HDC hdc) {
+  if (renodx::mods::swapchain::use_device_proxy && !renodx::utils::device_proxy::device_proxy_creation_failed) return TRUE;
+  return original_wgl_swap_buffers(hdc);
+}
+
+std::vector<renodx::utils::detour::Export> wgl_swap_buffers_detours = {
+    {"wglSwapBuffers", &original_wgl_swap_buffers, &OnWglSwapBuffers},
+};
+
+// The game sizes its full-screen render targets from the window's client area, and a window can have any shape
+// (3818x2104 after switching to windowed in game), so the scene upgrade rule's fixed aspect ratio must follow the
+// window. This runs before RenoDX's create_resource handler (registered first), so the new ratio already applies to
+// the target being created.
+bool OnCreateResourceFollowWindowAspect(
+    reshade::api::device* device,
+    reshade::api::resource_desc& desc,
+    reshade::api::subresource_data* initial_data,
+    reshade::api::resource_usage initial_state) {
+  if (desc.type != reshade::api::resource_type::texture_2d) return false;
+  if (desc.texture.format != reshade::api::format::r8g8b8a8_unorm) return false;
+  if (!renodx::utils::bitwise::HasAnyFlag(desc.usage, reshade::api::resource_usage::render_target)) return false;
+
+  HWND game_window = FindWindowW(L"Wolfenstein The New Order", nullptr);
+  if (game_window == nullptr) return false;
+  DWORD window_process_id = 0;
+  GetWindowThreadProcessId(game_window, &window_process_id);
+  if (window_process_id != GetCurrentProcessId()) return false;
+  RECT client_rect = {};
+  if (GetClientRect(game_window, &client_rect) == FALSE) return false;
+  const LONG client_width = client_rect.right - client_rect.left;
+  const LONG client_height = client_rect.bottom - client_rect.top;
+  if (client_width <= 0 || client_height <= 0) return false;
+  const float window_aspect_ratio = static_cast<float>(client_width) / static_cast<float>(client_height);
+
+  auto* upgrade_data = renodx::utils::data::Get<renodx::utils::resource::upgrade::DeviceData>(device);
+  if (upgrade_data == nullptr) return false;
+  const std::unique_lock lock(upgrade_data->mutex);
+  for (auto& upgrade_info : upgrade_data->upgrade_infos) {
+    // Only the scene rule uses a fixed ratio; ANY and BACK_BUFFER are negative markers.
+    if (upgrade_info.aspect_ratio <= 0.f) continue;
+    if (std::abs(upgrade_info.aspect_ratio - window_aspect_ratio) < 0.0005f) continue;
+    upgrade_info.aspect_ratio = window_aspect_ratio;
+    std::stringstream s;
+    s << "wolfensteintno: scene upgrade aspect ratio follows window " << client_width << "x" << client_height;
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  }
+  return false;
+}
+
 bool initialized = false;
 
 }  // namespace
@@ -809,6 +875,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
+      reshade::register_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowAspect);
       trace::Register(true);
 
       if (!initialized) {
@@ -922,6 +989,18 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           renodx::mods::swapchain::set_color_space = !use_device_proxy;
           if (use_device_proxy) {
             reshade::register_event<reshade::addon_event::present>(OnPresent);
+
+            wchar_t system_directory[MAX_PATH] = {};
+            GetSystemDirectoryW(system_directory, MAX_PATH);
+            const std::wstring system_opengl_path = std::wstring(system_directory) + L"\\opengl32.dll";
+            HMODULE system_opengl = GetModuleHandleW(system_opengl_path.c_str());
+            if (system_opengl == nullptr) {
+              reshade::log::message(reshade::log::level::warning, "wolfensteintno: system opengl32.dll not loaded, GL present kept");
+            } else if (renodx::utils::detour::Install(system_opengl, wgl_swap_buffers_detours).Complete()) {
+              reshade::log::message(reshade::log::level::info, "wolfensteintno: GL present skipped while the proxy presents");
+            } else {
+              reshade::log::message(reshade::log::level::warning, "wolfensteintno: wglSwapBuffers detour failed, GL present kept");
+            }
           } else {
             shader_injection.custom_flip_uv_y = 0.f;
           }
@@ -1003,9 +1082,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
         {
           // Wolfenstein creates its full-screen render targets (scene colour 0xFBF, half/quarter res) before the swapchain
-          // exists, so a back-buffer size match ("Output size") misses them and the scene stays 8-bit. Match the screen's
-          // aspect ratio instead: full/half/quarter res + glare chain, but not the 8192x8192 virtual-texture caches,
-          // the colour LUTs (256x16, 256x1) or other non-screen-shaped targets.
+          // exists, so a back-buffer size match ("Output size") misses them and the scene stays 8-bit. Match the window's
+          // aspect ratio instead (starts at the screen's; OnCreateResourceFollowWindowAspect keeps it on the window):
+          // full/half/quarter res + glare chain, but not the 8192x8192 virtual-texture caches, the colour LUTs (256x16,
+          // 256x1) or other non-screen-shaped targets.
           const float screen_aspect_ratio = static_cast<float>(GetSystemMetrics(SM_CXSCREEN))
                                             / static_cast<float>(GetSystemMetrics(SM_CYSCREEN));
           renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
@@ -1025,7 +1105,16 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowAspect);
       trace::Register(false);
+      if (original_wgl_swap_buffers != nullptr) {
+        // Never let an exception leave DllMain.
+        try {
+          renodx::utils::detour::Uninstall(wgl_swap_buffers_detours);
+        } catch (const std::exception&) {
+          reshade::log::message(reshade::log::level::warning, "wolfensteintno: wglSwapBuffers detour removal failed");
+        }
+      }
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_addon(h_module);
       break;
