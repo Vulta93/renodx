@@ -93,7 +93,7 @@ Do not load the RenoDX Devkit together with this mod (both run a Display Proxy).
   helper window is pending.
 
 ## Known issues
-- Vanilla issues, present without the mod (and without id5Tweaker): distant lamp lights flicker; small floor clutter (planks, tins)
+- Vanilla issues, present without the mod (and without id5Tweaker): distant lamp lights flicker; small metallic clutter
   flickers at a distance.
 - PsychoV-17's Blowout has no visible effect with a fixed adaptation state, so it is not exposed.
 - Haze flare passes add into the scene after the composite; they are clamped at Peak by the proxy, not tone mapped.
