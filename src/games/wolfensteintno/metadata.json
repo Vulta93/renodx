@@ -2,11 +2,17 @@
   "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
   "id": "wolfensteintno",
   "title": "Wolfenstein: The New Order",
+  "summary": "RenoDX HDR mod for Wolfenstein: The New Order (OpenGL, HDR10 through the RenoDX Display Proxy).",
   "status": "experimental",
+  "notes": [
+    "Requires ReShade with add-on support installed as opengl32.dll and [INSTALL] HookDirectX=1 in ReShade.ini."
+  ],
   "deploy": {
     "steam_appid": 201810,
     "game_exe": "WolfNewOrder_x64.exe",
     "api": "opengl",
-    "architecture": "x64"
+    "architecture": [
+      "x64"
+    ]
   }
 }
