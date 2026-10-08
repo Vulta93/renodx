@@ -71,8 +71,8 @@ struct ShaderInjectData {
   float swap_chain_encoding;
   float swap_chain_encoding_color_space;
   float custom_flip_uv_y;
-  // Pads the struct to 32 floats (a multiple of 16 bytes): the GLSL composite reads it as a std140 uniform block, whose
-  // size is rounded up to 16 bytes, and the uploaded buffer must cover the whole block. Keep 0xA85A9FE0.frag.glsl in sync.
+  // Pads the struct to a multiple of 16 bytes (std140 rounds uniform block sizes up to 16; the uploaded buffer must
+  // cover the whole block). The GLSL composite 0xA85A9FE0 reads fields by byte offset; addon.cpp static_asserts both.
   float padding0;
 };
 
