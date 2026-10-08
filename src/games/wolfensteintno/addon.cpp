@@ -883,6 +883,17 @@ std::vector<renodx::utils::detour::Export> wgl_swap_buffers_detours = {
     {"wglSwapBuffers", &original_wgl_swap_buffers, &OnWglSwapBuffers},
 };
 
+// With the Display Proxy there are two ReShade runtimes: the OpenGL one (ReShade.ini), whose overlay is drawn into the
+// GL back buffer that is no longer presented, and the D3D11 proxy one (ReShade2.ini) that the player sees. Both open on
+// the overlay key and take the same mouse input, so a click on the visible overlay also hit a different control in the
+// invisible one (other settings changing, effects switching on and being saved to the shared preset). Keep the
+// invisible overlay closed.
+bool OnReShadeOpenOverlay(reshade::api::effect_runtime* runtime, bool open, reshade::api::input_source source) {
+  if (!open) return false;
+  if (runtime->get_device()->get_api() != reshade::api::device_api::opengl) return false;
+  return renodx::mods::swapchain::use_device_proxy && !renodx::utils::device_proxy::device_proxy_creation_failed;
+}
+
 // Scene upgrades by exact size, as fractions of the window's client area (the game sizes its render targets from it, and
 // a window can have any shape, e.g. 3818x2104 after switching to windowed in game). Traced 2026-10-08: full = scene
 // colour and its MSAA attachments, reflections, resolve target; eighth = luminance / bright-pass / glare / haze chain;
@@ -950,6 +961,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowSize);
+      reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReShadeOpenOverlay);
       trace::Register(true);
 
       if (!initialized) {
@@ -1184,6 +1196,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowSize);
+      reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReShadeOpenOverlay);
       trace::Register(false);
       if (original_wgl_swap_buffers != nullptr) {
         // Never let an exception leave DllMain.
