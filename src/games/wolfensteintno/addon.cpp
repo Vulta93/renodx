@@ -7,7 +7,6 @@
 
 #define DEBUG_LEVEL_0
 
-#include <cmath>
 #include <cstring>
 #include <exception>
 #include <mutex>
@@ -423,6 +422,11 @@ bool active = false;
 int draws = 0;
 int cooldown = 0;
 uint64_t back_buffer_handle = 0;
+// Draw runs are grouped by pixel shader (set by gl_probe::OnBindPipeline) and list the screen-sized textures they read.
+uint32_t current_pixel_shader = 0;
+uint32_t run_pixel_shader = 0;
+std::string run_inputs;
+reshade::api::resource_view bound_textures[16] = {};
 
 void Log(const std::string& message) {
   reshade::log::message(reshade::log::level::info, ("WOLFTRACE " + message).c_str());
@@ -439,7 +443,11 @@ std::string Describe(reshade::api::device* device, reshade::api::resource resour
 }
 
 void FlushDraws() {
-  if (draws > 0) Log("  ... " + std::to_string(draws) + " draws");
+  if (draws > 0) {
+    std::stringstream s;
+    s << "  ... " << draws << " draws ps 0x" << std::hex << std::uppercase << run_pixel_shader << std::dec << run_inputs;
+    Log(s.str());
+  }
   draws = 0;
 }
 
@@ -476,19 +484,49 @@ void OnBindRenderTargets(reshade::api::command_list* cmd_list, uint32_t count, c
   FlushDraws();
   auto* device = cmd_list->get_device();
   std::string message = "BIND RT x" + std::to_string(count);
-  if (count > 0 && rtvs[0].handle != 0u) {
-    message += " -> " + Describe(device, device->get_resource_from_view(rtvs[0]));
+  for (uint32_t i = 0; i < count; ++i) {
+    if (rtvs[i].handle == 0u) continue;
+    message += " rt" + std::to_string(i) + "=" + Describe(device, device->get_resource_from_view(rtvs[i]));
   }
   Log(message);
 }
 
+void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage, reshade::api::pipeline_layout,
+                       uint32_t layout_param, const reshade::api::descriptor_table_update& update) {
+  if (cmd_list->get_device()->get_api() != reshade::api::device_api::opengl) return;
+  if (layout_param != 0 || update.type != reshade::api::descriptor_type::sampler_with_resource_view) return;
+  const auto* descriptors = static_cast<const reshade::api::sampler_with_resource_view*>(update.descriptors);
+  for (uint32_t i = 0; i < update.count; ++i) {
+    const uint32_t slot = update.binding + i;
+    if (slot < 16) bound_textures[slot] = descriptors[i].view;
+  }
+}
+
+void CountDraw(reshade::api::command_list* cmd_list) {
+  if (!IsActive(cmd_list)) return;
+  if (draws > 0 && current_pixel_shader != run_pixel_shader) FlushDraws();
+  if (draws == 0) {
+    run_pixel_shader = current_pixel_shader;
+    run_inputs.clear();
+    auto* device = cmd_list->get_device();
+    for (uint32_t slot = 0; slot < 16; ++slot) {
+      if (bound_textures[slot].handle == 0u) continue;
+      const auto resource = device->get_resource_from_view(bound_textures[slot]);
+      if (resource.handle == 0u) continue;
+      if (device->get_resource_desc(resource).texture.width < 400) continue;
+      run_inputs += " t" + std::to_string(slot) + "=" + Describe(device, resource);
+    }
+  }
+  ++draws;
+}
+
 bool OnDraw(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, uint32_t) {
-  if (IsActive(cmd_list)) ++draws;
+  CountDraw(cmd_list);
   return false;
 }
 
 bool OnDrawIndexed(reshade::api::command_list* cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
-  if (IsActive(cmd_list)) ++draws;
+  CountDraw(cmd_list);
   return false;
 }
 
@@ -539,6 +577,7 @@ void Register(bool attach) {
     reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
     reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
     reshade::register_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+    reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
   } else {
     reshade::unregister_event<reshade::addon_event::present>(OnPresent);
     reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
@@ -548,6 +587,7 @@ void Register(bool attach) {
     reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
     reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
     reshade::unregister_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+    reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
   }
 }
 }  // namespace trace
@@ -702,6 +742,8 @@ void OnBindPipeline(reshade::api::command_list* cmd_list, reshade::api::pipeline
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::opengl) return;
   if ((pipeline.handle >> 40) != kGlProgramHandleType) return;
   current_program = static_cast<GLuint>(pipeline.handle & 0xFFFFFFFFu);
+  const auto hash_it = pixel_shader_hash_by_program.find(current_program);
+  trace::current_pixel_shader = (hash_it != pixel_shader_hash_by_program.end()) ? hash_it->second : 0u;
 }
 
 bool ReadCentre(GLuint framebuffer, float out[4]) {
@@ -824,11 +866,23 @@ std::vector<renodx::utils::detour::Export> wgl_swap_buffers_detours = {
     {"wglSwapBuffers", &original_wgl_swap_buffers, &OnWglSwapBuffers},
 };
 
-// The game sizes its full-screen render targets from the window's client area, and a window can have any shape
-// (3818x2104 after switching to windowed in game), so the scene upgrade rule's fixed aspect ratio must follow the
-// window. This runs before RenoDX's create_resource handler (registered first), so the new ratio already applies to
-// the target being created.
-bool OnCreateResourceFollowWindowAspect(
+// Scene upgrades by exact size, as fractions of the window's client area (the game sizes its render targets from it, and
+// a window can have any shape, e.g. 3818x2104 after switching to windowed in game). Traced 2026-10-08: full = scene
+// colour and its MSAA attachments, reflections, resolve target; eighth = luminance / bright-pass / glare / haze chain;
+// half is unused in gameplay but kept. Quarter is left 8-bit on purpose: it holds the screen-distortion offsets
+// (0xBE1EA7F8, range -0.5..1.5) and vanilla relies on the 8-bit target clamping them.
+struct SceneUpgradeScale {
+  const char* name;
+  int16_t divisor;
+};
+constexpr SceneUpgradeScale SCENE_UPGRADE_SCALES[] = {
+    {.name = "wolfensteintno full", .divisor = 1},
+    {.name = "wolfensteintno half", .divisor = 2},
+    {.name = "wolfensteintno eighth", .divisor = 8},
+};
+
+// Runs before RenoDX's create_resource handler (registered first), so the sizes already apply to the target being created.
+bool OnCreateResourceFollowWindowSize(
     reshade::api::device* device,
     reshade::api::resource_desc& desc,
     reshade::api::subresource_data* initial_data,
@@ -847,19 +901,22 @@ bool OnCreateResourceFollowWindowAspect(
   const LONG client_width = client_rect.right - client_rect.left;
   const LONG client_height = client_rect.bottom - client_rect.top;
   if (client_width <= 0 || client_height <= 0) return false;
-  const float window_aspect_ratio = static_cast<float>(client_width) / static_cast<float>(client_height);
 
   auto* upgrade_data = renodx::utils::data::Get<renodx::utils::resource::upgrade::DeviceData>(device);
   if (upgrade_data == nullptr) return false;
   const std::unique_lock lock(upgrade_data->mutex);
   for (auto& upgrade_info : upgrade_data->upgrade_infos) {
-    // Only the scene rule uses a fixed ratio; ANY and BACK_BUFFER are negative markers.
-    if (upgrade_info.aspect_ratio <= 0.f) continue;
-    if (std::abs(upgrade_info.aspect_ratio - window_aspect_ratio) < 0.0005f) continue;
-    upgrade_info.aspect_ratio = window_aspect_ratio;
-    std::stringstream s;
-    s << "wolfensteintno: scene upgrade aspect ratio follows window " << client_width << "x" << client_height;
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+    for (const auto& scale : SCENE_UPGRADE_SCALES) {
+      if (upgrade_info.name != scale.name) continue;
+      const auto width = static_cast<int16_t>(client_width / scale.divisor);
+      const auto height = static_cast<int16_t>(client_height / scale.divisor);
+      if (upgrade_info.dimensions.width == width && upgrade_info.dimensions.height == height) continue;
+      upgrade_info.dimensions.width = width;
+      upgrade_info.dimensions.height = height;
+      std::stringstream s;
+      s << "wolfensteintno: " << scale.name << " upgrade follows window: " << width << "x" << height;
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
   }
   return false;
 }
@@ -875,7 +932,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
-      reshade::register_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowAspect);
+      reshade::register_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowSize);
       trace::Register(true);
 
       if (!initialized) {
@@ -1082,22 +1139,25 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
         {
           // Wolfenstein creates its full-screen render targets (scene colour 0xFBF, half/quarter res) before the swapchain
-          // exists, so a back-buffer size match ("Output size") misses them and the scene stays 8-bit. Match the window's
-          // aspect ratio instead (starts at the screen's; OnCreateResourceFollowWindowAspect keeps it on the window):
-          // full/half/quarter res + glare chain, but not the 8192x8192 virtual-texture caches, the colour LUTs (256x16,
-          // 256x1) or other non-screen-shaped targets.
-          const float screen_aspect_ratio = static_cast<float>(GetSystemMetrics(SM_CXSCREEN))
-                                            / static_cast<float>(GetSystemMetrics(SM_CYSCREEN));
-          renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
-              .old_format = reshade::api::format::r8g8b8a8_unorm,
-              .new_format = reshade::api::format::r16g16b16a16_float,
-              // OpenGL: clone + redirect leaves the 3D scene black; upgrade the texture itself at creation instead.
-              .use_resource_view_cloning = false,
-              .aspect_ratio = screen_aspect_ratio,
-              .aspect_ratio_tolerance = 0.01f,
-              .min_dimensions = {.width = 400, .height = 200},
-              .usage_include = reshade::api::resource_usage::render_target,
-          });
+          // exists, so a back-buffer size match ("Output size") misses them and the scene stays 8-bit. Match explicit
+          // fractions of the window instead (SCENE_UPGRADE_SCALES; start from the screen size,
+          // OnCreateResourceFollowWindowSize keeps them on the window).
+          const auto screen_width = static_cast<int16_t>(GetSystemMetrics(SM_CXSCREEN));
+          const auto screen_height = static_cast<int16_t>(GetSystemMetrics(SM_CYSCREEN));
+          for (const auto& scale : SCENE_UPGRADE_SCALES) {
+            renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+                .old_format = reshade::api::format::r8g8b8a8_unorm,
+                .new_format = reshade::api::format::r16g16b16a16_float,
+                // OpenGL: clone + redirect leaves the 3D scene black; upgrade the texture itself at creation instead.
+                .use_resource_view_cloning = false,
+                .dimensions = {
+                    .width = static_cast<int16_t>(screen_width / scale.divisor),
+                    .height = static_cast<int16_t>(screen_height / scale.divisor),
+                },
+                .usage_include = reshade::api::resource_usage::render_target,
+                .name = scale.name,
+            });
+          }
         }
 
         initialized = true;
@@ -1105,7 +1165,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
-      reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowAspect);
+      reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResourceFollowWindowSize);
       trace::Register(false);
       if (original_wgl_swap_buffers != nullptr) {
         // Never let an exception leave DllMain.
