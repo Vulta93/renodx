@@ -1033,7 +1033,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           auto* setting = new renodx::utils::settings::Setting{
               .key = "SwapChainDeviceProxy",
               .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 0.f,
+              // OpenGL has no HDR swap chain of its own; HDR output only exists through the D3D11 Display Proxy.
+              .default_value = 1.f,
               .label = "Use Display Proxy",
               .section = "Display Proxy",
               .labels = {"Off", "On"},
