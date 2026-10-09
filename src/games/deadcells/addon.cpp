@@ -540,9 +540,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .key = "SwapChainEncoding",
               .binding = &shader_injection.swap_chain_encoding,
               .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 4.f,
+              .default_value = 5.f,
               .label = "Encoding",
               .section = "Display Output",
+              .tooltip = "scRGB (default) presents the game's own float back buffer. HDR10 swaps the back buffer for a clone,\n"
+                         "which shows the game's light-blue clear colour for a moment at startup.",
               .labels = {"None", "SRGB", "2.2", "2.4", "HDR10", "scRGB"},
               .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
               .on_change_value = [](float previous, float current) {

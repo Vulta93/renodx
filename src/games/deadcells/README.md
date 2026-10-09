@@ -17,7 +17,7 @@ The only place HDR information is destroyed is an 8-bit write:
 5. HUD and UI draw directly onto the backbuffer at native resolution.
 
 ## What the mod does
-- Swap chain upgraded to `r10g10b10a2_unorm` / HDR10 (no Display Proxy). Resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
+- Swap chain upgraded to `r16g16b16a16_float` / scRGB by default (swap chain proxy in compatibility mode, no Display Proxy); HDR10 (`r10g10b10a2_unorm`) selectable. Resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
 - Active shader replacements:
   - `0x48C1C006` — world composite. Gated so only the first draw of the frame, and only when `t0` is a render target, is replaced. This is what separates Game Brightness (world only) from UI Brightness (UI only).
   - `0x8F0EAF1C` — main sprite/smoke shader. Outputs are clamped (alpha, distortion, glow, light scatter) so smoke stays clear.
@@ -58,9 +58,10 @@ The game has no tone curve: the scene is hard clipped at white by the 8-bit targ
 `0x8F0EAF1C` smoke / main sprite · `0x82BDA5F5` lighting composite · `0x5D4017CA` per-light accumulator · `0x01A7A161` glow/light-scatter G-buffer (4 render targets) · `0x6AE9A56B` colour-matrix tint · `0xD38C1AE4` radial light pool · `0x11A4EA78` heat distortion · `0x0A271311` minimap · `0x48C1C006` world blit and HUD icons · `0x40BF5761` glow add · `0x991A7AE4` 5-tap glow blur · `0xF3928D92` lights (also draws the character head) · `0x9FBDC40F` character body.
 
 ## Open items
-- Light-blue screen at game start, just before the main menu appears. Light blue is the game's back-buffer clear colour: the loading-screen frame is ~187 alpha-blended `0x48C1C006` draws from a 2048x4096 atlas straight onto the back buffer, and they are not visible. Not caused by our `0x48C1C006` replacement (still there with it disabled). Under investigation; the swap chain proxy replaces the back buffer with an rgba16f clone, so a direct write to or read-back of the real back buffer is the lead (RenoDX Discord).
+- None known. Tester feedback welcome.
 
 ## Resolved (2026-10-09)
+- Light-blue screen at game start (1-2 s before the main menu): with HDR10 output the swap chain proxy replaces the game's back buffer with a clone, and during the startup load stall the game's three loading quads (1x1 texture, `0x48C1C006`) don't end up in it, so the light-blue clear colour (0.67, 0.90, 1.0) shows. Bisected with a temporary ini test mode: cloning off = no blue; resource-view upgrade off = blue; resource upgrades off = blue; our `0x48C1C006` replacement off = blue. scRGB output uses the proxy's compatibility mode (float swap chain, no back-buffer clone for the game) = no blue, HDR unchanged. **Fix: scRGB is the default Encoding.** HDR10 stays selectable (tooltip notes the flash).
 - Light-blue flash between menu and level: caused by the mod's manual re-bind of the original `0x48C1C006` pipeline when a draw was not replaced (the loading-screen draws vanished). Removed; HUD still follows UI Brightness. Found by A/B: replacement off (flash gone), replacement on without the re-bind (flash gone).
 - Background: a Devkit snapshot shows every layer, background included, is drawn into the 642x362 scene first; the gated `0x48C1C006` draw that tone maps it is the first, opaque (blend off) draw on the back buffer. In-game check: the background follows Game Brightness, the HUD follows UI Brightness.
 - Peak Brightness: tested at 1360 nits (OLED). HDR Analysis in a level: max 430-600 nits, MaxCLL 691; nothing reaches Peak, so nothing is clipped.
