@@ -547,7 +547,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .default_value = 4.f,
               .label = "Encoding",
               .section = "Display Output",
-              .labels = {"None", "SRGB", "2.2", "2.4", "HDR10", "scRGB"},
+              .labels = {"None", "SRGB", "2.2", "2.4", "HDR10"},  // no scRGB: not recommended upstream; a saved 5 clamps to HDR10
               .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
               .on_change_value = [](float previous, float current) {
                 bool is_hdr10 = current == 4;

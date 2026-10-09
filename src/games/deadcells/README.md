@@ -17,7 +17,7 @@ The only place HDR information is destroyed is an 8-bit write:
 5. HUD and UI draw directly onto the backbuffer at native resolution.
 
 ## What the mod does
-- Swap chain upgraded to `r10g10b10a2_unorm` / HDR10 by default (swap chain proxy with back-buffer clone, no Display Proxy); scRGB selectable. `swapchain_proxy_revert_state` is on (see Resolved). Resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
+- Swap chain upgraded to `r10g10b10a2_unorm` / HDR10 by default (swap chain proxy with back-buffer clone, no Display Proxy). scRGB output was removed (no longer recommended by RenoDX); an old saved scRGB setting falls back to HDR10. `swapchain_proxy_revert_state` is on (see Resolved). Resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
 - Active shader replacements:
   - `0x48C1C006` — world composite. Gated so only the first draw of the frame, and only when `t0` is a render target, is replaced. This is what separates Game Brightness (world only) from UI Brightness (UI only).
   - `0x8F0EAF1C` — main sprite/smoke shader. Outputs are clamped (alpha, distortion, glow, light scatter) so smoke stays clear.
