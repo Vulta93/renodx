@@ -2,7 +2,7 @@
 
 HDR mod for Wolfenstein: The New Order (Steam 201810, `WolfNewOrder_x64.exe`, id Tech 5, **OpenGL**, x64).
 
-Status: experimental. Tested on one machine (RTX 5070 Ti, driver 617.14, 4K OLED, HDR10), ReShade 6.8.0 with add-on support.
+Status: experimental. Tested on one machine (RTX 5070 Ti, driver 617.14, 4K OLED, HDR10), ReShade 6.8.0 with add-on support, with and without id5Tweaker (`r_multisamples 2`).
 
 ## Install
 
@@ -100,7 +100,6 @@ Do not load the RenoDX Devkit together with this mod (both run a Display Proxy).
   flickers at a distance.
 - PsychoV-17's Blowout has no visible effect with a fixed adaptation state, so it is not exposed.
 - Haze flare passes add into the scene after the composite; they are clamped at Peak by the proxy, not tone mapped.
-- Tested only with id5Tweaker (`r_multisamples 2`, 60 fps cap); without forced MSAA is untested.
 
 ## Verification
 1. Build target `wolfensteintno` (Clang x64 preset) -> `renodx-wolfensteintno.addon64`. After adding/removing shader files: CMake Configure.
