@@ -110,3 +110,5 @@ Do not load the RenoDX Devkit together with this mod (both run a Display Proxy).
    None / PsychoV differ; Game Brightness changes only the scene, UI Brightness the HUD.
 4. ReShade menu: clicks change only what is clicked; the game ignores input while the menu is open; effect choices persist.
 5. Distortion (glass, heat haze) looks like vanilla; no rectangular blobs on damage decals.
+6. Pre-rendered Bink cutscenes (`base/bink`, played while loading and inside chapters): normal brightness, black levels
+   and colours (checked: Chapter 1 intro and the in-water transition).
