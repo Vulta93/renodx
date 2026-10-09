@@ -45,8 +45,11 @@ The game has no tone curve: the scene is hard clipped at white by the 8-bit targ
   - now (RenoDRT Neutwo, clip 7): avg 25–27, max ~1011 nits, CLL 1354 (Peak). The window light pulses, so readings vary.
 - Evaluated and dropped: an exponential **Roll-off** on the max channel (same avg and peak, but kept the unclipped
   orange instead of the vanilla yellow); ACES (removed from the list, `.parse` maps index 2 to RenoDRT).
-- PsychoV: not evaluated in game. The range is small (~7x white, additive light); in the Prince of Persia mods PsychoV
-  whitened and flattened coloured highlights from a similar source, and the default must keep the vanilla look.
+- PsychoV: evaluated on the evidence and rejected (project decision). The `handle-sdr-tonemap-lut` skill adds PsychoV17 only when
+  requested or already exposed, and lists `ToneMapPass` (RenoDRT) as the preferred path. Vanilla is a hard clip, so there is no
+  curve for PsychoV's mid-grey/knee anchors to match. The source range is small (~7x white) and PsychoV has no white-clip control,
+  while RenoDRT's white clip 7 is what matched vanilla's average and window brightness. In the Prince of Persia mods PsychoV
+  whitened coloured highlights from a similar source; here that would lose the vanilla yellow of the window light.
 
 ## Lessons from building it
 1. **Frame counter never reset.** The generic template only registers `OnPresent` when Display Proxy is on, so the per-frame counter stayed at frame 0 and only one draw per session was replaced. The reset now lives in a callback registered unconditionally.
