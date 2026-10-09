@@ -114,7 +114,11 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection.swap_chain_clamp_color_space
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection.swap_chain_encoding
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
-#define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
+#define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::NEUTWO
+// White clip = brightest steady scene value (max channel, linear, relative to Game Brightness, before gamma
+// correction): a lit window measured 1249 nits CLL at Game 203 with no tone mapping and Peak 4000
+// = 6.15x in gamma 2.2 output = ~6.8 scene; rounded up for margin.
+#define RENODX_RENO_DRT_WHITE_CLIP             7.f
 
 #include "../../shaders/renodx.hlsl"
 

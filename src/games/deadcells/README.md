@@ -17,13 +17,35 @@ The only place HDR information is destroyed is an 8-bit write:
 5. HUD and UI draw directly onto the backbuffer at native resolution.
 
 ## What the mod does
-- Display Proxy and resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
+- Swap chain upgraded to `r10g10b10a2_unorm` / HDR10 (no Display Proxy). Resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
 - Active shader replacements:
   - `0x48C1C006` — world composite. Gated so only the first draw of the frame, and only when `t0` is a render target, is replaced. This is what separates Game Brightness (world only) from UI Brightness (UI only).
   - `0x8F0EAF1C` — main sprite/smoke shader. Outputs are clamped (alpha, distortion, glow, light scatter) so smoke stays clear.
   - `0x0A271311` — minimap/map. `saturate()` so the map does not hit peak brightness.
   - `0x40BF5761` — glow add, multiplied by the **Glow Strength** slider (0-100, default 100). At 100, metal shine reaches about 730 nits; at 50, about 350.
 - Settings confirmed working: tone mapper type, Game Brightness, UI Brightness, Blowout, Saturation, Glow Strength.
+
+## Tone mapping (2026-10-09)
+The game has no tone curve: the scene is hard clipped at white by the 8-bit target written from the lighting composite
+`0x82BDA5F5` on. With the float upgrade, values above white reach `0x48C1C006`, where the mod tone maps.
+
+| Tone Mapper | What it does |
+|---|---|
+| Vanilla | `saturate()` before `ToneMapPass`: the original 8-bit clip, for A/B. Grading sliders still apply. |
+| None | Untonemapped; anything above Peak is clamped by `SwapChainPass`. |
+| **RenoDRT (default)** | `ToneMapPass`, RenoDRT method **Neutwo**, white clip **7.0** (brightest steady scene value, see `shared.h`). |
+
+- Source range (measured, no tone mapping, Peak 4000): the brightest steady light, a lit window, reaches 1249 nits CLL at
+  Game 203 = ~6.8x white in scene units. Character glow is far below that.
+- Default Hue Shift (50, clip method) keeps the vanilla hue of clipped lights: the window is pale yellow in vanilla (red and
+  green both clip); its unclipped colour is orange. Neutral-by-default = keep the yellow.
+- Measured at Peak 1360, Game 203, same spot (HDR Analysis + decoded HDR screenshots):
+  - before (RenoDRT Reinhard, default white clip 100): avg 22 nits vs 28 unclamped, max 613. Too dark, highlights cut.
+  - now (RenoDRT Neutwo, clip 7): avg 25–27, max ~1011 nits, CLL 1354 (Peak). The window light pulses, so readings vary.
+- Evaluated and dropped: an exponential **Roll-off** on the max channel (same avg and peak, but kept the unclipped
+  orange instead of the vanilla yellow); ACES (removed from the list, `.parse` maps index 2 to RenoDRT).
+- PsychoV: not evaluated in game. The range is small (~7x white, additive light); in the Prince of Persia mods PsychoV
+  whitened and flattened coloured highlights from a similar source, and the default must keep the vanilla look.
 
 ## Lessons from building it
 1. **Frame counter never reset.** The generic template only registers `OnPresent` when Display Proxy is on, so the per-frame counter stayed at frame 0 and only one draw per session was replaced. The reset now lives in a callback registered unconditionally.

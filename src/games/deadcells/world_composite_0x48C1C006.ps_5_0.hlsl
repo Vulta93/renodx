@@ -20,6 +20,11 @@ void main(
 
   // RenoDX: gamma -> linear, tone map + color grade, apply Game Brightness
   color.rgb = renodx::color::srgb::DecodeSafe(color.rgb);
+  // Vanilla: the scene went through an 8-bit target (from lighting composite 0x82BDA5F5 on), which clipped it at white.
+  [branch]
+  if (RENODX_TONE_MAP_TYPE == 0.f) {
+    color.rgb = saturate(color.rgb);
+  }
   color.rgb = renodx::draw::ToneMapPass(color.rgb);
   color.rgb = renodx::draw::RenderIntermediatePass(color.rgb);
 
