@@ -36,6 +36,9 @@ Do not load the RenoDX Devkit together with this mod (both run a Display Proxy).
   0xE4870070).
 - **0xA85A9FE0** (GLSL, replaced): main post-process. DOF/blur via mips, radial blur, sharpen, glare add, desaturate, 1D curve
   `cbconversionlut`, overlay, film grain, `saturate` -> 16^3 colour LUT `dynamiccc`. Output into 0xFA1.
+- Vanilla has no tone mapper: the 8-bit scene targets clip at white before this pass. In the dumped gameplay scene
+  `cbconversionlut` is an identity curve (same for R, G, B; likely the colour-blind option), and `dynamiccc` is a grade that
+  darkens and cools shadows and mid-tones but maps white to white with slope ~1, so neither rolls off highlights.
 - 0xD7D85DFF copies the result to the back buffer, then the HUD is drawn.
 
 ### Signals
