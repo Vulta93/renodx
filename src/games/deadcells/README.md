@@ -17,12 +17,12 @@ The only place HDR information is destroyed is an 8-bit write:
 5. HUD and UI draw directly onto the backbuffer at native resolution.
 
 ## What the mod does
-- Swap chain upgraded to `r16g16b16a16_float` / scRGB by default (swap chain proxy in compatibility mode, no Display Proxy); HDR10 (`r10g10b10a2_unorm`) selectable. Resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
+- Swap chain upgraded to `r10g10b10a2_unorm` / HDR10 by default (swap chain proxy with back-buffer clone, no Display Proxy); scRGB selectable. `swapchain_proxy_revert_state` is on, and the add-on restores pixel texture/sampler slot 0 after the proxy pass (see Resolved). Resource upgrade: `r8g8b8a8_unorm` becomes `r16g16b16a16_float` (any size, render targets, view cloning), set in `DllMain`.
 - Active shader replacements:
   - `0x48C1C006` — world composite. Gated so only the first draw of the frame, and only when `t0` is a render target, is replaced. This is what separates Game Brightness (world only) from UI Brightness (UI only).
   - `0x8F0EAF1C` — main sprite/smoke shader. Outputs are clamped (alpha, distortion, glow, light scatter) so smoke stays clear.
+  - `0x40BF5761` — glow add, multiplied by the **Glow Strength** slider (0-100, default 100). The glow is added in fixed-function blending on the float scene, so unlike the 8-bit original it is not cut at white (weapon shine looked like a "lightsaber"); the slider tones it down. At 100, metal shine reaches about 730 nits; at 50, about 350.
   - `0x0A271311` — minimap/map. `saturate()` so the map does not hit peak brightness.
-  - `0x40BF5761` — glow add, multiplied by the **Glow Strength** slider (0-100, default 100). At 100, metal shine reaches about 730 nits; at 50, about 350.
 - Settings confirmed working: tone mapper type, Game Brightness, UI Brightness, Blowout, Saturation, Glow Strength.
 
 ## Tone mapping (2026-10-09)
@@ -58,10 +58,10 @@ The game has no tone curve: the scene is hard clipped at white by the 8-bit targ
 `0x8F0EAF1C` smoke / main sprite · `0x82BDA5F5` lighting composite · `0x5D4017CA` per-light accumulator · `0x01A7A161` glow/light-scatter G-buffer (4 render targets) · `0x6AE9A56B` colour-matrix tint · `0xD38C1AE4` radial light pool · `0x11A4EA78` heat distortion · `0x0A271311` minimap · `0x48C1C006` world blit and HUD icons · `0x40BF5761` glow add · `0x991A7AE4` 5-tap glow blur · `0xF3928D92` lights (also draws the character head) · `0x9FBDC40F` character body.
 
 ## Open items
-- None known. Tester feedback welcome.
+- Tester feedback welcome.
 
 ## Resolved (2026-10-09)
-- Light-blue screen at game start (1-2 s before the main menu): with HDR10 output the swap chain proxy replaces the game's back buffer with a clone, and during the startup load stall the game's three loading quads (1x1 texture, `0x48C1C006`) don't end up in it, so the light-blue clear colour (0.67, 0.90, 1.0) shows. Bisected with a temporary ini test mode: cloning off = no blue; resource-view upgrade off = blue; resource upgrades off = blue; our `0x48C1C006` replacement off = blue. scRGB output uses the proxy's compatibility mode (float swap chain, no back-buffer clone for the game) = no blue, HDR unchanged. **Fix: scRGB is the default Encoding.** HDR10 stays selectable (tooltip notes the flash).
+- Light-blue screen at game start (1-2 s before the main menu) and stray white/blue speckles on the character in gameplay. Cause: the swap chain proxy pass (RenoDX present handler) leaves its own state bound - render targets, shaders, blend, and pixel texture/sampler slot 0. During the startup load stall Heaps issues its first draw of each frame without re-binding t0, so it read the proxy's back-buffer clone; on the HDR10 path that clone is also the render target, so D3D11 unbound it, the draw painted nothing and the light-blue clear colour (0.67, 0.90, 1.0) showed (with scRGB it read a copy of the last frame by luck). `swapchain_proxy_revert_state` restores render targets/pipelines/descriptor tables but not D3D11 push_descriptors (SRVs, samplers), so alone it fixed nothing and with only the slot restore the screen went grey. **Fix: `swapchain_proxy_revert_state = true` plus saving pixel slot 0 before the proxy pass and restoring it after (`OnPresentAfterProxy`).** Startup is now black like vanilla, and the character speckles are gone (same spot A/B: mod before / mod after / vanilla). Found with logs: back-buffer readback before/after the proxy pass, per-draw bound RT and SRVs, RenoDX view-list lookup. Candidate upstream fix: track push_descriptors in `utils/state.hpp` `CommandListState`.
 - Light-blue flash between menu and level: caused by the mod's manual re-bind of the original `0x48C1C006` pipeline when a draw was not replaced (the loading-screen draws vanished). Removed; HUD still follows UI Brightness. Found by A/B: replacement off (flash gone), replacement on without the re-bind (flash gone).
 - Background: a Devkit snapshot shows every layer, background included, is drawn into the 642x362 scene first; the gated `0x48C1C006` draw that tone maps it is the first, opaque (blend off) draw on the back buffer. In-game check: the background follows Game Brightness, the HUD follows UI Brightness.
 - Peak Brightness: tested at 1360 nits (OLED). HDR Analysis in a level: max 430-600 nits, MaxCLL 691; nothing reaches Peak, so nothing is clipped.

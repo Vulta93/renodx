@@ -20,6 +20,8 @@
 #include "../../utils/swapchain.hpp"
 #include "./shared.h"
 
+#include <d3d11.h>
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -442,6 +444,34 @@ void OnPresent(reshade::api::command_queue* queue,
   }
 }
 
+// The swap chain proxy pass (RenoDX present handler) binds its own texture/sampler to pixel slot 0 and does not
+// restore the game's: swapchain_proxy_revert_state restores descriptor tables, but D3D11 SRVs/samplers arrive as
+// push_descriptors. During the startup load stall Heaps issues its first draw of the frame without re-binding t0,
+// so it read the proxy's back-buffer clone - also its render target on the HDR10 path, so D3D11 unbound it, the
+// draw painted nothing and the light-blue clear colour showed. In gameplay the leaked state also put stray white/blue
+// speckles on the character (A/B against vanilla). Save slot 0 before the proxy pass, restore it after.
+// Keyed by device: with the Display Proxy, RenoDX presents a second swap chain inside its own present handler.
+reshade::api::device* saved_pixel_device = nullptr;
+ID3D11ShaderResourceView* saved_pixel_srv = nullptr;
+ID3D11SamplerState* saved_pixel_sampler = nullptr;
+
+void OnPresentAfterProxy(reshade::api::command_queue* queue,
+                         reshade::api::swapchain* swapchain,
+                         const reshade::api::rect* source_rect,
+                         const reshade::api::rect* dest_rect,
+                         uint32_t dirty_rect_count,
+                         const reshade::api::rect* dirty_rects) {
+  if (queue->get_device() != saved_pixel_device) return;
+  auto* context = reinterpret_cast<ID3D11DeviceContext*>(queue->get_immediate_command_list()->get_native());
+  context->PSSetShaderResources(0, 1, &saved_pixel_srv);
+  context->PSSetSamplers(0, 1, &saved_pixel_sampler);
+  if (saved_pixel_srv != nullptr) saved_pixel_srv->Release();
+  if (saved_pixel_sampler != nullptr) saved_pixel_sampler->Release();
+  saved_pixel_srv = nullptr;
+  saved_pixel_sampler = nullptr;
+  saved_pixel_device = nullptr;
+}
+
 // Registered unconditionally (the template's OnPresent above is only
 // registered when "Use Display Proxy" is on).
 void OnPresentFrameReset(reshade::api::command_queue* queue,
@@ -451,6 +481,13 @@ void OnPresentFrameReset(reshade::api::command_queue* queue,
                          uint32_t dirty_rect_count,
                          const reshade::api::rect* dirty_rects) {
   world_composite_draw_count = 0;
+  // Runs before the proxy pass: save the game's pixel slot 0 (restored in OnPresentAfterProxy).
+  if (saved_pixel_device == nullptr && queue->get_device()->get_api() == reshade::api::device_api::d3d11) {
+    saved_pixel_device = queue->get_device();
+    auto* context = reinterpret_cast<ID3D11DeviceContext*>(queue->get_immediate_command_list()->get_native());
+    context->PSGetShaderResources(0, 1, &saved_pixel_srv);
+    context->PSGetSamplers(0, 1, &saved_pixel_sampler);
+  }
 }
 
 bool initialized = false;
@@ -476,6 +513,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
         renodx::mods::swapchain::use_resource_cloning = true;
+        // Restore render targets, pipelines (shaders, blend), viewports after the proxy pass; texture/sampler slot 0
+        // is restored separately (OnPresentAfterProxy), since this does not track D3D11 push_descriptors.
+        renodx::mods::swapchain::swapchain_proxy_revert_state = true;
         renodx::mods::swapchain::swap_chain_proxy_shaders = {
             {
                 reshade::api::device_api::d3d11,
@@ -540,11 +580,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
               .key = "SwapChainEncoding",
               .binding = &shader_injection.swap_chain_encoding,
               .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-              .default_value = 5.f,
+              .default_value = 4.f,
               .label = "Encoding",
               .section = "Display Output",
-              .tooltip = "scRGB (default) presents the game's own float back buffer. HDR10 swaps the back buffer for a clone,\n"
-                         "which shows the game's light-blue clear colour for a moment at startup.",
               .labels = {"None", "SRGB", "2.2", "2.4", "HDR10", "scRGB"},
               .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
               .on_change_value = [](float previous, float current) {
@@ -647,6 +685,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
   renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
+  // Registered after mods::swapchain::Use so it runs after the proxy pass (handlers run in registration order);
+  // OnPresentFrameReset (registered earlier) saves the slot before it.
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    reshade::register_event<reshade::addon_event::present>(OnPresentAfterProxy);
+  } else if (fdw_reason == DLL_PROCESS_DETACH) {
+    reshade::unregister_event<reshade::addon_event::present>(OnPresentAfterProxy);
+  }
 
   return TRUE;
 }
