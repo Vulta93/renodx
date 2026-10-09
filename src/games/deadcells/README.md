@@ -37,5 +37,8 @@ The only place HDR information is destroyed is an 8-bit write:
 
 ## Open items
 - A light-blue loading screen and a split-second flash between menu and level. It persists with the resource upgrade off and disappears with the add-on removed; the cause is probably the swap chain/proxy layer, not a shader. Low priority.
-- The background layer, drawn by a different shader before the composite, is not tone mapped yet.
-- Tune Peak Brightness to the display and verify with the HDR Analysis overlay.
+
+## Resolved (2026-10-09)
+- Background: a Devkit snapshot shows every layer, background included, is drawn into the 642x362 scene first; the gated `0x48C1C006` draw that tone maps it is the first, opaque (blend off) draw on the back buffer. In-game check: the background follows Game Brightness, the HUD follows UI Brightness.
+- Peak Brightness: tested at 1360 nits (OLED). HDR Analysis in a level: max 430-600 nits, MaxCLL 691; nothing reaches Peak, so nothing is clipped.
+- Release build: 32-bit Release builds need the x86 HeapAlloc alignment fix in `src/utils/platform.hpp` (commit on this branch); without it optimized x86 builds can crash at launch.
