@@ -21,7 +21,8 @@ The only place HDR information is destroyed is an 8-bit write:
 - Active shader replacements:
   - `0x48C1C006` — world composite. Gated so only the first draw of the frame, and only when `t0` is a render target, is replaced. This is what separates Game Brightness (world only) from UI Brightness (UI only).
   - `0x8F0EAF1C` — main sprite/smoke shader. Outputs are clamped (alpha, distortion, glow, light scatter) so smoke stays clear.
-  - `0x40BF5761` — glow add, multiplied by the **Glow Strength** slider (0-100, default 100). The glow is added in fixed-function blending on the float scene, so unlike the 8-bit original it is not cut at white (weapon shine looked like a "lightsaber"); the slider tones it down. At 100, metal shine reaches about 730 nits; at 50, about 350.
+  - `0x991A7AE4` — 5-tap glow blur (runs twice on the glow layer). Taps and output clamped to 0..1. In the original the glow layer is 8-bit, so additive sprite blends into it stop at 1; after the float16 upgrade its alpha summed to 3.5-7.2 across the frame, and `0x40BF5761` blends with source alpha, so the glow reached the scene several times too bright (weapon shine looked like a "lightsaber": sword peak 5.3x white). With the clamp the layer's alpha is back to 1.0 (Devkit readback) and the sword peak measured 3.7x white at Glow Strength 100; what remains above white is the sword sprite in the scene itself (1.6x with no glow), i.e. real HDR range.
+  - `0x40BF5761` — glow add, multiplied by the **Glow Strength** slider (0-100, default 100 = original).
   - `0x0A271311` — minimap/map. `saturate()` so the map does not hit peak brightness.
 - Settings confirmed working: tone mapper type, Game Brightness, UI Brightness, Blowout, Saturation, Glow Strength.
 

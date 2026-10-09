@@ -74,6 +74,7 @@ bool OnWorldCompositeDraw(reshade::api::command_list* cmd_list) {
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x40BF5761),  // glow add pass, scaled by Glow Strength slider
+    CustomShaderEntry(0x991A7AE4),  // glow blur, glow layer clamped to 0..1 like the 8-bit original
     CustomShaderEntry(0x0A271311),  // minimap/map, clamped to 0..1
     CustomShaderEntry(0x8F0EAF1C),  // main sprite + smoke shader (clamped outputs)
     CustomShaderEntryCallback(0x48C1C006, &OnWorldCompositeDraw),  // world composite only
