@@ -58,9 +58,10 @@ The game has no tone curve: the scene is hard clipped at white by the 8-bit targ
 `0x8F0EAF1C` smoke / main sprite · `0x82BDA5F5` lighting composite · `0x5D4017CA` per-light accumulator · `0x01A7A161` glow/light-scatter G-buffer (4 render targets) · `0x6AE9A56B` colour-matrix tint · `0xD38C1AE4` radial light pool · `0x11A4EA78` heat distortion · `0x0A271311` minimap · `0x48C1C006` world blit and HUD icons · `0x40BF5761` glow add · `0x991A7AE4` 5-tap glow blur · `0xF3928D92` lights (also draws the character head) · `0x9FBDC40F` character body.
 
 ## Open items
-- A light-blue loading screen and a split-second flash between menu and level. It persists with the resource upgrade off and disappears with the add-on removed; the cause is probably the swap chain/proxy layer, not a shader. Low priority.
+- Light-blue screen at game start, just before the main menu appears. Light blue is the game's back-buffer clear colour: the loading-screen frame is ~187 alpha-blended `0x48C1C006` draws from a 2048x4096 atlas straight onto the back buffer, and they are not visible. Not caused by our `0x48C1C006` replacement (still there with it disabled). Under investigation; the swap chain proxy replaces the back buffer with an rgba16f clone, so a direct write to or read-back of the real back buffer is the lead (RenoDX Discord).
 
 ## Resolved (2026-10-09)
+- Light-blue flash between menu and level: caused by the mod's manual re-bind of the original `0x48C1C006` pipeline when a draw was not replaced (the loading-screen draws vanished). Removed; HUD still follows UI Brightness. Found by A/B: replacement off (flash gone), replacement on without the re-bind (flash gone).
 - Background: a Devkit snapshot shows every layer, background included, is drawn into the 642x362 scene first; the gated `0x48C1C006` draw that tone maps it is the first, opaque (blend off) draw on the back buffer. In-game check: the background follows Game Brightness, the HUD follows UI Brightness.
 - Peak Brightness: tested at 1360 nits (OLED). HDR Analysis in a level: max 430-600 nits, MaxCLL 691; nothing reaches Peak, so nothing is clipped.
 - Release build: 32-bit Release builds need the x86 HeapAlloc alignment fix in `src/utils/platform.hpp` (commit on this branch); without it optimized x86 builds can crash at launch.

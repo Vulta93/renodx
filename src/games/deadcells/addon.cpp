@@ -63,23 +63,13 @@ bool PixelT0IsRenderTarget(reshade::api::command_list* cmd_list) {
   return (static_cast<uint32_t>(desc.usage) & static_cast<uint32_t>(reshade::api::resource_usage::render_target)) != 0u;
 }
 
-// Restores the game's original pixel shader. RenoDX doesn't re-bind it when a
-// replacement is skipped, and Heaps doesn't re-set its shader between draws,
-// so without this the replacement would leak into the following UI draws.
-void RebindOriginalPixelShader(reshade::api::command_list* cmd_list) {
-  auto* shader_state = renodx::utils::shader::GetCurrentState(cmd_list);
-  if (shader_state == nullptr) return;
-  auto* pixel_state = renodx::utils::shader::GetCurrentPixelState(shader_state);
-  if (pixel_state->pipeline.handle == 0u) return;
-  cmd_list->bind_pipeline(pixel_state->applied_stage, pixel_state->pipeline);
-}
-
 // on_replace callback: true = use our replacement for this draw.
+// No manual re-bind of the original shader when skipping: re-binding the tracked pixel pipeline here made the
+// loading-screen draws vanish (light-blue flash between menu and level). Tested without it: HUD still follows
+// UI Brightness, world follows Game Brightness.
 bool OnWorldCompositeDraw(reshade::api::command_list* cmd_list) {
   const bool is_first_draw = (world_composite_draw_count.fetch_add(1) == 0);
-  const bool replace = is_first_draw && PixelT0IsRenderTarget(cmd_list);
-  if (!replace) RebindOriginalPixelShader(cmd_list);
-  return replace;
+  return is_first_draw && PixelT0IsRenderTarget(cmd_list);
 }
 
 renodx::mods::shader::CustomShaders custom_shaders = {
