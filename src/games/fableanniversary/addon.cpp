@@ -15,12 +15,35 @@
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/swapchain.hpp"
 #include "./shared.h"
 
 namespace {
 
+// The combine target's size depends on the resolution, so it is upgraded by activating its clone when the combine draws.
 renodx::mods::shader::CustomShaders custom_shaders = {
-    __ALL_CUSTOM_SHADERS,
+    {
+        0x63ACB381,
+        {
+            .crc32 = 0x63ACB381,
+            .code = __0x63ACB381,
+            .on_draw = [](auto* cmd_list) {
+              auto rtvs = renodx::utils::swapchain::GetRenderTargets(cmd_list);
+              bool changed = false;
+              for (auto rtv : rtvs) {
+                changed = renodx::mods::swapchain::ActivateCloneHotSwap(cmd_list->get_device(), rtv) || changed;
+              }
+              if (changed) {
+                // D3D9 SetRenderTarget also resets the viewport to the full (padded) surface: the activation frame (first
+                // frame, device reset) can be mis-scaled once; later frames bind the clone before the game sets its viewport.
+                renodx::mods::swapchain::FlushDescriptors(cmd_list);
+                renodx::mods::swapchain::RewriteRenderTargets(
+                    cmd_list, rtvs.size(), rtvs.data(), renodx::utils::swapchain::GetDepthStencil(cmd_list));
+              }
+              return true;
+            },
+        },
+    },
 };
 
 ShaderInjectData shader_injection;
@@ -478,18 +501,19 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           settings.push_back(setting);
         }
 
-        // The post-process shader (0x63ACB381) writes its result to a B8G8R8A8 target whose height is the back buffer
-        // height * 46 / 45 (3840x2208 at 4K, 2560x1472 at 1440p), so it is matched by aspect ratio (40:23). The main menu
-        // draws into other 8-bit targets (e.g. 3840x2205); upgrading those washes the menu out, so they stay 8-bit.
         renodx::mods::swapchain::resource_upgrade_infos.push_back({
             .old_format = reshade::api::format::b8g8r8a8_unorm,
             .new_format = reshade::api::format::r16g16b16a16_float,
         });
+        // Other 8-bit render targets are only marked for cloning: the main menu draws into some of them (e.g. 3840x2205)
+        // and upgrading those washes the menu out.
         renodx::mods::swapchain::resource_upgrade_infos.push_back({
             .old_format = reshade::api::format::b8g8r8a8_unorm,
             .new_format = reshade::api::format::r16g16b16a16_float,
-            .aspect_ratio = 40.f / 23.f,
-            .aspect_ratio_tolerance = 0.0005f,
+            .ignore_size = true,
+            .use_resource_view_cloning = true,
+            .use_resource_view_hot_swap = true,
+            .usage_include = reshade::api::resource_usage::render_target,
         });
 
         initialized = true;

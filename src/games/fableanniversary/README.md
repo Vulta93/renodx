@@ -49,11 +49,26 @@ at Peak 1360). Stars are brighter and simply reach peak.
 
 ## Resource upgrades
 
-`b8g8r8a8_unorm → r16g16b16a16_float` for exactly two kinds of target: back-buffer sized, and the **post-process output**, matched by
-aspect ratio 40:23 (its height is the back-buffer height × 46/45: 3840x2208 at 4K, 2560x1472 at 1440p; found with the Devkit).
-Do **not** widen this to "everything the width of the back buffer": the engine also creates 3840x2205 8-bit targets and upgrading those washes
-the main menu out (hazy page photo, faded buttons/text). Narrowing the upgrade fixed it (compared against the unmodded screenshot).
-The exact mechanism of the wash-out is not proven; the fix is empirical.
+`b8g8r8a8_unorm → r16g16b16a16_float` for two kinds of target:
+- back-buffer sized targets (plain upgrade);
+- the **post-process output**, through a **clone hot swap**: every other 8-bit render target is marked for cloning (`ignore_size`),
+  and `0x63ACB381`'s `on_draw` activates the clone of the target it draws into (`ActivateCloneHotSwap` + `RewriteRenderTargets`,
+  the `batmanak` pattern; no other DX9 user found). The float clone is only created when activated. The target's size is not
+  predictable, so a size rule cannot match it (Devkit):
+
+  | Back buffer | Post-process target |
+  | --- | --- |
+  | 3840x2160 | 3840x2208 |
+  | 2560x1440 | 2560x1472 |
+  | 2560x1600 | 2560x1600 |
+  | 1600x1200 | 2048x1200 |
+
+  The target is UE3's shared scratch surface (light attenuation and distortion earlier in the frame); once activated, those passes
+  use the float clone too, as they did with the earlier full upgrade at 16:9. No artifacts seen on shadowed, alpha-tested surfaces;
+  heavy distortion (heat haze, water, spells) not compared against vanilla. On D3D9 the activation rebind resets the viewport, so
+  the first frame after launch or a device reset may be mis-scaled once (not observed).
+Do **not** upgrade all 8-bit targets: the engine also creates 3840x2205 8-bit targets and upgrading those washes the main menu out
+(hazy page photo, faded buttons/text). The exact mechanism of the wash-out is not proven; keeping them 8-bit fixes it.
 
 ## Settings
 
@@ -65,7 +80,10 @@ Preset Off = vanilla (also resets Gamma Correction to 2.2).
 
 - 4K: neutral by default — A/B RenoDRT vs Vanilla, same spot: median luma 9.1 / 9.1 nits, bin ratios 0.96–1.06 between 2 and 120 nits,
   same chroma (rgb/Y); vanilla clips at ~116–140 nits, HDR reaches ~590–640 nits (lamp), stars > 1000 nits, fire ~800 nits (user HDR Analysis).
-- 1440p: before the aspect-ratio rule HDR was lost (max 139.7 nits = vanilla clip); after: 691 nits. Menu fine in both modes.
+- 1440p (historical, aspect-ratio rule since replaced by the clone hot swap): before the aspect-ratio rule HDR was lost (max 139.7 nits = vanilla clip); after: 691 nits. Menu fine in both modes.
+- Resolutions (2026-10-10): with the old 40:23 rule, 1600x1200 lost HDR (max 139.7 nits); with the clone hot swap 1600x1200 and 3840x2160
+  reach ~950–1050 nits at the candles, main menu normal, lattice wall clean. 2560x1600 (1115 nits) was tested with the old rules
+  (its target is back-buffer sized, plain upgrade); 2560x1440 not retested.
 - Main menu, in-game menus, dialogue, cutscenes, loading screens, dark scenes, fire/particles: no artifacts reported.
 - HDR10 output verified in the log (`r10g10b10a2_unorm`, `hdr10_st2084`).
 - Gamma fix (2026-10-10), indoor wall at night, Gamma Correction 2.2: Vanilla p10/median 0.22/1.30 nits vs unmodded 0.20/1.28
@@ -78,8 +96,10 @@ and RenoDRT with the SDR/LUT bridge already tracks vanilla within a few percent;
 
 ## Known limitations / open items
 
-- Ultrawide / non-16:9: the padding formula of the post-process target is unverified there (the 40:23 rule may not match → HDR lost).
-- Resolution switched *in-session* keeps the old render targets (still matched by the aspect rule); a fresh start is the normal path.
+- Tested at 3840x2160, 2560x1600 (16:10) and 1600x1200 (4:3); 21:9 not tested (the display offers no such mode).
+- Below the desktop resolution, Force Borderless (default) shows the game as a window of that size in a corner (no display mode change);
+  set Windows to the same resolution or turn Force Borderless off. The game letterboxes 16:10 to a 16:9 picture (vanilla behaviour).
+- Resolution switched *in-session* keeps the old render targets; a fresh start is the normal path.
 - The FXAA pass computes luma from the HDR-encoded intermediate (values may exceed 1); no artifacts seen, edge quality not measured.
 - Other combine-shader permutations (other areas/cutscene paths) were not seen; Devkit snapshots only covered the village and menu.
 - Running the Devkit addon together with this mod froze the picture (audio kept playing): test with the Devkit alone, not both.
