@@ -30,10 +30,22 @@ The **main menu does not use the combine shader or FXAA at all**: its ~156 draws
 
 1. Rebuild `untonemapped` exactly as the original does (DOF blend, bloom).
 2. `neutral_sdr = renodrt::NeutralSDR(untonemapped)` (Vanilla mode: `saturate(untonemapped)`, bit-identical clip).
-3. Run the **vanilla LUT** on the encoded `neutral_sdr` (same slice/bilinear addressing and constants as the original) → `graded_sdr`.
-4. `renodx::draw::ToneMapPass(untonemapped, graded_sdr, neutral_sdr)` → `RenderIntermediatePass` → luma in alpha for FXAA.
+3. Run the **vanilla LUT** on the `pow(1/2.2)`-encoded `neutral_sdr` (same slice/bilinear addressing and constants as the original).
+4. Decode the LUT output as **sRGB** → `graded_sdr`; `ToneMapPass` gets all three signals in that sRGB-decoded domain
+   (`correct::GammaSafe(untonemapped, true)`, `graded_sdr`, `srgb::DecodeSafe(lut_input)`) → `RenderIntermediatePass` → luma in alpha for FXAA.
 
 The LUT is sampled once, outside the branches. Vanilla mode (Tone Mapper = Vanilla) reproduces the original math.
+
+**Gamma:** vanilla encodes with `pow(1/2.2)`. As in `borderlands2`, the LUT output is decoded as sRGB and **Gamma Correction 2.2
+(default)** applies the 2.2 display curve once in `RenderIntermediatePass`, so Vanilla + 2.2 equals the unmodded game (Off = sRGB
+display curve, lifted shadows). Moving `untonemapped` into the same domain with `correct::GammaSafe(x, true)` is this mod's own step
+(borderlands2 passes its scene colour raw), so all three ToneMapPass inputs share one domain. Decoding with 2.2 in the
+shader *and* selecting 2.2 corrected twice: shadows ~10x darker and near-black chroma blown up into blue speckles (seen on a dark
+lattice wall panel indoors, mistaken at first for a resource-upgrade bug).
+
+**RenoDRT:** Reinhard, white clip **13** (`shared.h`): candle flames measured ~8–13x diffuse white (luminance, ToneMapPass domain)
+with Tone Mapper = None at Peak 10000; lamps and fire were at least ~7x. The default clip of 100 compressed them (lamp 1320 → 800 nits
+at Peak 1360). Stars are brighter and simply reach peak.
 
 ## Resource upgrades
 
@@ -45,9 +57,9 @@ The exact mechanism of the wash-out is not proven; the fix is empirical.
 
 ## Settings
 
-Tone Mapper: Vanilla / None / **RenoDRT (default)**. Peak 1000, Game 203, UI 203 nits (UI brightness also scales the main menu, since
+Tone Mapper: Vanilla / None / **RenoDRT (default)**. Gamma Correction **2.2 (default)**. Peak 1000, Game 203, UI 203 nits (UI brightness also scales the main menu, since
 it is drawn as UI). Encoding default **HDR10** (scRGB selectable). Force Borderless on. Standard RenoDX grading sliders.
-Preset Off = vanilla.
+Preset Off = vanilla (also resets Gamma Correction to 2.2).
 
 ## Testing performed
 
@@ -56,6 +68,8 @@ Preset Off = vanilla.
 - 1440p: before the aspect-ratio rule HDR was lost (max 139.7 nits = vanilla clip); after: 691 nits. Menu fine in both modes.
 - Main menu, in-game menus, dialogue, cutscenes, loading screens, dark scenes, fire/particles: no artifacts reported.
 - HDR10 output verified in the log (`r10g10b10a2_unorm`, `hdr10_st2084`).
+- Gamma fix (2026-10-10), indoor wall at night, Gamma Correction 2.2: Vanilla p10/median 0.22/1.30 nits vs unmodded 0.20/1.28
+  (before the fix 0.02/0.71); RenoDRT 0.23/1.35; lattice panel clean, no negative colour values. Candles with RenoDRT: ~1000 nits.
 
 ## PsychoV evaluation
 

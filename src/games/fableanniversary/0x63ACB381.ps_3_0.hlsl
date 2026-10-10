@@ -46,12 +46,17 @@ float4 main(PS_IN i) : COLOR {
       tex2D(ColorGradingLUT, lut_uv).rgb,
       tex2D(ColorGradingLUT, lut_uv + float2(0.0625f, 0.f)).rgb,
       lut_input.b * 15.f - lut_slice);
-  float3 graded_sdr = renodx::color::gamma::DecodeSafe(lut_output, 2.2f);
+  // Vanilla encodes with pow(1 / 2.2): decode as sRGB so the Gamma Correction setting (2.2) restores the vanilla look once,
+  // in RenderIntermediatePass. ToneMapPass inputs move to the same sRGB-decoded domain.
+  float3 graded_sdr = renodx::color::srgb::DecodeSafe(lut_output);
 
   float3 output_linear = graded_sdr;
   [branch]
   if (RENODX_TONE_MAP_TYPE != 0.f) {
-    output_linear = renodx::draw::ToneMapPass(untonemapped, graded_sdr, neutral_sdr);
+    output_linear = renodx::draw::ToneMapPass(
+        renodx::color::correct::GammaSafe(untonemapped, true),
+        graded_sdr,
+        renodx::color::srgb::DecodeSafe(lut_input));
   }
 
   float4 o;
