@@ -105,7 +105,8 @@ and RenoDRT with the SDR/LUT bridge already tracks vanilla within a few percent;
   set Windows to the same resolution or turn Force Borderless off. The game letterboxes 16:10 to a 16:9 picture (vanilla behaviour).
 - Resolution switched *in-session* keeps the old render targets; a fresh start is the normal path.
 - The FXAA pass computes luma from the HDR-encoded intermediate (values may exceed 1); no artifacts seen, edge quality not measured.
-- Other combine-shader permutations (other areas/cutscene paths) were not seen; Devkit snapshots only covered the village and menu.
+- Other combine-shader permutations (other areas/cutscene paths) were not seen; Devkit snapshots and tests covered Oakvale (2026-10-03),
+  the Heroes' Guild (2026-10-10) and the menus.
 - Running the Devkit addon together with this mod froze the picture (audio kept playing): test with the Devkit alone, not both.
 - Requires the x86 `platform.hpp` alignment fix (separate commit, outside this folder) or optimized 32-bit builds can crash at launch.
 
