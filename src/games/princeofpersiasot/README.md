@@ -123,7 +123,7 @@ Established with the RenoDX Devkit (snapshots, vs_1_1/ps_1_1 disassembly) and on
 Palace, courtyard fire, windows room, outdoor sky, dark areas, HUD, pause / profile / main menus, loading screens, in-game
 cutscenes, pre-rendered videos, ReShade overlay open/close, tone mapper A/B with measurements (same camera, decoded
 HDR screenshots), test ramp and squares test pattern (temporary debug options, removed), pause screen against an SDR
-screenshot.
+screenshot, smoke with and without the mod (looks the same; visual check, no screenshots).
 
 ## Known behaviour and limitations
 - Pre-rendered videos, main menu and loading screens follow UI Brightness (intended; the videos are very low resolution and
