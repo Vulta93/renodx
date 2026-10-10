@@ -83,7 +83,11 @@ Preset Off = vanilla (also resets Gamma Correction to 2.2).
 - 1440p (historical, aspect-ratio rule since replaced by the clone hot swap): before the aspect-ratio rule HDR was lost (max 139.7 nits = vanilla clip); after: 691 nits. Menu fine in both modes.
 - Resolutions (2026-10-10): with the old 40:23 rule, 1600x1200 lost HDR (max 139.7 nits); with the clone hot swap 1600x1200 and 3840x2160
   reach ~950–1050 nits at the candles, main menu normal, lattice wall clean. 2560x1600 (1115 nits) was tested with the old rules
-  (its target is back-buffer sized, plain upgrade); 2560x1440 not retested.
+  (its target is back-buffer sized, plain upgrade). Later with the hot swap: 3840x1600 (21:9, 1032 nits; the game pillarboxes a 16:9
+  picture) and 2560x1440 (1071 nits), main menu normal.
+- Daylight (outdoors, sun and clouds, Gamma Correction 2.2): Vanilla vs unmodded, static area: p10/median 0.69/2.19 vs 0.70/2.22 nits,
+  same clip level (~115 nits); clouds drifted between launches, so the sky is not comparable. RenoDRT vs Vanilla, same session: band
+  ratios 0.99–1.03 up to 50 nits, highlights extended (p99 205 vs 114 nits, sun 566 nits).
 - Main menu, in-game menus, dialogue, cutscenes, loading screens, dark scenes, fire/particles: no artifacts reported.
 - HDR10 output verified in the log (`r10g10b10a2_unorm`, `hdr10_st2084`).
 - Gamma fix (2026-10-10), indoor wall at night, Gamma Correction 2.2: Vanilla p10/median 0.22/1.30 nits vs unmodded 0.20/1.28
@@ -96,7 +100,7 @@ and RenoDRT with the SDR/LUT bridge already tracks vanilla within a few percent;
 
 ## Known limitations / open items
 
-- Tested at 3840x2160, 2560x1600 (16:10) and 1600x1200 (4:3); 21:9 not tested (the display offers no such mode).
+- Tested at 3840x2160, 2560x1440, 3840x1600 (21:9, custom resolution), 2560x1600 (16:10) and 1600x1200 (4:3).
 - Below the desktop resolution, Force Borderless (default) shows the game as a window of that size in a corner (no display mode change);
   set Windows to the same resolution or turn Force Borderless off. The game letterboxes 16:10 to a 16:9 picture (vanilla behaviour).
 - Resolution switched *in-session* keeps the old render targets; a fresh start is the normal path.
