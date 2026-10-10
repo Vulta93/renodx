@@ -57,9 +57,12 @@ own blending (fires, lanterns, lit decals). ps_1_x shaders clamp their output to
 - Deterministic ramp test (temporary debug mode, 0 → 20× white, Peak 1360): None avg 1109 nits (predicted 1116),
   Neutwo 1014 (predicted 1018) with the game's glow on (before Roll-off replaced Neutwo).
 - Water reflections, ripples/heat haze, water near bright lights and splashes: identical in SDR and HDR.
+- Smoke (burning ship, 4 shots with the mod vs 3 without): same density, colour and edges, no dark boxes or halos,
+  no banding, no invalid values; fire behind smoke stays orange instead of clipping to pale yellow. The hard-edged dark
+  smoke volume by the mast is vanilla (present without the mod).
 
 ## Known limitations / open
 
 - Pre-rendered videos and loading screens follow UI Brightness (intended; the videos are very low resolution, like
   Sands of Time's, and not worth HDR).
-- Not yet tested: dagger time powers (rewind / slow motion), smoke-heavy areas.
+- Not yet tested: dagger time powers (rewind / slow motion).
