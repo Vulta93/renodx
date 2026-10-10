@@ -60,4 +60,6 @@ own blending (fires, lanterns, lit decals). ps_1_x shaders clamp their output to
 
 ## Known limitations / open
 
-- Not yet tested: dagger time powers (rewind / slow motion), smoke-heavy areas, pre-rendered videos, loading screens.
+- Pre-rendered videos and loading screens follow UI Brightness (intended; the videos are very low resolution, like
+  Sands of Time's, and not worth HDR).
+- Not yet tested: dagger time powers (rewind / slow motion), smoke-heavy areas.
