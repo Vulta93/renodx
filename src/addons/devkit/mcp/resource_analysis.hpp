@@ -482,6 +482,39 @@ inline void to_json(json& j, const RatioStats& value) {
   throw std::runtime_error(std::format("signal '{}' is invalid. Expected 'raw', 'pq' or 'scrgb'.", value));
 }
 
+// Optional pixel region from regionX/regionY/regionWidth/regionHeight, which must be given together.
+[[nodiscard]] inline std::optional<reshade::api::subresource_box> ParseRegion(const json& arguments) {
+  const std::array<std::optional<std::uint32_t>, 4> region_values = {
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionX"),
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionY"),
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionWidth"),
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionHeight"),
+  };
+  const auto region_value_count = std::ranges::count_if(region_values, [](const auto& value) { return value.has_value(); });
+  if (region_value_count != 0 && region_value_count != 4) {
+    throw std::runtime_error("regionX, regionY, regionWidth and regionHeight must be given together.");
+  }
+  std::optional<reshade::api::subresource_box> region = std::nullopt;
+  if (region_value_count == 4) {
+    if (*region_values[2] == 0u || *region_values[3] == 0u) {
+      throw std::runtime_error("regionWidth and regionHeight must be greater than 0.");
+    }
+    if (*region_values[2] > (std::numeric_limits<std::uint32_t>::max)() - *region_values[0]
+        || *region_values[3] > (std::numeric_limits<std::uint32_t>::max)() - *region_values[1]) {
+      throw std::runtime_error("The region is out of range.");
+    }
+    region = reshade::api::subresource_box{
+        .left = *region_values[0],
+        .top = *region_values[1],
+        .front = 0u,
+        .right = *region_values[0] + *region_values[2],
+        .bottom = *region_values[1] + *region_values[3],
+        .back = 1u,
+    };
+  }
+  return region;
+}
+
 [[nodiscard]] inline float ToneMapNeutwo(float value) {
   value = std::max(value, 0.f);
   return value / std::sqrt(std::fma(value, value, 1.f));
@@ -1319,34 +1352,7 @@ inline void EncodePreviewPixel(
   const auto preview_mode = internal::ParsePreviewMode(preview_mode_value);
   const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
   const auto signal = internal::ParseSignal(mcp_arguments::GetOptional<std::string>(arguments, "signal").value_or("raw"));
-  const std::array<std::optional<std::uint32_t>, 4> region_values = {
-      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionX"),
-      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionY"),
-      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionWidth"),
-      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionHeight"),
-  };
-  const auto region_value_count = std::ranges::count_if(region_values, [](const auto& value) { return value.has_value(); });
-  if (region_value_count != 0 && region_value_count != 4) {
-    throw std::runtime_error("regionX, regionY, regionWidth and regionHeight must be given together.");
-  }
-  std::optional<reshade::api::subresource_box> region = std::nullopt;
-  if (region_value_count == 4) {
-    if (*region_values[2] == 0u || *region_values[3] == 0u) {
-      throw std::runtime_error("regionWidth and regionHeight must be greater than 0.");
-    }
-    if (*region_values[2] > (std::numeric_limits<std::uint32_t>::max)() - *region_values[0]
-        || *region_values[3] > (std::numeric_limits<std::uint32_t>::max)() - *region_values[1]) {
-      throw std::runtime_error("The region is out of range.");
-    }
-    region = reshade::api::subresource_box{
-        .left = *region_values[0],
-        .top = *region_values[1],
-        .front = 0u,
-        .right = *region_values[0] + *region_values[2],
-        .bottom = *region_values[1] + *region_values[3],
-        .back = 1u,
-    };
-  }
+  const auto region = internal::ParseRegion(arguments);
 
   std::optional<std::filesystem::path> output_path = std::nullopt;
   if (!output_path_value.empty()) {
