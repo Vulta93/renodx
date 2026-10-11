@@ -241,6 +241,17 @@ Do not use the PNG alone to decide whether HDR survived. Use:
 
 The PNG is for quick visual inspection, not for HDR truth.
 
+### Regions and nits
+
+`devkit_analyze_resource` also accepts:
+
+- `regionX`, `regionY`, `regionWidth`, `regionHeight` (pixels, all four together): only that box is copied and analyzed, so
+  every statistic, preview and dump describes the region. Use it to isolate one light source or UI element.
+- `signal`: `raw` (default), `pq` or `scrgb`. With `pq` (HDR10 ST 2084 targets, BT.2020) or `scrgb` (linear, 1.0 = 80 nits,
+  BT.709) the result adds `analysis.nits`: luminance and max-channel stats in nits, luminance percentiles (p50/p90/p99/p99.9)
+  and the share of pixels above 203/400/1000/4000 nits. Only use it on a resource that actually holds that encoding, such as
+  the swap chain or an HDR10/scRGB output target.
+
 ## 11. Current practical caveats
 
 - Some clone and preview workflows may still behave better when the devkit overlay has already touched the resource in the current session. Treat that as a devkit limitation, not as a mod requirement.
