@@ -515,6 +515,31 @@ inline void to_json(json& j, const RatioStats& value) {
   return region;
 }
 
+// Display light of a decoded pixel for a PQ or scRGB signal. PQ: decoded values are the ST 2084 encoding of BT.2020
+// light. scRGB: 1.0 = 80 nits, BT.709 primaries. Shared by the CPU analysis and the watch_region verification.
+struct DisplayLight {
+  std::array<double, 3> nits = {};
+  double luminance = 0.0;
+};
+
+[[nodiscard]] inline DisplayLight DecodeDisplayLight(Signal signal, const float rgba[4]) {
+  DisplayLight light = {};
+  if (signal == Signal::PQ) {
+    for (uint32_t channel = 0; channel < 3u; ++channel) {
+      const auto encoded_power = std::pow(std::clamp(static_cast<double>(rgba[channel]), 0.0, 1.0), 1.0 / 78.84375);
+      const auto linear_ratio = std::max(encoded_power - 0.8359375, 0.0) / (18.8515625 - (18.6875 * encoded_power));
+      light.nits[channel] = 10000.0 * std::pow(linear_ratio, 1.0 / 0.1593017578125);
+    }
+    light.luminance = (0.2627002 * light.nits[0]) + (0.6779981 * light.nits[1]) + (0.0593017 * light.nits[2]);
+    return light;
+  }
+  for (uint32_t channel = 0; channel < 3u; ++channel) {
+    light.nits[channel] = 80.0 * rgba[channel];
+  }
+  light.luminance = (0.2126 * light.nits[0]) + (0.7152 * light.nits[1]) + (0.0722 * light.nits[2]);
+  return light;
+}
+
 [[nodiscard]] inline float ToneMapNeutwo(float value) {
   value = std::max(value, 0.f);
   return value / std::sqrt(std::fma(value, value, 1.f));
@@ -948,22 +973,9 @@ inline void EncodePreviewPixel(
 
         if (signal == Signal::RAW) continue;
 
-        // PQ: decoded values are the ST 2084 encoding of BT.2020 light. scRGB: 1.0 = 80 nits, BT.709 primaries.
-        std::array<double, 3> nits = {};
-        double nits_luminance = 0.0;
-        if (signal == Signal::PQ) {
-          for (uint32_t channel = 0; channel < 3u; ++channel) {
-            const auto encoded_power = std::pow(std::clamp(static_cast<double>(rgba[channel]), 0.0, 1.0), 1.0 / 78.84375);
-            const auto linear_ratio = std::max(encoded_power - 0.8359375, 0.0) / (18.8515625 - (18.6875 * encoded_power));
-            nits[channel] = 10000.0 * std::pow(linear_ratio, 1.0 / 0.1593017578125);
-          }
-          nits_luminance = (0.2627002 * nits[0]) + (0.6779981 * nits[1]) + (0.0593017 * nits[2]);
-        } else {
-          for (uint32_t channel = 0; channel < 3u; ++channel) {
-            nits[channel] = 80.0 * rgba[channel];
-          }
-          nits_luminance = (0.2126 * nits[0]) + (0.7152 * nits[1]) + (0.0722 * nits[2]);
-        }
+        const auto display_light = DecodeDisplayLight(signal, rgba);
+        const auto& nits = display_light.nits;
+        const auto nits_luminance = display_light.luminance;
         const auto nits_max_channel = std::max({nits[0], nits[1], nits[2]});
         nits_luminance_values.push_back(static_cast<float>(nits_luminance));
         nits_luminance_min = std::min(nits_luminance_min, nits_luminance);

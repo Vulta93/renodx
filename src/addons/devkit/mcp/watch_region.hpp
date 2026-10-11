@@ -80,7 +80,12 @@ constexpr std::uint32_t STATS_ABOVE_1000_COUNT = 10u;
 constexpr std::uint32_t STATS_ABOVE_4000_COUNT = 11u;
 constexpr std::uint32_t STATS_FINITE_COUNT = 12u;
 constexpr std::uint32_t STATS_BLACK_COUNT = 13u;
-constexpr double LUMINANCE_SUM_SCALE = 256.0;
+constexpr double LUMINANCE_SUM_SCALE = 1048576.0;
+// Per-pixel luminance cap applied to the sum (float16 maximum), mirrored by the CPU verification.
+constexpr double LUMINANCE_SUM_CLAMP = 65504.0;
+// verify: GPU float math against CPU double math on the same pixels.
+constexpr double VERIFY_RELATIVE_TOLERANCE = 1e-4;
+constexpr double VERIFY_ABSOLUTE_TOLERANCE = 1e-7;
 
 // Relative change below which two peaks count as equal.
 constexpr double PEAK_TOLERANCE = 1e-4;
@@ -104,6 +109,7 @@ struct Request {
   std::uint32_t frames = 1u;
   std::optional<std::uint32_t> shader_hash = std::nullopt;
   bool include_unchanged = false;
+  bool verify = false;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -203,7 +209,14 @@ struct Session {
   std::optional<std::uint32_t> shader_hash = std::nullopt;
   bool include_unchanged = false;
   bool used_clone = false;
+  reshade::api::format scratch_format = reshade::api::format::unknown;
   std::string resource_format_name;
+
+  // verify: CPU readback of the region taken at the last present, compared with the GPU stats of the same moment.
+  bool verify = false;
+  reshade::api::resource verify_readback = {0u};
+  std::optional<std::uint32_t> verify_slot = std::nullopt;
+  std::optional<RegionStats> verify_gpu_stats = std::nullopt;
 
   reshade::api::resource scratch = {0u};
   reshade::api::resource_view scratch_srv = {0u};
@@ -291,6 +304,10 @@ inline void DestroySessionObjects(Session* session, reshade::api::device* device
     if (readback.handle == 0u) continue;
     device->destroy_resource(readback);
     readback = {0u};
+  }
+  if (session->verify_readback.handle != 0u) {
+    device->destroy_resource(session->verify_readback);
+    session->verify_readback = {0u};
   }
 }
 
@@ -393,6 +410,8 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
   std::unique_lock lock(watcher->mutex);
   auto* session = watcher->session.get();
   if (session == nullptr || !session->failure.empty()) return;
+  // Re-checked under the lock: the texture may have been destroyed while this thread waited.
+  if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
 
   const auto command_index = session->command_count++;
   auto* device = cmd_list->get_device();
@@ -443,6 +462,8 @@ inline void OnResourceWrite(
   std::unique_lock lock(watcher->mutex);
   auto* session = watcher->session.get();
   if (session == nullptr || !session->failure.empty()) return;
+  // Re-checked under the lock: the texture may have been destroyed while this thread waited.
+  if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
 
   const auto command_index = session->command_count;
   if (kind == WriterKind::COPY) {
@@ -495,6 +516,31 @@ inline void ProcessAtPresent(
   if (auto* session = watcher->session.get(); session != nullptr) {
     auto* cmd_list = queue->get_immediate_command_list();
 
+    const auto stats_to_json = [&](const RegionStats& stats) {
+      auto stats_json = json{
+          {"finitePixels", stats.finite_count},
+          {"nonFinitePixels", stats.non_finite_count},
+          {"negativePixels", stats.negative_count},
+          {"pixelsAboveOne", stats.above_one_count},
+          {"blackPixels", stats.black_count},
+      };
+      if (stats.finite_count != 0u) {
+        stats_json["maxLuminance"] = stats.max_luminance;
+        stats_json["minLuminance"] = stats.min_luminance;
+        stats_json["meanLuminance"] = stats.mean_luminance;
+        stats_json["maxChannel"] = stats.max_channel;
+      }
+      if (session->signal != Signal::RAW) {
+        stats_json["pixelsAboveNits"] = json{
+            {"203", stats.above_nits_counts[0]},
+            {"400", stats.above_nits_counts[1]},
+            {"1000", stats.above_nits_counts[2]},
+            {"4000", stats.above_nits_counts[3]},
+        };
+      }
+      return stats_json;
+    };
+
     // Maps the oldest in-flight readback and folds its events into the aggregates (and the trace for one frame).
     const auto drain_oldest = [&]() {
       const auto frame = std::move(session->in_flight.front());
@@ -526,31 +572,9 @@ inline void ProcessAtPresent(
         stats.mean_luminance = static_cast<double>(luminance_sum) / (LUMINANCE_SUM_SCALE * static_cast<double>(stats.finite_count));
       }
       device->unmap_texture_region(session->readbacks[frame.ring_index], 0u);
-
-      const auto stats_to_json = [&](const RegionStats& stats) {
-        auto stats_json = json{
-            {"finitePixels", stats.finite_count},
-            {"nonFinitePixels", stats.non_finite_count},
-            {"negativePixels", stats.negative_count},
-            {"pixelsAboveOne", stats.above_one_count},
-            {"blackPixels", stats.black_count},
-        };
-        if (stats.finite_count != 0u) {
-          stats_json["maxLuminance"] = stats.max_luminance;
-          stats_json["minLuminance"] = stats.min_luminance;
-          stats_json["meanLuminance"] = stats.mean_luminance;
-          stats_json["maxChannel"] = stats.max_channel;
-        }
-        if (session->signal != Signal::RAW) {
-          stats_json["pixelsAboveNits"] = json{
-              {"203", stats.above_nits_counts[0]},
-              {"400", stats.above_nits_counts[1]},
-              {"1000", stats.above_nits_counts[2]},
-              {"4000", stats.above_nits_counts[3]},
-          };
-        }
-        return stats_json;
-      };
+      if (session->verify_slot.has_value() && frame.frame_index + 1u == session->frames) {
+        session->verify_gpu_stats = slot_stats[session->verify_slot.value()];
+      }
 
       ++session->frames_decoded;
       if (frame.truncated) {
@@ -644,10 +668,21 @@ inline void ProcessAtPresent(
     }
 
     if (!request_canceled && session->failure.empty()) {
+      const auto is_last_frame = (session->frames_recorded + 1u >= session->frames);
       if (session->open_event_index.has_value()) {
         const auto final_slot = internal::MeasureRegion(session, cmd_list);
         session->events[session->open_event_index.value()].after_slot = final_slot;
         session->open_event_index.reset();
+        // Nothing writes the texture between this measurement and the copy below, so both see the same pixels.
+        if (session->verify && is_last_frame && final_slot.has_value()
+            && device->create_resource(
+                reshade::api::resource_desc(session->width, session->height, 1, 1, session->scratch_format, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
+                nullptr,
+                reshade::api::resource_usage::copy_dest,
+                &session->verify_readback)) {
+          cmd_list->copy_texture_region(session->watched_resource, session->subresource, &session->region, session->verify_readback, 0u, nullptr);
+          session->verify_slot = final_slot;
+        }
       }
 
       if (!session->events.empty() && session->failure.empty()) {
@@ -798,6 +833,118 @@ inline void ProcessAtPresent(
           if (session->frames == 1u) {
             result_json["trace"] = std::move(session->trace);
           }
+
+          if (session->verify) {
+            reshade::api::subresource_data verify_data = {};
+            if (!session->verify_gpu_stats.has_value()
+                || !device->map_texture_region(session->verify_readback, 0u, nullptr, reshade::api::map_access::read_only, &verify_data)) {
+              result_json["verify"] = json{{"status", "skipped"}, {"reason", "No measurement was taken at the last present: no writer was still open at the end of the last frame (with shaderHash, a filtered writer is closed at the next writer instead), or the CPU readback failed."}};
+              summary += "\nVerify: skipped (no measurement at the last present; with shaderHash, watch without the filter to verify).";
+            } else {
+              // Same definitions as watch_region_reduce: non-finite pixels are excluded, luminance is clamped at 0 for
+              // min/max/mean and at LUMINANCE_SUM_CLAMP for the mean.
+              RegionStats cpu_stats = {};
+              double cpu_luminance_sum = 0.0;
+              double cpu_min_luminance = std::numeric_limits<double>::infinity();
+              bool decoded = true;
+              const auto pixel_stride = static_cast<std::size_t>(reshade::api::format_row_pitch(session->scratch_format, 1));
+              constexpr std::array<double, 4> NITS_THRESHOLDS = {203.0, 400.0, 1000.0, 4000.0};
+              for (std::uint32_t y = 0u; y < session->height && decoded; ++y) {
+                const auto* row = static_cast<const std::uint8_t*>(verify_data.data) + (static_cast<std::size_t>(verify_data.row_pitch) * y);
+                for (std::uint32_t x = 0u; x < session->width; ++x) {
+                  float rgba[4] = {0.f, 0.f, 0.f, 1.f};
+                  std::uint32_t channel_count = 4u;
+                  if (!resource_analysis::internal::DecodePixelToLinear(session->scratch_format, row + (pixel_stride * x), rgba, channel_count)) {
+                    decoded = false;
+                    break;
+                  }
+                  if (!std::isfinite(rgba[0]) || !std::isfinite(rgba[1]) || !std::isfinite(rgba[2])) {
+                    ++cpu_stats.non_finite_count;
+                    continue;
+                  }
+                  std::array<double, 3> display = {rgba[0], rgba[1], rgba[2]};
+                  double luminance = (0.2126 * rgba[0]) + (0.7152 * rgba[1]) + (0.0722 * rgba[2]);
+                  if (session->signal != Signal::RAW) {
+                    const auto display_light = resource_analysis::internal::DecodeDisplayLight(session->signal, rgba);
+                    display = display_light.nits;
+                    luminance = display_light.luminance;
+                  }
+                  const auto non_negative_luminance = std::max(luminance, 0.0);
+                  ++cpu_stats.finite_count;
+                  cpu_stats.max_luminance = std::max(cpu_stats.max_luminance, non_negative_luminance);
+                  cpu_min_luminance = std::min(cpu_min_luminance, non_negative_luminance);
+                  cpu_stats.max_channel = std::max({cpu_stats.max_channel, display[0], display[1], display[2]});
+                  cpu_luminance_sum += std::min(non_negative_luminance, LUMINANCE_SUM_CLAMP);
+                  if (rgba[0] < 0.f || rgba[1] < 0.f || rgba[2] < 0.f) {
+                    ++cpu_stats.negative_count;
+                  }
+                  if (rgba[0] > 1.f || rgba[1] > 1.f || rgba[2] > 1.f) {
+                    ++cpu_stats.above_one_count;
+                  }
+                  if (rgba[0] == 0.f && rgba[1] == 0.f && rgba[2] == 0.f) {
+                    ++cpu_stats.black_count;
+                  }
+                  if (session->signal != Signal::RAW) {
+                    for (std::size_t threshold_index = 0u; threshold_index < NITS_THRESHOLDS.size(); ++threshold_index) {
+                      if (luminance > NITS_THRESHOLDS[threshold_index]) {
+                        ++cpu_stats.above_nits_counts[threshold_index];
+                      }
+                    }
+                  }
+                }
+              }
+              device->unmap_texture_region(session->verify_readback, 0u);
+
+              if (!decoded) {
+                result_json["verify"] = json{{"status", "skipped"}, {"reason", std::format("CPU decoding is not implemented for {}.", session->resource_format_name)}};
+                summary += "\nVerify: skipped (format not decodable on the CPU).";
+              } else {
+                if (cpu_stats.finite_count != 0u) {
+                  cpu_stats.min_luminance = cpu_min_luminance;
+                  cpu_stats.mean_luminance = cpu_luminance_sum / static_cast<double>(cpu_stats.finite_count);
+                }
+                const auto& gpu_stats = session->verify_gpu_stats.value();
+                auto mismatches = json::array();
+                const auto compare_count = [&](std::string_view field, std::uint32_t gpu_value, std::uint32_t cpu_value, std::uint32_t allowed_difference) {
+                  const auto difference = (gpu_value > cpu_value ? gpu_value - cpu_value : cpu_value - gpu_value);
+                  if (difference > allowed_difference) {
+                    mismatches.push_back(json{{"field", std::string(field)}, {"gpu", gpu_value}, {"cpu", cpu_value}});
+                  }
+                };
+                const auto compare_value = [&](std::string_view field, double gpu_value, double cpu_value) {
+                  const auto allowed_difference = std::max(VERIFY_ABSOLUTE_TOLERANCE, VERIFY_RELATIVE_TOLERANCE * std::max(std::abs(gpu_value), std::abs(cpu_value)));
+                  if (std::abs(gpu_value - cpu_value) > allowed_difference) {
+                    mismatches.push_back(json{{"field", std::string(field)}, {"gpu", gpu_value}, {"cpu", cpu_value}});
+                  }
+                };
+                compare_count("finitePixels", gpu_stats.finite_count, cpu_stats.finite_count, 0u);
+                compare_count("nonFinitePixels", gpu_stats.non_finite_count, cpu_stats.non_finite_count, 0u);
+                compare_count("negativePixels", gpu_stats.negative_count, cpu_stats.negative_count, 0u);
+                compare_count("pixelsAboveOne", gpu_stats.above_one_count, cpu_stats.above_one_count, 0u);
+                compare_count("blackPixels", gpu_stats.black_count, cpu_stats.black_count, 0u);
+                // GPU float and CPU double nits can land on opposite sides of a threshold for a few pixels.
+                const auto allowed_nits_difference = std::max<std::uint32_t>(2u, (session->width * session->height) / 10000u);
+                compare_count("pixelsAboveNits.203", gpu_stats.above_nits_counts[0], cpu_stats.above_nits_counts[0], allowed_nits_difference);
+                compare_count("pixelsAboveNits.400", gpu_stats.above_nits_counts[1], cpu_stats.above_nits_counts[1], allowed_nits_difference);
+                compare_count("pixelsAboveNits.1000", gpu_stats.above_nits_counts[2], cpu_stats.above_nits_counts[2], allowed_nits_difference);
+                compare_count("pixelsAboveNits.4000", gpu_stats.above_nits_counts[3], cpu_stats.above_nits_counts[3], allowed_nits_difference);
+                compare_value("maxLuminance", gpu_stats.max_luminance, cpu_stats.max_luminance);
+                compare_value("minLuminance", gpu_stats.min_luminance, cpu_stats.min_luminance);
+                compare_value("meanLuminance", gpu_stats.mean_luminance, cpu_stats.mean_luminance);
+                compare_value("maxChannel", gpu_stats.max_channel, cpu_stats.max_channel);
+
+                const auto verify_matched = mismatches.empty();
+                summary += std::format("\nVerify (CPU readback of the state at the last present): {}.", (verify_matched ? "match" : "MISMATCH"));
+                result_json["verify"] = json{
+                    {"status", (verify_matched ? "match" : "mismatch")},
+                    {"gpu", stats_to_json(gpu_stats)},
+                    {"cpu", stats_to_json(cpu_stats)},
+                    {"mismatches", std::move(mismatches)},
+                };
+              }
+            }
+          }
+          result_json["summary"] = summary;
           complete_request(session->request, ToolResult{.text = summary, .structured_content = std::move(result_json), .is_error = false});
         }
       }
@@ -896,6 +1043,8 @@ inline void ProcessAtPresent(
     session->frames = request->frames;
     session->shader_hash = request->shader_hash;
     session->include_unchanged = request->include_unchanged;
+    session->verify = request->verify;
+    session->scratch_format = scratch_format;
     session->used_clone = target.used_clone;
     session->resource_format_name = formatting::StreamToString(scratch_format);
 
@@ -1002,6 +1151,7 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
   request->signal = resource_analysis::internal::ParseSignal(mcp_arguments::GetOptional<std::string>(arguments, "signal").value_or("raw"));
   request->frames = frames;
   request->include_unchanged = mcp_arguments::GetOptional<bool>(arguments, "includeUnchanged").value_or(false);
+  request->verify = mcp_arguments::GetOptional<bool>(arguments, "verify").value_or(false);
   const auto* shader_hash_value = mcp_arguments::FindValue(arguments, "shaderHash");
   if (shader_hash_value != nullptr && !shader_hash_value->is_null()) {
     request->shader_hash = shader_hash::GetRequired(arguments, "shaderHash");

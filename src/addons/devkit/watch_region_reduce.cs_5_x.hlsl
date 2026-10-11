@@ -25,9 +25,12 @@
 #define SIGNAL_PQ 1
 #define SIGNAL_SCRGB 2
 
-// Luminance sum is accumulated as fixed point (value * 256); a per-pixel luminance is clamped so a group sum fits in 32 bits.
-#define LUMINANCE_SUM_SCALE 256.0f
-#define LUMINANCE_SUM_CLAMP 32768.0f
+// The luminance sum is reduced in float inside a group, then added to a 64-bit fixed-point total (low and high words,
+// value * 2^20). Rounding once per group, not per pixel, keeps the mean exact for dark 8-bit content. Per-pixel values
+// are clamped to the float16 maximum so the total stays far below 2^64 units.
+#define LUMINANCE_SUM_SCALE 1048576.0f
+#define LUMINANCE_SUM_CLAMP 65504.0f
+#define TWO_POW_32 4294967296.0f
 
 // Counter slots in the group-shared reduction.
 #define COUNT_NON_FINITE 0
@@ -54,7 +57,7 @@ cbuffer Constants : register(b0) {
 groupshared uint shared_max_luminance[GROUP_THREADS];
 groupshared uint shared_min_luminance_inverted[GROUP_THREADS];
 groupshared uint shared_max_channel[GROUP_THREADS];
-groupshared uint shared_luminance_sum[GROUP_THREADS];
+groupshared float shared_luminance_sum[GROUP_THREADS];
 groupshared uint shared_counts[COUNT_KINDS][GROUP_THREADS];
 
 bool IsNonFinite(float value) {
@@ -72,7 +75,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
   uint max_luminance_bits = 0u;
   uint min_luminance_inverted_bits = 0u;
   uint max_channel_bits = 0u;
-  uint luminance_sum = 0u;
+  float luminance_sum = 0.f;
   uint counts[COUNT_KINDS] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
 
   if (dispatch_thread_id.x < region_width && dispatch_thread_id.y < region_height) {
@@ -101,7 +104,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
       max_luminance_bits = asuint(non_negative_luminance);
       min_luminance_inverted_bits = ~asuint(non_negative_luminance);
       max_channel_bits = asuint(max_channel);
-      luminance_sum = (uint)(min(non_negative_luminance, LUMINANCE_SUM_CLAMP) * LUMINANCE_SUM_SCALE + 0.5f);
+      luminance_sum = min(non_negative_luminance, LUMINANCE_SUM_CLAMP);
 
       counts[COUNT_FINITE] = 1u;
       counts[COUNT_NEGATIVE] = (rgb.r < 0.f || rgb.g < 0.f || rgb.b < 0.f) ? 1u : 0u;
@@ -155,12 +158,16 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
   InterlockedMax(stats[uint2(STATS_MIN_LUMINANCE_INVERTED_BITS, slot)], shared_min_luminance_inverted[0]);
   InterlockedMax(stats[uint2(STATS_MAX_CHANNEL_BITS, slot)], shared_max_channel[0]);
 
-  // 64-bit sum: add into the low word and carry into the high word when the low word wraps.
-  const uint group_sum = shared_luminance_sum[0];
+  // 64-bit fixed-point sum: split the scaled group sum into high and low words, add the low word and carry into the high
+  // word when it wraps.
+  const float scaled_group_sum = shared_luminance_sum[0] * LUMINANCE_SUM_SCALE;
+  const uint scaled_high = (uint)floor(scaled_group_sum / TWO_POW_32);
+  const uint scaled_low = (uint)clamp(scaled_group_sum - ((float)scaled_high * TWO_POW_32) + 0.5f, 0.f, 4294967295.f);
   uint previous_low = 0u;
-  InterlockedAdd(stats[uint2(STATS_LUMINANCE_SUM_LOW, slot)], group_sum, previous_low);
-  if (previous_low + group_sum < previous_low) {
-    InterlockedAdd(stats[uint2(STATS_LUMINANCE_SUM_HIGH, slot)], 1u);
+  InterlockedAdd(stats[uint2(STATS_LUMINANCE_SUM_LOW, slot)], scaled_low, previous_low);
+  const uint carry = (previous_low + scaled_low < previous_low) ? 1u : 0u;
+  if (scaled_high + carry != 0u) {
+    InterlockedAdd(stats[uint2(STATS_LUMINANCE_SUM_HIGH, slot)], scaled_high + carry);
   }
 
   InterlockedAdd(stats[uint2(STATS_FINITE_COUNT, slot)], shared_counts[COUNT_FINITE][0]);

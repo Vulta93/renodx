@@ -265,7 +265,10 @@ bound as a render target, dispatches with it bound as a compute UAV, and copies,
 Arguments: `resourceViewHandle` and `preferClone` (as for `devkit_analyze_resource`; the backing resource or its clone is
 watched), the optional region (`regionX`/`regionY`/`regionWidth`/`regionHeight`, default: whole texture), `signal`
 (`raw`/`pq`/`scrgb`), `frames` (default 1, max 3600), `shaderHash` (measure only writers using that shader) and
-`includeUnchanged` (also list writers that did not change the region, `frames: 1` only). The call blocks until done.
+`includeUnchanged` (also list writers that did not change the region, `frames: 1` only) and `verify` (read the region back to
+the CPU at the last present and compare it with the GPU statistics of that same moment: `verify.status` is `match`,
+`mismatch` with the differing fields, or `skipped` when nothing was measured at the last present, for example with
+`shaderHash`, whose last filtered writer is closed at the next writer). The call blocks until done.
 
 - `frames: 1` returns `trace`: every writer that changed the region, in command order, with `commandIndex` (ordinal among the
   frame's draws, dispatches and copies; offset from `devkit_list_draws` indexes, so match by shader hash and order), shader
@@ -285,6 +288,8 @@ writer costs a region copy and a small dispatch, so use a region or `shaderHash`
   redirects the game's rendering into clones, watch the clone (`preferClone: true`).
 - Draws that write the texture through a pixel-shader UAV are not detected.
 - If the watched texture is destroyed during the watch (for example on resize), the watch stops and returns an error.
+- When another add-on performs a write itself inside the same ReShade event (for example a mod redirecting a clear onto its
+  clone), its handler may run before the Devkit's, so that writer's "before" already includes the write.
 
 ## 11. Current practical caveats
 
