@@ -48,7 +48,7 @@ that matters.
 
 ## Output
 
-Written to `<ReShade base>/renodx-dev/hdr_analysis/`:
+Written to `<ReShade base>/hdr_analysis/`:
 
 | File | Contents |
 |---|---|

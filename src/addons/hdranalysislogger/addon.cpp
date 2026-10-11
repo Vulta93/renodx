@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 Gaetano
+ * Copyright (C) 2026 Vulta93
  * SPDX-License-Identifier: MIT
  */
 
@@ -33,9 +33,6 @@
 #include <include/reshade.hpp>
 #include <nlohmann/json.hpp>
 
-#include "../../utils/float16.hpp"
-#include "../../utils/log.hpp"
-#include "../../utils/path.hpp"
 
 namespace {
 
@@ -164,8 +161,33 @@ std::string completion_message;
 std::chrono::steady_clock::time_point completion_message_end_time;
 json latest_sample;
 
+// <ReShade base folder>/hdr_analysis, normally next to ReShade.ini.
 std::filesystem::path GetOutputFolder() {
-  return renodx::utils::path::GetOutputSubdirectory("hdr_analysis");
+  static const std::filesystem::path OUTPUT_FOLDER = [] {
+    size_t path_size = 0;
+    reshade::get_reshade_base_path(nullptr, &path_size);
+    std::string base_path(path_size, '\0');
+    reshade::get_reshade_base_path(base_path.data(), &path_size);
+    base_path.resize(std::strlen(base_path.c_str()));
+    return std::filesystem::path(std::u8string(base_path.begin(), base_path.end())) / "hdr_analysis";
+  }();
+  return OUTPUT_FOLDER;
+}
+
+const char* FormatName(reshade::api::format format) {
+  switch (format) {
+    case reshade::api::format::r8g8b8a8_unorm:      return "r8g8b8a8_unorm";
+    case reshade::api::format::r8g8b8a8_unorm_srgb: return "r8g8b8a8_unorm_srgb";
+    case reshade::api::format::b8g8r8a8_unorm:      return "b8g8r8a8_unorm";
+    case reshade::api::format::b8g8r8a8_unorm_srgb: return "b8g8r8a8_unorm_srgb";
+    case reshade::api::format::r8g8b8x8_unorm:      return "r8g8b8x8_unorm";
+    case reshade::api::format::b8g8r8x8_unorm:      return "b8g8r8x8_unorm";
+    case reshade::api::format::r10g10b10a2_unorm:   return "r10g10b10a2_unorm";
+    case reshade::api::format::b10g10r10a2_unorm:   return "b10g10r10a2_unorm";
+    case reshade::api::format::r11g11b10_float:     return "r11g11b10_float";
+    case reshade::api::format::r16g16b16a16_float:  return "r16g16b16a16_float";
+    default:                                        return "other";
+  }
 }
 
 std::string GetFileTimestamp() {
@@ -256,7 +278,7 @@ void StartSeries() {
       .end_time = std::chrono::steady_clock::now() + std::chrono::seconds(series_duration_seconds),
   };
   status = std::format("Recording series \"{}\" for {} s.", series->label, series_duration_seconds);
-  renodx::utils::log::i("HDRAnalysisLogger: ", status);
+  reshade::log::message(reshade::log::level::info, std::format("HDRAnalysisLogger: {}", status).c_str());
 }
 
 void OnInitEffectRuntime(reshade::api::effect_runtime* runtime) {
@@ -417,13 +439,27 @@ void OnReShadeFinishEffects(
   queue->flush_immediate_command_list();
   queue->wait_idle();
 
+  std::wstring module_path(MAX_PATH, L'\0');
+  module_path.resize(GetModuleFileNameW(nullptr, module_path.data(), static_cast<DWORD>(module_path.size())));
+  const std::filesystem::path game_folder = module_path;
+  const auto* device_api = [&]() {
+    switch (device->get_api()) {
+      case reshade::api::device_api::d3d9:   return "d3d9";
+      case reshade::api::device_api::d3d10:  return "d3d10";
+      case reshade::api::device_api::d3d11:  return "d3d11";
+      case reshade::api::device_api::d3d12:  return "d3d12";
+      case reshade::api::device_api::opengl: return "opengl";
+      case reshade::api::device_api::vulkan: return "vulkan";
+      default:                               return "unknown";
+    }
+  }();
   const auto local_now = std::chrono::current_zone()->to_local(std::chrono::floor<std::chrono::milliseconds>(std::chrono::system_clock::now()));
   latest_sample = json{
       {"time", std::format("{:%FT%T}", local_now)},
       {"frame", frame_index},
-      {"game_folder", renodx::utils::path::GetExecutableBasePath().filename().string()},
-      {"api", renodx::utils::log::BuildString(device->get_api())},
-      {"back_buffer_format", renodx::utils::log::BuildString(device->get_resource_desc(runtime->get_current_back_buffer()).texture.format)},
+      {"game_folder", game_folder.parent_path().filename().string()},
+      {"api", device_api},
+      {"back_buffer_format", FormatName(device->get_resource_desc(runtime->get_current_back_buffer()).texture.format)},
   };
 
   reshade::api::subresource_data mapped = {};
@@ -500,7 +536,7 @@ void OnReShadeFinishEffects(
     default:                                       break;
   }
   if (copied_region.has_value() && region_colour_space == nullptr) {
-    latest_sample["region"] = {{"status", std::format("Unsupported back buffer format {}.", renodx::utils::log::BuildString(region_format))}};
+    latest_sample["region"] = {{"status", std::format("Unsupported back buffer format {}.", FormatName(region_format))}};
   } else if (copied_region.has_value() && device->map_texture_region(region_readback.staging, 0, nullptr, reshade::api::map_access::read_only, &mapped)) {
     const auto box = copied_region.value();
     const bool is_sdr = (std::string_view(region_colour_space) == "sdr");
@@ -515,12 +551,22 @@ void OnReShadeFinishEffects(
         std::array<float, 3> rgb = {};
         switch (region_format) {
           case reshade::api::format::r16g16b16a16_float: {
-            const auto* half = reinterpret_cast<const uint16_t*>(row + (x * 8u));
-            const std::array<float, 3> bt709 = {
-                renodx::utils::float16::Decode(half[0]),
-                renodx::utils::float16::Decode(half[1]),
-                renodx::utils::float16::Decode(half[2]),
+            const auto decode_half = [](uint16_t half) {
+              const auto exponent = static_cast<int>((half >> 10) & 0x1Fu);
+              const auto mantissa = static_cast<float>(half & 0x3FFu);
+              float magnitude = 0.f;
+              if (exponent == 0) {
+                magnitude = std::ldexp(mantissa, -24);
+              } else if (exponent == 31) {
+                magnitude = (mantissa == 0.f ? std::numeric_limits<float>::infinity() : std::numeric_limits<float>::quiet_NaN());
+              } else {
+                magnitude = std::ldexp(mantissa + 1024.f, exponent - 25);
+              }
+              return ((half & 0x8000u) != 0u ? -magnitude : magnitude);
             };
+            std::array<uint16_t, 3> half = {};
+            std::memcpy(half.data(), row + (x * 8u), sizeof(half));
+            const std::array<float, 3> bt709 = {decode_half(half[0]), decode_half(half[1]), decode_half(half[2])};
             for (int channel = 0; channel < 3; ++channel) {
               const auto& row_weights = BT709_TO_BT2020[channel];
               rgb[channel] = 80.f * ((row_weights[0] * bt709[0]) + (row_weights[1] * bt709[1]) + (row_weights[2] * bt709[2]));
@@ -665,7 +711,7 @@ void OnReShadeFinishEffects(
   status = std::format("Wrote {} ({} samples).", file_name, series->samples.size());
   completion_message = std::format("Logging complete: {} ({} samples)", file_name, series->samples.size());
   completion_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  renodx::utils::log::i("HDRAnalysisLogger: ", status);
+  reshade::log::message(reshade::log::level::info, std::format("HDRAnalysisLogger: {}", status).c_str());
   series.reset();
 }
 
