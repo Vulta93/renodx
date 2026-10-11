@@ -20,6 +20,7 @@
 #include "snapshot_tools.hpp"
 #include "texture_replace.hpp"
 #include "tool_catalog.hpp"
+#include "watch_region.hpp"
 
 namespace renodx::addons::devkit::mcp::runtime {
 
@@ -28,6 +29,7 @@ struct RegistrationContext {
   std::function<shader_inspection::ToolContext()> build_shader_inspection_tool_context;
   std::function<live_shaders::ToolContext()> build_live_shaders_tool_context;
   std::function<resource_analysis::ToolContext()> build_analyze_resource_tool_context;
+  std::function<watch_region::ToolContext()> build_watch_region_tool_context;
   std::function<resource_clone::ToolContext()> build_resource_clone_tool_context;
   std::function<texture_replace::ToolContext()> build_texture_replace_tool_context;
   std::function<renodx::utils::mcp::ToolResult(const std::optional<std::string>&)> set_tools_path;
@@ -100,6 +102,10 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
   register_tool("devkit_analyze_resource", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                const renodx::utils::mcp::json& arguments) {
     return resource_analysis::HandleAnalyzeResourceTool(arguments, build_analyze_resource_tool_context());
+  });
+  register_tool("devkit_watch_region", [build_watch_region_tool_context = context.build_watch_region_tool_context](
+                                           const renodx::utils::mcp::json& arguments) {
+    return watch_region::HandleWatchRegionTool(arguments, build_watch_region_tool_context());
   });
   register_tool("devkit_dump_resource_with_hash", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                        const renodx::utils::mcp::json& arguments) {

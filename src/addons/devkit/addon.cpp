@@ -82,6 +82,7 @@
 #include "./mcp/shader_summary.hpp"
 #include "./mcp/snapshot_tools.hpp"
 #include "./mcp/texture_replace.hpp"
+#include "./mcp/watch_region.hpp"
 #include "./tools_path.hpp"
 
 namespace {
@@ -93,6 +94,7 @@ namespace devkit_resource_analysis = renodx::addons::devkit::mcp::resource_analy
 namespace devkit_resource_clone = renodx::addons::devkit::mcp::resource_clone;
 namespace devkit_resource_view_summary = renodx::addons::devkit::mcp::resource_view_summary;
 namespace devkit_texture_replace = renodx::addons::devkit::mcp::texture_replace;
+namespace devkit_watch_region = renodx::addons::devkit::mcp::watch_region;
 namespace devkit_device_selection = renodx::addons::devkit::mcp::device_selection;
 namespace devkit_device_summary = renodx::addons::devkit::mcp::device_summary;
 namespace devkit_draw_summary = renodx::addons::devkit::mcp::draw_summary;
@@ -421,6 +423,7 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   bool primary_swapchain_is_flip = false;
   bool is_d3d9_ex = false;
   bool has_synced_addon_shaders = false;
+  devkit_watch_region::Watcher watch_region_watcher;
 
   ShaderDetails* GetShaderDetails(uint32_t shader_hash) {
     // assert(shader_hash != 0u);
@@ -2809,6 +2812,33 @@ void CancelPendingResourceAnalysisRequest(
   std::erase(device_data->pending_resource_analysis_requests, request);
 }
 
+[[nodiscard]] bool EnqueuePendingWatchRegionRequest(
+    uint32_t device_index,
+    const std::shared_ptr<devkit_watch_region::Request>& request) {
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (device_index >= device_data_list.size()) {
+    return false;
+  }
+  auto* device_data = device_data_list[device_index];
+
+  std::unique_lock watcher_lock(device_data->watch_region_watcher.mutex);
+  device_data->watch_region_watcher.pending_requests.push_back(request);
+  return true;
+}
+
+void CancelPendingWatchRegionRequest(
+    uint32_t device_index,
+    const std::shared_ptr<devkit_watch_region::Request>& request) {
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (device_index >= device_data_list.size()) {
+    return;
+  }
+  auto* device_data = device_data_list[device_index];
+
+  std::unique_lock watcher_lock(device_data->watch_region_watcher.mutex);
+  std::erase(device_data->watch_region_watcher.pending_requests, request);
+}
+
 [[nodiscard]] bool EnqueuePendingLiveShaderRequest(
     uint32_t device_index,
     const std::shared_ptr<PendingLiveShaderRequest>& request) {
@@ -4176,6 +4206,11 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                         .enqueue_request = EnqueuePendingResourceAnalysisRequest,
                                                         .cancel_request = CancelPendingResourceAnalysisRequest,
                                                     }; },
+      .build_watch_region_tool_context = []() { return devkit_watch_region::ToolContext{
+                                                    .resolve_device_index = BuildResolveDeviceIndexCallback(),
+                                                    .enqueue_request = EnqueuePendingWatchRegionRequest,
+                                                    .cancel_request = CancelPendingWatchRegionRequest,
+                                                }; },
       .build_resource_clone_tool_context = []() { return devkit_resource_clone::ToolContext{
                                                       .resolve_device_index = BuildResolveDeviceIndexCallback(),
                                                       .set_resource_clone = SetResourceCloneForMcp,
@@ -4282,6 +4317,7 @@ void OnDestroyDevice(reshade::api::device* device) {
   }
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
+  devkit_watch_region::Shutdown(&device_data->watch_region_watcher, device);
   if (GetSelectedDeviceData() == device_data) {
     DestroyDeviceProxyOutputWindow();
   }
@@ -4624,10 +4660,20 @@ void OnBindPipeline(
   }
 }
 
+void NotifyWatchRegionWrite(
+    reshade::api::command_list* cmd_list,
+    devkit_watch_region::WriterKind kind,
+    reshade::api::resource written_resource) {
+  auto* device_data = renodx::utils::data::Get<DeviceData>(cmd_list->get_device());
+  if (device_data == nullptr) return;
+  devkit_watch_region::OnResourceWrite(&device_data->watch_region_watcher, cmd_list, kind, written_resource);
+}
+
 bool OnCopyResource(
     reshade::api::command_list* cmd_list,
     reshade::api::resource source,
     reshade::api::resource dest) {
+  NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::COPY, dest);
   reshade::api::device* active_snapshot_device = snapshot_device;
   if (active_snapshot_device == nullptr) return false;
 
@@ -4674,6 +4720,7 @@ bool OnCopyTextureRegion(
     uint32_t dest_subresource,
     const reshade::api::subresource_box* dest_box,
     reshade::api::filter_mode filter) {
+  NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::COPY, dest);
   reshade::api::device* active_snapshot_device = snapshot_device;
   if (active_snapshot_device == nullptr) return false;
 
@@ -4711,9 +4758,68 @@ bool OnCopyTextureRegion(
   return false;
 }
 
+bool OnResolveTextureRegion(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource source,
+    uint32_t source_subresource,
+    const reshade::api::subresource_box* source_box,
+    reshade::api::resource dest,
+    uint32_t dest_subresource,
+    uint32_t dest_x,
+    uint32_t dest_y,
+    uint32_t dest_z,
+    reshade::api::format format) {
+  NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::RESOLVE, dest);
+  return false;
+}
+
+// On D3D11, UpdateSubresource on the immediate context raises the device-level event, not update_texture_region_command.
+bool OnUpdateTextureRegion(
+    reshade::api::device* device,
+    const reshade::api::subresource_data& data,
+    reshade::api::resource dest,
+    uint32_t dest_subresource,
+    const reshade::api::subresource_box* dest_box) {
+  auto* device_data = renodx::utils::data::Get<DeviceData>(device);
+  if (device_data == nullptr) return false;
+  devkit_watch_region::OnResourceWrite(&device_data->watch_region_watcher, nullptr, devkit_watch_region::WriterKind::UPDATE, dest);
+  return false;
+}
+
+bool OnClearRenderTargetView(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource_view rtv,
+    const float color[4],
+    uint32_t rect_count,
+    const reshade::api::rect* rects) {
+  NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::CLEAR, cmd_list->get_device()->get_resource_from_view(rtv));
+  return false;
+}
+
+bool OnClearUnorderedAccessViewUint(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource_view uav,
+    const uint32_t values[4],
+    uint32_t rect_count,
+    const reshade::api::rect* rects) {
+  NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::CLEAR, cmd_list->get_device()->get_resource_from_view(uav));
+  return false;
+}
+
+bool OnClearUnorderedAccessViewFloat(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource_view uav,
+    const float values[4],
+    uint32_t rect_count,
+    const reshade::api::rect* rects) {
+  NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::CLEAR, cmd_list->get_device()->get_resource_from_view(uav));
+  return false;
+}
+
 void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
   auto* data = renodx::utils::data::Get<DeviceData>(device);
   if (data == nullptr) return;
+  devkit_watch_region::OnResourceDestroyed(&data->watch_region_watcher, resource);
   const std::unique_lock lock(data->mutex);
   auto pair = data->preview_srvs.find(resource.handle);
   if (pair == data->preview_srvs.end()) return;
@@ -4888,6 +4994,11 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
 
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return false;
+
+  devkit_watch_region::OnDrawOrDispatch(
+      &device_data->watch_region_watcher,
+      cmd_list,
+      draw_method == DrawDetails::DrawMethods::DISPATCH);
 
   struct BoundShader {
     reshade::api::pipeline_stage stage;
@@ -9192,6 +9303,13 @@ void OnPresent(
             .build_resource_view_summary = [](reshade::api::resource_view resource_view, reshade::api::device* device) { return BuildResourceViewSummary(GetResourceViewDetails(resource_view, device)); },
         });
 
+    devkit_watch_region::ProcessAtPresent(
+        &device_data->watch_region_watcher,
+        device_index,
+        device_data->device,
+        queue,
+        __watch_region_reduce_dx11);
+
     std::deque<std::shared_ptr<PendingLiveShaderRequest>> pending_live_shader_requests;
     {
       std::unique_lock device_lock(device_data->mutex);
@@ -9364,6 +9482,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+      reshade::register_event<reshade::addon_event::update_texture_region>(OnUpdateTextureRegion);
+      reshade::register_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUint);
+      reshade::register_event<reshade::addon_event::clear_unordered_access_view_float>(OnClearUnorderedAccessViewFloat);
+      reshade::register_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
 
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
@@ -9408,6 +9531,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
+      reshade::unregister_event<reshade::addon_event::update_texture_region>(OnUpdateTextureRegion);
+      reshade::unregister_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUint);
+      reshade::unregister_event<reshade::addon_event::clear_unordered_access_view_float>(OnClearUnorderedAccessViewFloat);
+      reshade::unregister_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
