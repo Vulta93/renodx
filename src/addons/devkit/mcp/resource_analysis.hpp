@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -51,6 +52,14 @@ enum class OutputFormat : std::uint8_t {
   EXR = 1,
 };
 
+// How decoded values map to display light for the optional nits summary.
+// RAW keeps the analysis on decoded values only.
+enum class Signal : std::uint8_t {
+  RAW = 0,
+  PQ = 1,
+  SCRGB = 2,
+};
+
 struct PendingRequest {
   reshade::api::resource_view resource_view = {0u};
   std::optional<std::filesystem::path> output_path = std::nullopt;
@@ -59,6 +68,8 @@ struct PendingRequest {
   PreviewMode preview_mode = PreviewMode::CLAMPED;
   std::string preview_mode_name = "clamped";
   bool prefer_clone = false;
+  std::optional<reshade::api::subresource_box> region = std::nullopt;
+  Signal signal = Signal::RAW;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -284,6 +295,14 @@ inline void to_json(json& j, const RatioStats& value) {
   }
 }
 
+[[nodiscard]] inline std::string_view GetSignalName(Signal signal) {
+  switch (signal) {
+    case Signal::PQ:    return "pq";
+    case Signal::SCRGB: return "scrgb";
+    default:            return "raw";
+  }
+}
+
 [[nodiscard]] inline OutputFormat GetOutputFormat(const std::filesystem::path& output_path) {
   return output_path.extension() == L".exr" ? OutputFormat::EXR : OutputFormat::PNG;
 }
@@ -453,6 +472,14 @@ inline void to_json(json& j, const RatioStats& value) {
   if (value == "neutwo") return PreviewMode::NEUTWO;
 
   throw std::runtime_error(std::format("previewMode '{}' is invalid. Expected 'clamped' or 'neutwo'.", value));
+}
+
+[[nodiscard]] inline Signal ParseSignal(std::string_view value) {
+  if (value == "raw") return Signal::RAW;
+  if (value == "pq") return Signal::PQ;
+  if (value == "scrgb") return Signal::SCRGB;
+
+  throw std::runtime_error(std::format("signal '{}' is invalid. Expected 'raw', 'pq' or 'scrgb'.", value));
 }
 
 [[nodiscard]] inline float ToneMapNeutwo(float value) {
@@ -633,7 +660,9 @@ inline void EncodePreviewPixel(
     const std::optional<std::string>& name_prefix,
     PreviewMode preview_mode,
     std::string_view preview_mode_name,
-    bool prefer_clone) {
+    bool prefer_clone,
+    const std::optional<reshade::api::subresource_box>& region,
+    Signal signal) {
   AnalysisTarget target = {};
   try {
     target = ResolveAnalysisTarget(resource_view, device, prefer_clone);
@@ -682,8 +711,26 @@ inline void EncodePreviewPixel(
   const auto first_layer = target.resolved_view_desc.texture.first_layer;
   const auto levels = std::max<uint32_t>(target.resolved_resource_desc.texture.levels, 1u);
   const auto subresource = first_level + (first_layer * levels);
-  const auto width = std::max<uint32_t>(target.resolved_resource_desc.texture.width >> first_level, 1u);
-  const auto height = std::max<uint32_t>(target.resolved_resource_desc.texture.height >> first_level, 1u);
+  const auto texture_width = std::max<uint32_t>(target.resolved_resource_desc.texture.width >> first_level, 1u);
+  const auto texture_height = std::max<uint32_t>(target.resolved_resource_desc.texture.height >> first_level, 1u);
+  if (region.has_value() && (region->right > texture_width || region->bottom > texture_height)) {
+    const auto error = std::format(
+        "The region {}x{} at ({}, {}) does not fit the {}x{} texture.",
+        region->width(),
+        region->height(),
+        region->left,
+        region->top,
+        texture_width,
+        texture_height);
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+  // With a region, only that box is copied, so every statistic, preview and dump below describes the region.
+  const auto width = (region.has_value() ? region->width() : texture_width);
+  const auto height = (region.has_value() ? region->height() : texture_height);
   const auto intermediate_format = reshade::api::format_to_default_typed(target.resolved_resource_desc.texture.format, 0);
   const auto analysis_format = target.resolved_view_desc.format != reshade::api::format::unknown
                                    ? target.resolved_view_desc.format
@@ -711,7 +758,8 @@ inline void EncodePreviewPixel(
   }
 
   auto* cmd_list = queue->get_immediate_command_list();
-  cmd_list->copy_texture_region(target.resolved_resource, subresource, nullptr, intermediate, 0, nullptr);
+  const auto* source_box = (region.has_value() ? &region.value() : nullptr);
+  cmd_list->copy_texture_region(target.resolved_resource, subresource, source_box, intermediate, 0, nullptr);
   queue->flush_immediate_command_list();
   queue->wait_idle();
 
@@ -738,6 +786,19 @@ inline void EncodePreviewPixel(
     double luminance_min = std::numeric_limits<double>::infinity();
     double luminance_max = -std::numeric_limits<double>::infinity();
     double luminance_sum = 0.0;
+    // Display-light summary, filled only when a signal other than RAW is requested.
+    std::vector<float> nits_luminance_values;
+    if (signal != Signal::RAW) {
+      nits_luminance_values.reserve(static_cast<size_t>(width) * static_cast<size_t>(height));
+    }
+    double nits_luminance_min = std::numeric_limits<double>::infinity();
+    double nits_luminance_max = -std::numeric_limits<double>::infinity();
+    double nits_luminance_sum = 0.0;
+    double nits_max_channel_min = std::numeric_limits<double>::infinity();
+    double nits_max_channel_max = -std::numeric_limits<double>::infinity();
+    double nits_max_channel_sum = 0.0;
+    std::array<uint64_t, 4> nits_pixels_above = {};
+    constexpr std::array<double, 4> NITS_THRESHOLDS = {203.0, 400.0, 1000.0, 4000.0};
     uint32_t channel_count = 4u;
     uint64_t pixel_count = 0u;
     uint64_t finite_pixel_count = 0u;
@@ -851,6 +912,36 @@ inline void EncodePreviewPixel(
         luminance_min = std::min(luminance_min, luminance);
         luminance_max = std::max(luminance_max, luminance);
         luminance_sum += luminance;
+
+        if (signal == Signal::RAW) continue;
+
+        // PQ: decoded values are the ST 2084 encoding of BT.2020 light. scRGB: 1.0 = 80 nits, BT.709 primaries.
+        std::array<double, 3> nits = {};
+        double nits_luminance = 0.0;
+        if (signal == Signal::PQ) {
+          for (uint32_t channel = 0; channel < 3u; ++channel) {
+            const auto encoded_power = std::pow(std::clamp(static_cast<double>(rgba[channel]), 0.0, 1.0), 1.0 / 78.84375);
+            const auto linear_ratio = std::max(encoded_power - 0.8359375, 0.0) / (18.8515625 - (18.6875 * encoded_power));
+            nits[channel] = 10000.0 * std::pow(linear_ratio, 1.0 / 0.1593017578125);
+          }
+          nits_luminance = (0.2627002 * nits[0]) + (0.6779981 * nits[1]) + (0.0593017 * nits[2]);
+        } else {
+          for (uint32_t channel = 0; channel < 3u; ++channel) {
+            nits[channel] = 80.0 * rgba[channel];
+          }
+          nits_luminance = (0.2126 * nits[0]) + (0.7152 * nits[1]) + (0.0722 * nits[2]);
+        }
+        const auto nits_max_channel = std::max({nits[0], nits[1], nits[2]});
+        nits_luminance_values.push_back(static_cast<float>(nits_luminance));
+        nits_luminance_min = std::min(nits_luminance_min, nits_luminance);
+        nits_luminance_max = std::max(nits_luminance_max, nits_luminance);
+        nits_luminance_sum += nits_luminance;
+        nits_max_channel_min = std::min(nits_max_channel_min, nits_max_channel);
+        nits_max_channel_max = std::max(nits_max_channel_max, nits_max_channel);
+        nits_max_channel_sum += nits_max_channel;
+        for (size_t threshold_index = 0; threshold_index < NITS_THRESHOLDS.size(); ++threshold_index) {
+          nits_pixels_above[threshold_index] += (nits_luminance > NITS_THRESHOLDS[threshold_index] ? 1u : 0u);
+        }
       }
     }
 
@@ -1090,6 +1181,46 @@ inline void EncodePreviewPixel(
               },
           },
       };
+      if (region.has_value()) {
+        result["analysis"]["region"] = {
+            {"x", region->left},
+            {"y", region->top},
+            {"width", region->width()},
+            {"height", region->height()},
+            {"textureWidth", texture_width},
+            {"textureHeight", texture_height},
+            {"note", "Statistics, preview, dump and resourceIdentity describe this region only."},
+        };
+      }
+      if (signal != Signal::RAW) {
+        json percentiles = json::object();
+        if (!nits_luminance_values.empty()) {
+          constexpr std::array<std::pair<const char*, double>, 4> PERCENTILES = {{
+              {"p50", 0.50},
+              {"p90", 0.90},
+              {"p99", 0.99},
+              {"p99_9", 0.999},
+          }};
+          for (const auto& [name, fraction] : PERCENTILES) {
+            auto nth = nits_luminance_values.begin()
+                       + static_cast<std::ptrdiff_t>(fraction * static_cast<double>(nits_luminance_values.size() - 1u));
+            std::nth_element(nits_luminance_values.begin(), nth, nits_luminance_values.end());
+            percentiles[name] = *nth;
+          }
+        }
+        const auto nits_count = static_cast<std::uint64_t>(nits_luminance_values.size());
+        result["analysis"]["nits"] = {
+            {"signal", std::string(GetSignalName(signal))},
+            {"primaries", (signal == Signal::PQ ? "bt2020" : "bt709")},
+            {"luminance", ScalarStats(nits_luminance_min, nits_luminance_max, nits_luminance_sum, nits_count)},
+            {"luminancePercentiles", percentiles},
+            {"maxChannel", ScalarStats(nits_max_channel_min, nits_max_channel_max, nits_max_channel_sum, nits_count)},
+            {"pixelsLuminanceAbove203", RatioStats(nits_pixels_above[0], nits_count)},
+            {"pixelsLuminanceAbove400", RatioStats(nits_pixels_above[1], nits_count)},
+            {"pixelsLuminanceAbove1000", RatioStats(nits_pixels_above[2], nits_count)},
+            {"pixelsLuminanceAbove4000", RatioStats(nits_pixels_above[3], nits_count)},
+        };
+      }
       if (!output_json.is_null()) {
         if (output_format == OutputFormat::PNG) {
           result["preview"] = output_json;
@@ -1156,6 +1287,13 @@ inline void EncodePreviewPixel(
               pixels_any_above_one);
         }
       }
+      if (signal != Signal::RAW && !nits_luminance_values.empty()) {
+        text += std::format(
+            " Luminance ({}) max {:.1f} nits, mean {:.2f} nits.",
+            GetSignalName(signal),
+            result["analysis"]["nits"]["luminance"]["max"].get<double>(),
+            result["analysis"]["nits"]["luminance"]["mean"].get<double>());
+      }
       tool_result = ToolResult{
           .text = text,
           .structured_content = result,
@@ -1180,6 +1318,35 @@ inline void EncodePreviewPixel(
   const auto preview_mode_value = mcp_arguments::GetOptional<std::string>(arguments, "previewMode").value_or("clamped");
   const auto preview_mode = internal::ParsePreviewMode(preview_mode_value);
   const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
+  const auto signal = internal::ParseSignal(mcp_arguments::GetOptional<std::string>(arguments, "signal").value_or("raw"));
+  const std::array<std::optional<std::uint32_t>, 4> region_values = {
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionX"),
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionY"),
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionWidth"),
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "regionHeight"),
+  };
+  const auto region_value_count = std::ranges::count_if(region_values, [](const auto& value) { return value.has_value(); });
+  if (region_value_count != 0 && region_value_count != 4) {
+    throw std::runtime_error("regionX, regionY, regionWidth and regionHeight must be given together.");
+  }
+  std::optional<reshade::api::subresource_box> region = std::nullopt;
+  if (region_value_count == 4) {
+    if (*region_values[2] == 0u || *region_values[3] == 0u) {
+      throw std::runtime_error("regionWidth and regionHeight must be greater than 0.");
+    }
+    if (*region_values[2] > (std::numeric_limits<std::uint32_t>::max)() - *region_values[0]
+        || *region_values[3] > (std::numeric_limits<std::uint32_t>::max)() - *region_values[1]) {
+      throw std::runtime_error("The region is out of range.");
+    }
+    region = reshade::api::subresource_box{
+        .left = *region_values[0],
+        .top = *region_values[1],
+        .front = 0u,
+        .right = *region_values[0] + *region_values[2],
+        .bottom = *region_values[1] + *region_values[3],
+        .back = 1u,
+    };
+  }
 
   std::optional<std::filesystem::path> output_path = std::nullopt;
   if (!output_path_value.empty()) {
@@ -1203,6 +1370,8 @@ inline void EncodePreviewPixel(
   request->preview_mode = preview_mode;
   request->preview_mode_name = std::string(internal::GetPreviewModeName(preview_mode));
   request->prefer_clone = prefer_clone;
+  request->region = region;
+  request->signal = signal;
 
   if (!context.enqueue_request(device_index, request)) {
     const auto error = std::format("Failed to queue the resource analysis request for device #{}.", device_index);
@@ -1347,7 +1516,9 @@ inline void ProcessPendingRequests(
           request->name_prefix,
           request->preview_mode,
           request->preview_mode_name,
-          request->prefer_clone);
+          request->prefer_clone,
+          request->region,
+          request->signal);
     } catch (const std::exception& exception) {
       result = ToolResult{
           .text = exception.what(),

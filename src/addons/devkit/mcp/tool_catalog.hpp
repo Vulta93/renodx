@@ -225,7 +225,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_analyze_resource",
         {
             .title = "Analyze Resource",
-            .description = "Copy a tracked resource view, or its instantiated clone when requested, into a temporary readback texture, summarize its current contents, and optionally save a PNG preview or RGBA16F EXR dump.",
+            .description = "Copy a tracked resource view, or its instantiated clone when requested, into a temporary readback texture, summarize its current contents, and optionally save a PNG preview or RGBA16F EXR dump. Optionally restrict everything to a pixel region (regionX/regionY/regionWidth/regionHeight, all four together) and add a display-light summary in nits (signal 'pq' for HDR10 ST 2084 BT.2020 targets, 'scrgb' for linear 1.0 = 80 nits BT.709 targets) with luminance percentiles and shares above 203/400/1000/4000 nits.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
@@ -233,6 +233,11 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
                     {"outputPath", {.types = {"string"}}},
                     {"previewMode", {.types = {"string"}, .enum_values = {"clamped", "neutwo"}}},
                     {"preferClone", {.types = {"boolean"}}},
+                    {"regionX", {.types = {"integer"}, .minimum = 0}},
+                    {"regionY", {.types = {"integer"}, .minimum = 0}},
+                    {"regionWidth", {.types = {"integer"}, .minimum = 1}},
+                    {"regionHeight", {.types = {"integer"}, .minimum = 1}},
+                    {"signal", {.types = {"string"}, .enum_values = {"raw", "pq", "scrgb"}}},
                 },
                 .required = {"resourceViewHandle"},
             },
