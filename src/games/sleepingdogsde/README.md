@@ -19,7 +19,7 @@
 | Round trip | copy `0xFFEE7D7A` | The scene is copied to a second full-res RGBA8 target and back. |
 | Bloom | bright pass `0xB942D81A`, 8-bit chain | Decodes a 5-tap average of the scene. |
 | Tone map | `0x67843125` | Decode, bloom alpha factor `lerp(1, x, bloom.a)`, Hejl-Dawson curve on `x - 0.004`, white scale `Value0.y`, bloom screen blend, brightness `pow(Value0.w)`. Writes the RGBA8 target the UI draws on. |
-| Output | `0x7DF69EF0` | Adds `Value0.x` and writes the swap chain (unchanged). |
+| Output | `0x7DF69EF0` | Adds `Value0.x` (constant black-level trim, measured -0.025) and writes the swap chain. |
 
 ## What the mod does
 
@@ -33,11 +33,18 @@
 - **Hair `0x4D449B45`:** its Kajiya-Kay `sqrt(1 - d^2)` and `pow` produce NaN, which the 8-bit target wrote as 0. The
   output is saturated to emulate that clamp.
 - **Tone mapping (`0x67843125`):** ShortFuse's original structure. The tone mapper replaces only the filmic curve and
-  the vanilla post-steps still run on top. `ToneMapPass(untonemapped, vanilla curve)` uses the vanilla curve as the
-  graded reference (toe, contrast and hue stay vanilla). The bloom screen blend afterwards holds back the range above
+  the vanilla post-steps still run on top. `ToneMapPass(untonemapped, vanilla curve, neutral)` uses the vanilla curve as
+  the graded reference (toe, contrast and hue stay vanilla). The graded reference is already a full filmic curve, so the
+  neutral reference is the scene itself up to half of SDR white, then `ExponentialRollOff` towards white (luminance):
+  in the SDR range the bridge returns the vanilla image. The roll-off start 0.5 is a project decision (the vanilla
+  curve already compresses there by ~13%, which is kept as part of the look). The bloom screen blend afterwards holds back the range above
   white where the bloom is strong, which keeps fireworks and lamp halos soft. Peak Brightness is pre-compensated for the
   white scale and brightness steps (RenoDRT gamma correction off around the explicit 2.2 encode). RenoDRT white clip
   6.26 = decode cap 5 × mid grey scale 0.2254 / 0.18, the maximum where bloom alpha is 0.
+- **Output pass `0x7DF69EF0`:** the intermediate holds the scene scaled by Game / UI nits, so the game's black trim
+  `Value0.x` is added in vanilla's space (inverse intermediate pass, add, intermediate pass). Added directly, a higher UI
+  Brightness darkened the scene. UI pixels in the same target get the scene's treatment (they cannot be separated; the
+  difference is ~0.007 in gamma at UI 400 / Game 203).
 - **Tone Mapper:** Vanilla (original math and 8-bit clamp), None, RenoDRT (default). ACES through the same path crushed
   the shadows and was removed.
 
@@ -47,23 +54,29 @@
   stacked in encoded space and only look right merged into white; expanded they turn into thin, white, blocky outlines.
 - The vanilla curve as `neutral_sdr`: its toe clips below 0.004, so the reference lifted the shadows and divided
   near-black colours by ~0 (warped clothing).
+- RenoDRT's `NeutralSDR` as the neutral reference (`ToneMapPass(untonemapped, graded)`): it brightens the low end
+  relative to the scene, so `UpgradeToneMap` scaled the vanilla image down by scene / neutral (None and RenoDRT ~25-35%
+  darker than Vanilla in the low mid-tones, measured).
 - Rolling the input off at vanilla white: clean but capped highlights at ~300 nits.
 - The tone mapper alone (ShortFuse's ACES/RenoDRT on the raw scene): RenoDRT had no filmic toe and looked washed out.
 - PsychoV-17/30 (earlier branch): the limited scene range kept the response far below Peak Brightness.
 
 ## Known limitations / open
 
+- Measured (percentiles, Vanilla/None/RenoDRT at one spot): None matches Vanilla within ±4% up to the 80th percentile;
+  RenoDRT lifts the darkest pixels slightly (0.12 -> 0.17 nits at p40, its own toe) and both HDR modes read ~9% lower
+  at p90-p95 (not yet confirmed per pixel on a static frame).
 - Highlights are limited to what the game stores up to `x = 5`; fireworks and lamps reach ~750–1100 nits at Peak 1360.
-- UI Brightness slightly changes the scene brightness (suspect: the output pass adds `Value0.x` in gamma space after the
-  UI scaling; value not yet read).
-- Not yet verified with the Devkit: which other targets the copy shader activates in menus, map, phone, cutscenes and
-  loading screens; whether stacked hair layers exceed 1 in the float scratch target; bloom alpha statistics (with bloom.a > 0 the input
+- Not yet verified with the Devkit: which other targets the copy shader activates in menus, map, phone and loading
+  screens (cutscenes checked: only the scene and its copy); whether stacked hair layers exceed 1 in the float scratch target; bloom alpha statistics (with bloom.a > 0 the input
   can exceed the white clip 6.26, up to ~31, and maps flat to peak).
 - Not tested: exclusive fullscreen with Prevent Fullscreen on, Bink videos, menus over bright scenes, daytime sun.
 
 ## Manual verification
 
-1. ReShade.log: `Registered runtime replacement` for `0x67843125`, `0xb942d81a`, `0x4d449b45`.
+1. ReShade.log: `Registered runtime replacement` for `0x67843125`, `0xb942d81a`, `0x4d449b45`, `0x7df69ef0`.
 2. Night street with lamps and fireworks: no black cores, rings or blocky white sprites; soft golden glow.
-3. Tone Mapper Vanilla vs RenoDRT at the same spot: shadows and mid-tones match; only highlights extend.
+3. Tone Mapper Vanilla / None / RenoDRT at the same spot: shadows and mid-tones look the same (see measured deviations
+   above); only highlights extend.
 4. Characters' clothes and hair: no warped colours, no black or flickering pixels.
+5. UI Brightness 100 / 203 / 400: only the HUD changes, the scene stays the same.

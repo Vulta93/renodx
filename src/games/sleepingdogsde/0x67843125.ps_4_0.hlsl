@@ -49,10 +49,18 @@ void main(
     // The 2.2 encode and decode around ToneMapPass are explicit here, so RenoDRT must not raise its peak for a later
     // gamma correction (it overshot Peak Brightness by ~10%).
     draw_config.gamma_correction = 0.f;
+    float3 untonemapped_scaled = untonemapped * (0.2254f / 0.18f);
+    // The graded reference is already the game's full filmic curve, so the neutral reference must equal the scene in
+    // the SDR range (RenoDRT's NeutralSDR brightens the low end, and the bridge darkened the low mid-tones by ~35%):
+    // identity up to half of SDR white, then rolled off towards white (luminance, hue kept).
+    float scene_luminance = renodx::color::y::from::BT709(untonemapped_scaled);
+    float3 neutral_sdr = untonemapped_scaled
+                         * renodx::math::DivideSafe(renodx::tonemap::ExponentialRollOff(scene_luminance, 0.5f, 1.f), scene_luminance, 1.f);
     tonemapped_gamma = renodx::color::gamma::EncodeSafe(
         renodx::draw::ToneMapPass(
-            untonemapped * (0.2254f / 0.18f),
+            untonemapped_scaled,
             renodx::color::gamma::DecodeSafe(tonemapped_gamma, 2.2f),
+            neutral_sdr,
             draw_config),
         2.2f);
   }
