@@ -247,6 +247,32 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_watch_region",
+        {
+            .title = "Watch Region",
+            .description = "Measure a pixel region of a texture on the GPU before every command that writes it (draws with it as render target, compute dispatches with it as UAV, copies, render target and UAV clears, resolves, updates) and once at present, then report which writers changed the region and how. frames=1 returns a per-writer trace in command order (commandIndex is the ordinal among draws, dispatches and copies on the immediate context this frame; it is offset from devkit_list_draws indexes, so match snapshot draws by shader hash and relative order); frames>1 watches that many presents and aggregates per writer (shader hashes): executions, how often the region changed, min/mean/max of the region peak before and after, how often the peak was lowered or values went from above 1.0 to at most 1.0, and the most repeated after-peak (a ceiling). The region (regionX/regionY/regionWidth/regionHeight, all four together) defaults to the whole texture; signal 'pq' or 'scrgb' reports luminance in nits. shaderHash limits measuring to writers using that shader. includeUnchanged also lists writers that did not change the region (frames=1). D3D11 only; blocks until the watch completes.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"resourceViewHandle", MakeFlexibleHandleProperty()},
+                    {"preferClone", {.types = {"boolean"}}},
+                    {"regionX", {.types = {"integer"}, .minimum = 0}},
+                    {"regionY", {.types = {"integer"}, .minimum = 0}},
+                    {"regionWidth", {.types = {"integer"}, .minimum = 1}},
+                    {"regionHeight", {.types = {"integer"}, .minimum = 1}},
+                    {"signal", {.types = {"string"}, .enum_values = {"raw", "pq", "scrgb"}}},
+                    {"frames", {.types = {"integer"}, .minimum = 1, .maximum = 3600}},
+                    {"shaderHash", MakeFlexibleHandleProperty()},
+                    {"includeUnchanged", {.types = {"boolean"}}},
+                },
+                .required = {"resourceViewHandle"},
+            },
+            .annotations = {
+                .read_only_hint = true,
+            },
+        },
+    },
+    {
         "devkit_dump_resource_with_hash",
         {
             .title = "Dump Resource With Hash",

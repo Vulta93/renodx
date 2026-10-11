@@ -80,6 +80,7 @@ This keeps tool definitions readable without building large raw JSON blobs by ha
 | [`live_shaders.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/live_shaders.hpp) | Dump/load/unload live shader tool handlers. |
 | [`resource_analysis.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_analysis.hpp) | Resource readback, preview, EXR/PNG dump, and hash-named dump handlers. |
 | [`resource_clone.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_clone.hpp) | Clone hotswap toggle tool handler. |
+| [`watch_region.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/watch_region.hpp) | `devkit_watch_region`: GPU region statistics before every writer of a texture (D3D11), per-writer trace and aggregates. |
 | [`texture_replace.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/texture_replace.hpp) | Texture replacement rule, observation, dump, and enable-state tool handlers. |
 
 ## Runtime Flow

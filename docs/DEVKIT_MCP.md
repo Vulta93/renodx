@@ -58,6 +58,7 @@ The exact MCP schema can evolve, but the current workflow is built around these 
 ### Resource inspection
 
 - `devkit_analyze_resource`
+- `devkit_watch_region`
 - `devkit_dump_resource_with_hash`
 - `devkit_set_resource_clone`
 
@@ -251,6 +252,39 @@ The PNG is for quick visual inspection, not for HDR truth.
   BT.709) the result adds `analysis.nits`: luminance and max-channel stats in nits, luminance percentiles (p50/p90/p99/p99.9)
   and the share of pixels above 203/400/1000/4000 nits. Only use it on a resource that actually holds that encoding, such as
   the swap chain or an HDR10/scRGB output target.
+
+### Watching a region over time (`devkit_watch_region`, D3D11)
+
+`devkit_watch_region` answers "which draw changes this region of this buffer, and how?" without a snapshot or screenshots.
+The state of a texture after command N equals its state before the next command that writes it, so the devkit measures the
+region on the GPU before every command that writes the texture and once more at present. Writers are draws with the texture
+bound as a render target, dispatches with it bound as a compute UAV, and copies, render target and UAV clears, resolves and
+`UpdateSubresource` calls that target it. Each measurement copies the region into a scratch texture and reduces it with a small compute shader
+(`watch_region_reduce.cs_5_x.hlsl`) into a stats texture that is read back two frames later.
+
+Arguments: `resourceViewHandle` and `preferClone` (as for `devkit_analyze_resource`; the backing resource or its clone is
+watched), the optional region (`regionX`/`regionY`/`regionWidth`/`regionHeight`, default: whole texture), `signal`
+(`raw`/`pq`/`scrgb`), `frames` (default 1, max 3600), `shaderHash` (measure only writers using that shader) and
+`includeUnchanged` (also list writers that did not change the region, `frames: 1` only). The call blocks until done.
+
+- `frames: 1` returns `trace`: every writer that changed the region, in command order, with `commandIndex` (ordinal among the
+  frame's draws, dispatches and copies; offset from `devkit_list_draws` indexes, so match by shader hash and order), shader
+  hashes and region stats before and after (`maxLuminance`, `minLuminance`, `meanLuminance`, `maxChannel`, pixel counts above 1.0,
+  negative, non-finite, black, and above 203/400/1000/4000 nits with a signal).
+- Every call returns `writers`, aggregated per writer (kind + pixel/vertex/compute hash): executions, frames seen, how often the
+  region changed, min/mean/max of the region peak and mean before and after, how often the peak was lowered or raised, how often
+  values went from above 1.0 to at most 1.0, and `afterPeakMode` (the most repeated after-peak, a ceiling candidate).
+- Statistics are luminance (BT.709 weights on raw values, or nits for `pq`/`scrgb`); the GPU path computes no percentiles.
+
+Limits: D3D11 immediate context only (deferred contexts are skipped); 2D, non-MSAA textures in 8-bit, 10-bit, R11G11B10, 16-bit
+or 32-bit float formats; up to 1023 measured writers per frame (`truncatedFrames` reports frames that hit it). Each measured
+writer costs a region copy and a small dispatch, so use a region or `shaderHash` for long watches of busy buffers.
+
+- Only commands the game issues are hooked. Passes that add-ons draw through the ReShade API (for example a mod's swap chain
+  proxy pass at present) are invisible; their effect shows up only if it lands before the present-time measurement. When a mod
+  redirects the game's rendering into clones, watch the clone (`preferClone: true`).
+- Draws that write the texture through a pixel-shader UAV are not detected.
+- If the watched texture is destroyed during the watch (for example on resize), the watch stops and returns an error.
 
 ## 11. Current practical caveats
 
