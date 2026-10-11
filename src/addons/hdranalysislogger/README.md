@@ -34,9 +34,12 @@ BT.2020; SDR values are percent with R/G/B in BT.709.
 
 Position is either a square at the screen centre (default 16 px; aim the
 camera at the target in mouse-look games) or a drawn rectangle: open the
-ReShade overlay, click **Draw region**, then drag a rectangle around the light
-source in the game. A plain click places a square of the configured size
-around the clicked point; Esc cancels. The rectangle is stored as fractions of
+ReShade overlay, click **Draw region**, then either drag the existing cyan box
+onto the target (press inside it, move, release; its size is kept) or draw a
+new one: click one corner of the light source and then the opposite corner
+(press, drag and release also works). The overlay can be closed first so it doesn't cover the target: while
+drawing, game mouse/keyboard input is blocked and a cursor is shown until the
+rectangle is done. Esc cancels. The rectangle is stored as fractions of
 the screen, so it is screen-space: if the camera moves, the target can leave
 it. A cyan outline shows the region; it is drawn after effects, so it is
 never measured. Drawing it every frame keeps ReShade's GUI active while the
@@ -82,7 +85,10 @@ ReShade overlay → Add-ons → HDR Analysis Logger:
   for the copy.
 - Write continuous session log (default on).
 - Series label and duration (default 5 s), then **Record series** or the
-  series hotkey (default **Shift+F9**). A series samples every 100 ms.
+  series hotkey (default **Shift+F9**). A series samples every 100 ms. A
+  banner at the top of the screen shows the countdown while recording and
+  "Logging complete" with the file name for 5 s afterwards (also with the
+  overlay closed).
 - **Change hotkey** rebinds the series hotkey: press the new combination
   (Ctrl/Shift/Alt modifiers are captured), or Esc to cancel. Saved in
   `ReShade.ini` under `[HDRAnalysisLogger]`.

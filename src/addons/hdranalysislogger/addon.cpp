@@ -145,7 +145,10 @@ bool show_region_outline = true;
 
 bool capturing_hotkey = false;
 bool drawing_region = false;
+// While drawing: the first corner of a new rectangle, or (when moving) the
+// grab offset from the existing box's top-left corner to the mouse.
 std::optional<ImVec2> drag_start;
+std::optional<ImVec2> move_grab_offset;
 Readback analysis_readback;
 Readback region_readback;
 std::optional<Series> series;
@@ -157,6 +160,8 @@ uint32_t back_buffer_height = 0;
 bool sample_pending = false;
 std::optional<RegionBox> copied_region;
 std::string status = "Waiting for the first sample.";
+std::string completion_message;
+std::chrono::steady_clock::time_point completion_message_end_time;
 json latest_sample;
 
 std::filesystem::path GetOutputFolder() {
@@ -658,6 +663,8 @@ void OnReShadeFinishEffects(
           {"samples", series->samples},
       });
   status = std::format("Wrote {} ({} samples).", file_name, series->samples.size());
+  completion_message = std::format("Logging complete: {} ({} samples)", file_name, series->samples.size());
+  completion_message_end_time = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   renodx::utils::log::i("HDRAnalysisLogger: ", status);
   series.reset();
 }
@@ -667,59 +674,118 @@ void OnReShadeFinishEffects(
 // never part of a measurement.
 void OnReShadeOverlay(reshade::api::effect_runtime* runtime) {
   if (back_buffer_width == 0 || back_buffer_height == 0) return;
-  const auto& io = ImGui::GetIO();
+  auto& io = ImGui::GetIO();
   auto* draw_list = ImGui::GetForegroundDrawList(nullptr);
   const auto draw_outline = [draw_list](ImVec2 top_left, ImVec2 bottom_right, ImU32 colour) {
     draw_list->AddRect({top_left.x - 1.f, top_left.y - 1.f}, {bottom_right.x + 1.f, bottom_right.y + 1.f}, IM_COL32(0, 0, 0, 255));
     draw_list->AddRect(top_left, bottom_right, colour);
   };
 
+  // On-screen banner, so recording progress and completion are visible with
+  // the ReShade overlay closed. Drawn after effects, so it is never measured.
+  std::string banner;
+  if (drawing_region && move_grab_offset.has_value()) {
+    banner = "Draw region: release to place the box (Esc cancels)";
+  } else if (drawing_region && drag_start.has_value()) {
+    banner = "Draw region: release, or click the opposite corner (Esc cancels)";
+  } else if (drawing_region) {
+    banner = "Draw region: drag the cyan box to move it, or click one corner of a new box (Esc cancels)";
+  } else if (series.has_value()) {
+    const auto remaining = std::chrono::duration<float>(series->end_time - std::chrono::steady_clock::now()).count();
+    banner = std::format("Recording \"{}\"... {:.1f} s", series->label, std::max(remaining, 0.f));
+  } else if (std::chrono::steady_clock::now() < completion_message_end_time) {
+    banner = completion_message;
+  }
+  if (!banner.empty()) {
+    const auto text_size = ImGui::CalcTextSize(banner.c_str());
+    const ImVec2 text_position = {(io.DisplaySize.x - text_size.x) * 0.5f, io.DisplaySize.y * 0.05f};
+    draw_list->AddRectFilled(
+        {text_position.x - 8.f, text_position.y - 6.f},
+        {text_position.x + text_size.x + 8.f, text_position.y + text_size.y + 6.f},
+        IM_COL32(0, 0, 0, 200),
+        4.f);
+    draw_list->AddText(text_position, IM_COL32(255, 255, 255, 255), banner.c_str());
+  }
+
+  const auto box = ComputeRegionBox(back_buffer_width, back_buffer_height);
+  const auto scale_x = io.DisplaySize.x / back_buffer_width;
+  const auto scale_y = io.DisplaySize.y / back_buffer_height;
+  const ImVec2 box_top_left = {box.left * scale_x, box.top * scale_y};
+  const ImVec2 box_size = {box.width * scale_x, box.height * scale_y};
+
   if (drawing_region) {
-    const auto mouse = ImGui::GetMousePos();
-    if (runtime->is_key_pressed(VK_ESCAPE)) {
-      drawing_region = false;
-      drag_start.reset();
-    } else if (!drag_start.has_value() && ImGui::IsMouseClicked(ImGuiMouseButton_Left, false) && !io.WantCaptureMouse) {
-      drag_start = mouse;
-    } else if (drag_start.has_value() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-      const ImVec2 top_left = {std::min(drag_start->x, mouse.x), std::min(drag_start->y, mouse.y)};
-      const ImVec2 bottom_right = {std::max(drag_start->x, mouse.x), std::max(drag_start->y, mouse.y)};
-      draw_outline(top_left, bottom_right, IM_COL32(255, 255, 0, 255));
-      return;
-    } else if (drag_start.has_value()) {
-      // A click without a meaningful drag places a square of the configured
-      // size around the clicked point.
-      auto left = std::min(drag_start->x, mouse.x);
-      auto top = std::min(drag_start->y, mouse.y);
-      auto right = std::max(drag_start->x, mouse.x);
-      auto bottom = std::max(drag_start->y, mouse.y);
-      if (right - left < 3.f || bottom - top < 3.f) {
-        const auto half_size = static_cast<float>(region_size) * 0.5f;
-        left = mouse.x - half_size;
-        top = mouse.y - half_size;
-        right = mouse.x + half_size;
-        bottom = mouse.y + half_size;
-      }
+    // Lets the region be drawn with the ReShade overlay closed: the game stops
+    // receiving mouse and keyboard input (no camera movement, Esc doesn't reach
+    // it), can't re-centre the cursor, and ImGui draws a cursor.
+    runtime->block_input_next_frame();
+    ImGui::SetNextFrameWantCaptureMouse(true);
+    ImGui::SetNextFrameWantCaptureKeyboard(true);
+    io.MouseDrawCursor = true;
+
+    const auto commit_rect = [&](ImVec2 top_left, ImVec2 bottom_right) {
       region_rect = {
-          std::clamp(left / io.DisplaySize.x, 0.f, 1.f),
-          std::clamp(top / io.DisplaySize.y, 0.f, 1.f),
-          std::clamp(right / io.DisplaySize.x, 0.f, 1.f),
-          std::clamp(bottom / io.DisplaySize.y, 0.f, 1.f),
+          std::clamp(top_left.x / io.DisplaySize.x, 0.f, 1.f),
+          std::clamp(top_left.y / io.DisplaySize.y, 0.f, 1.f),
+          std::clamp(bottom_right.x / io.DisplaySize.x, 0.f, 1.f),
+          std::clamp(bottom_right.y / io.DisplaySize.y, 0.f, 1.f),
       };
       region_anchor = REGION_ANCHOR_DRAWN;
       drawing_region = false;
       drag_start.reset();
+      move_grab_offset.reset();
       SaveSettings(runtime);
+    };
+
+    const auto mouse = ImGui::GetMousePos();
+    if (runtime->is_key_pressed(VK_ESCAPE)) {
+      drawing_region = false;
+      drag_start.reset();
+      move_grab_offset.reset();
+    } else if (move_grab_offset.has_value()) {
+      // Moving keeps the box size and keeps it on screen.
+      const ImVec2 moved_top_left = {
+          std::clamp(mouse.x - move_grab_offset->x, 0.f, std::max(io.DisplaySize.x - box_size.x, 0.f)),
+          std::clamp(mouse.y - move_grab_offset->y, 0.f, std::max(io.DisplaySize.y - box_size.y, 0.f)),
+      };
+      const ImVec2 moved_bottom_right = {moved_top_left.x + box_size.x, moved_top_left.y + box_size.y};
+      if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        draw_outline(moved_top_left, moved_bottom_right, IM_COL32(255, 255, 0, 255));
+        return;
+      }
+      commit_rect(moved_top_left, moved_bottom_right);
+    } else if (!drag_start.has_value()) {
+      if (ImGui::IsMouseClicked(ImGuiMouseButton_Left, false) && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+        const bool inside_box = mouse.x >= box_top_left.x && mouse.x <= box_top_left.x + box_size.x
+                                && mouse.y >= box_top_left.y && mouse.y <= box_top_left.y + box_size.y;
+        if (inside_box) {
+          move_grab_offset = ImVec2(mouse.x - box_top_left.x, mouse.y - box_top_left.y);
+        } else {
+          drag_start = mouse;
+        }
+      }
+    } else {
+      // Two ways to finish a new box: release after dragging (press, drag,
+      // release), or a second click (click one corner, move, click the
+      // opposite corner).
+      const bool dragged = std::abs(mouse.x - drag_start->x) >= 3.f && std::abs(mouse.y - drag_start->y) >= 3.f;
+      const bool finished = (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && dragged)
+                            || ImGui::IsMouseClicked(ImGuiMouseButton_Left, false);
+      const ImVec2 top_left = {std::min(drag_start->x, mouse.x), std::min(drag_start->y, mouse.y)};
+      const ImVec2 bottom_right = {std::max(drag_start->x, mouse.x), std::max(drag_start->y, mouse.y)};
+      if (!finished) {
+        draw_outline(top_left, bottom_right, IM_COL32(255, 255, 0, 255));
+        return;
+      }
+      commit_rect(top_left, bottom_right);
     }
   }
 
   if (!show_region_outline && !drawing_region) return;
-  const auto box = ComputeRegionBox(back_buffer_width, back_buffer_height);
-  const auto scale_x = io.DisplaySize.x / back_buffer_width;
-  const auto scale_y = io.DisplaySize.y / back_buffer_height;
+  // Recomputed because a move or a new box may have been committed above.
+  const auto current_box = ComputeRegionBox(back_buffer_width, back_buffer_height);
   draw_outline(
-      {box.left * scale_x, box.top * scale_y},
-      {(box.left + box.width) * scale_x, (box.top + box.height) * scale_y},
+      {current_box.left * scale_x, current_box.top * scale_y},
+      {(current_box.left + current_box.width) * scale_x, (current_box.top + current_box.height) * scale_y},
       IM_COL32(0, 255, 255, 255));
 }
 
@@ -782,10 +848,12 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
   ImGui::Separator();
   ImGui::Text("Measurement region");
   settings_changed |= ImGui::Combo("Position", &region_anchor, "Screen centre\0Drawn rectangle\0", -1);
-  settings_changed |= ImGui::SliderInt("Square size (px)", &region_size, 1, 256);
+  settings_changed |= ImGui::SliderInt("Centre square size (px)", &region_size, 1, 256);
   settings_changed |= ImGui::Checkbox("Show outline", &show_region_outline);
   if (drawing_region) {
-    ImGui::TextWrapped("Drag a rectangle around the light source in the game, or click for a square (Esc cancels)...");
+    ImGui::TextWrapped("Drag the cyan box to move it, or click one corner of the light source and then the "
+                       "opposite corner to draw a new one (press, drag and release also works). Esc cancels. "
+                       "You can close the ReShade overlay first; game input stays blocked until you finish.");
   } else if (ImGui::Button("Draw region")) {
     drawing_region = true;
   }
