@@ -30,27 +30,31 @@
 - **Decode (`common.hlsl`):** the float scene keeps additive stacks above `y = 1`, where the vanilla decode returns
   black or inf (black firework cores, coloured rings). The decode saturates `y` first, so the HDR range is the vanilla
   one (up to `x = 5`), at float precision. Used by the tone mapper and the bloom bright pass.
+- **Hair copy `0xC7C6CCDF`:** copies the hair specular scratch into the light buffers; its input is saturated to emulate
+  vanilla's 8-bit scratch, which clamped the sum of the overlapping additive hair layers at 1 (whether the float sum
+  ever exceeds 1 was not measured; hair looks unchanged).
 - **Hair `0x4D449B45`:** its Kajiya-Kay `sqrt(1 - d^2)` and `pow` produce NaN, which the 8-bit target wrote as 0. The
   output is saturated to emulate that clamp.
 - **Tone mapping (`0x67843125`):** ShortFuse's original structure. The tone mapper replaces only the filmic curve and
-  the vanilla post-steps still run on top. `ToneMapPass(untonemapped, vanilla curve, neutral)` uses the vanilla curve as
-  the graded reference (toe, contrast and hue stay vanilla). The graded reference is already a full filmic curve, so the
-  neutral reference is the scene itself up to half of SDR white, then `ExponentialRollOff` towards white (luminance):
-  in the SDR range the bridge returns the vanilla image. The roll-off start 0.5 is a project decision (the vanilla
-  curve already compresses there by ~13%, which is kept as part of the look). The bloom screen blend afterwards holds back the range above
-  white where the bloom is strong, which keeps fireworks and lamp halos soft. Peak Brightness is pre-compensated for the
-  white scale and brightness steps (RenoDRT gamma correction off around the explicit 2.2 encode). RenoDRT white clip
-  6.26 = decode cap 5 × mid grey scale 0.2254 / 0.18, the maximum where bloom alpha is 0.
+  the vanilla post-steps still run on top. `ToneMapPass(untonemapped, vanilla curve, neutral)` uses the vanilla curve
+  as the graded reference (toe, contrast and hue stay vanilla). The graded reference is already a full filmic curve,
+  so the neutral reference is the scene itself up to half of SDR white, then `ExponentialRollOff` towards white
+  (luminance): in the SDR range the bridge returns the vanilla image. The roll-off start 0.5 is a project decision
+  (the vanilla curve already compresses there by ~13%, which is kept as part of the look). The bloom screen blend
+  afterwards holds back the range above white where the bloom is strong, which keeps fireworks and lamp halos soft.
+  Peak Brightness is pre-compensated for the white scale and brightness steps (RenoDRT gamma correction off around the
+  explicit 2.2 encode). RenoDRT white clip 6.26 = decode cap 5 × mid grey scale 0.2254 / 0.18, the maximum where bloom
+  alpha is 0.
 - **World-space icons `0xAD8E2B7C`** (NPC dialogue indicator): the shader writes the texture colour into the encoded
   scene without the encode, so white landed at lamp-core level and the pulse reached peak. In the HDR modes the colour
-  is scaled down (max channel) to `y = 0.82`, the scene value the HDR path outputs as SDR white, calibrated for RenoDRT at
-  default sliders and white scale ~0.87 (other Peak/Exposure/None or a changing white scale move it). Measured: ~203
-  nits like Vanilla, ~310-320 nits at the end of the pulse (cause unverified; HYPOTHESIS: bloom screen blend on top). Being scene
-  content in the game too, it follows Game Brightness, not UI Brightness (the scene alpha is already used, no marker).
+  is scaled down (max channel) to `y = 0.82`, the scene value the HDR path outputs as SDR white, calibrated for
+  RenoDRT at default sliders and white scale ~0.87 (other Peak/Exposure/None or a changing white scale move it).
+  Measured: ~203 nits like Vanilla, ~310-320 nits at the end of the pulse (see open items). Being scene content in the
+  game too, it follows Game Brightness, not UI Brightness (the scene alpha is already used, no marker).
 - **Output pass `0x7DF69EF0`:** the intermediate holds the scene scaled by Game / UI nits, so the game's black trim
-  `Value0.x` is added in vanilla's space (inverse intermediate pass, add, intermediate pass). Added directly, a higher UI
-  Brightness darkened the scene. UI pixels in the same target get the scene's treatment (they cannot be separated; the
-  difference is ~0.007 in gamma at UI 400 / Game 203).
+  `Value0.x` is added in vanilla's space (inverse intermediate pass, add, intermediate pass). Added directly, a higher
+  UI Brightness darkened the scene. UI pixels in the same target get the scene's treatment (they cannot be separated;
+  the difference is ~0.007 in gamma at UI 400 / Game 203).
 - **Tone Mapper:** Vanilla (original math and 8-bit clamp), None, RenoDRT (default). ACES through the same path crushed
   the shadows and was removed.
 
@@ -73,17 +77,21 @@
   RenoDRT lifts the darkest pixels slightly (0.12 -> 0.17 nits at p40, its own toe) and both HDR modes read ~9% lower
   at p90-p95 (not yet confirmed per pixel on a static frame).
 - Highlights are limited to what the game stores up to `x = 5`; fireworks and lamps reach ~750–1100 nits at Peak 1360.
-- Not yet verified with the Devkit: which other targets the copy shader activates in the map, phone and loading screens
-  (cutscenes and pause menu checked: only the scene, its copy and half-res targets); whether stacked hair layers exceed 1 in the float scratch target; bloom alpha statistics (with bloom.a > 0 the input
-  can exceed the white clip 6.26, up to ~31, and maps flat to peak).
+- Not yet verified with the Devkit: which other targets the copy shader activates in the map, phone and loading
+  screens (cutscenes and pause menu checked: only the scene, its copy and half-res targets).
+- RenoDRT white clip 6.26, checked with a debug overlay: y = 1 pixels with bloom.a > 0 (lamp cores, sparks; 0.05-0.1%
+  of the screen) and the dialogue indicator pulse exceed it and map flat to peak.
+- The dialogue indicator pulse is a second draw over the icon, not capped yet (~310-320 nits at its end).
 - Not tested: exclusive fullscreen with Prevent Fullscreen on, Bink videos, menus over bright scenes, daytime sun.
 
 ## Manual verification
 
-1. ReShade.log: `Registered runtime replacement` for `0x67843125`, `0xb942d81a`, `0x4d449b45`, `0x7df69ef0`, `0xad8e2b7c`.
+1. ReShade.log: `Registered runtime replacement` for `0x67843125`, `0xb942d81a`, `0x4d449b45`, `0x7df69ef0`,
+   `0xad8e2b7c`, `0xc7c6ccdf`.
 2. Night street with lamps and fireworks: no black cores, rings or blocky white sprites; soft golden glow.
 3. Tone Mapper Vanilla / None / RenoDRT at the same spot: shadows and mid-tones look the same (see measured deviations
    above); only highlights extend.
 4. Characters' clothes and hair: no warped colours, no black or flickering pixels.
 5. UI Brightness 100 / 203 / 400: only the HUD changes, the scene stays the same.
-6. NPC dialogue indicator (RenoDRT, default sliders): about the same brightness as Vanilla (~203 nits), no flash to peak.
+6. NPC dialogue indicator (RenoDRT, default sliders): about the same brightness as Vanilla (~203 nits), no flash to
+   peak.

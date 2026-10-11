@@ -116,6 +116,7 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
 // Brightest scene value where bloom.a = 0: decode cap x = 5 (y = 1) times the mid-grey scale 0.2254 / 0.18. With
 // bloom.a > 0 the vanilla factor lerp(1, x, bloom.a) raises it (up to ~31 at bloom.a = 1); above the clip it maps to peak.
+// Checked in game (debug overlay): y = 1 pixels with bloom.a > 0 (lamp cores, sparks; 0.05-0.1%) exceed it.
 #define RENODX_RENO_DRT_WHITE_CLIP             6.26f
 
 #include "../../shaders/renodx.hlsl"
