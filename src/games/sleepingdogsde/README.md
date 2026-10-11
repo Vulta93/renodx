@@ -41,6 +41,12 @@
   white where the bloom is strong, which keeps fireworks and lamp halos soft. Peak Brightness is pre-compensated for the
   white scale and brightness steps (RenoDRT gamma correction off around the explicit 2.2 encode). RenoDRT white clip
   6.26 = decode cap 5 × mid grey scale 0.2254 / 0.18, the maximum where bloom alpha is 0.
+- **World-space icons `0xAD8E2B7C`** (NPC dialogue indicator): the shader writes the texture colour into the encoded
+  scene without the encode, so white landed at lamp-core level and the pulse reached peak. In the HDR modes the colour
+  is scaled down (max channel) to `y = 0.82`, the scene value the HDR path outputs as SDR white, calibrated for RenoDRT at
+  default sliders and white scale ~0.87 (other Peak/Exposure/None or a changing white scale move it). Measured: ~203
+  nits like Vanilla, ~310-320 nits at the end of the pulse (cause unverified; HYPOTHESIS: bloom screen blend on top). Being scene
+  content in the game too, it follows Game Brightness, not UI Brightness (the scene alpha is already used, no marker).
 - **Output pass `0x7DF69EF0`:** the intermediate holds the scene scaled by Game / UI nits, so the game's black trim
   `Value0.x` is added in vanilla's space (inverse intermediate pass, add, intermediate pass). Added directly, a higher UI
   Brightness darkened the scene. UI pixels in the same target get the scene's treatment (they cannot be separated; the
@@ -67,16 +73,17 @@
   RenoDRT lifts the darkest pixels slightly (0.12 -> 0.17 nits at p40, its own toe) and both HDR modes read ~9% lower
   at p90-p95 (not yet confirmed per pixel on a static frame).
 - Highlights are limited to what the game stores up to `x = 5`; fireworks and lamps reach ~750–1100 nits at Peak 1360.
-- Not yet verified with the Devkit: which other targets the copy shader activates in menus, map, phone and loading
-  screens (cutscenes checked: only the scene and its copy); whether stacked hair layers exceed 1 in the float scratch target; bloom alpha statistics (with bloom.a > 0 the input
+- Not yet verified with the Devkit: which other targets the copy shader activates in the map, phone and loading screens
+  (cutscenes and pause menu checked: only the scene, its copy and half-res targets); whether stacked hair layers exceed 1 in the float scratch target; bloom alpha statistics (with bloom.a > 0 the input
   can exceed the white clip 6.26, up to ~31, and maps flat to peak).
 - Not tested: exclusive fullscreen with Prevent Fullscreen on, Bink videos, menus over bright scenes, daytime sun.
 
 ## Manual verification
 
-1. ReShade.log: `Registered runtime replacement` for `0x67843125`, `0xb942d81a`, `0x4d449b45`, `0x7df69ef0`.
+1. ReShade.log: `Registered runtime replacement` for `0x67843125`, `0xb942d81a`, `0x4d449b45`, `0x7df69ef0`, `0xad8e2b7c`.
 2. Night street with lamps and fireworks: no black cores, rings or blocky white sprites; soft golden glow.
 3. Tone Mapper Vanilla / None / RenoDRT at the same spot: shadows and mid-tones look the same (see measured deviations
    above); only highlights extend.
 4. Characters' clothes and hair: no warped colours, no black or flickering pixels.
 5. UI Brightness 100 / 203 / 400: only the HUD changes, the scene stays the same.
+6. NPC dialogue indicator (RenoDRT, default sliders): about the same brightness as Vanilla (~203 nits), no flash to peak.
