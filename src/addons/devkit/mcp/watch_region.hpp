@@ -32,6 +32,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -87,8 +88,18 @@ constexpr std::uint32_t MAX_COMPUTE_UAV_SLOTS = 8u;
 constexpr std::uint32_t DEFAULT_SCRATCH_BUDGET_MB = 512u;
 constexpr std::uint32_t MAX_SCRATCH_BUDGET_MB = 8192u;
 constexpr std::uint32_t MAX_SCRATCH_ENTRIES = 4096u;
+// D3D12/Vulkan scratch textures created when a watch starts; the pool then grows at frame ends as needed.
+constexpr std::uint32_t INITIAL_SCRATCH_ENTRIES = 16u;
 // D3D12/Vulkan: extra frames a watch may run to measure the state after the last writer of its last frame.
 constexpr std::uint32_t MAX_CLOSING_FRAMES = 4u;
+constexpr auto LOCK_WAIT_REPORT_TIME = std::chrono::seconds(2);
+// D3D12: a game submission of a region copy gets its lifetime fence value only after this many frame ends and this much
+// time since its execute_command_list event (see GpuSubmission).
+constexpr std::uint64_t SUBMISSION_FENCE_MIN_FRAME_ENDS = 2u;
+constexpr auto SUBMISSION_FENCE_MIN_DELAY = std::chrono::milliseconds(100);
+// D3D12/Vulkan: every CPU wait for the GPU in the watch (lifetime fences at the end of a watch and when a queue or the
+// device is destroyed, the stats readback fence) and the wait for a frame end's signals in flight on a destroyed queue.
+constexpr auto LIFETIME_FENCE_WAIT_TIMEOUT = std::chrono::seconds(2);
 // Descriptor table ranges are scanned up to this many descriptors when looking for the watched texture as a UAV.
 constexpr std::uint32_t MAX_SCANNED_TABLE_DESCRIPTORS = 256u;
 constexpr std::size_t MAX_RENDER_PASS_MEMBERS = 64u;
@@ -146,6 +157,10 @@ enum class UnmeasuredReason : std::uint8_t {
   UNTRACKED_COMMAND_LIST = 7,
   BUNDLE = 8,
   NO_LATER_MEASUREMENT = 9,
+  SCRATCH_POOL_EMPTY = 10,
+  // A dispatch that can reach the texture only through a bound descriptor table: bindless engines keep most
+  // textures in one table, so this does not prove a write, and the texture's state is unknown.
+  DESCRIPTOR_TABLE = 11,
 };
 
 struct Request {
@@ -196,6 +211,8 @@ struct Record {
   std::optional<std::uint32_t> measurement = std::nullopt;
   // Why no measurement was taken before this writer.
   UnmeasuredReason reason = UnmeasuredReason::NONE;
+  // D3D12/Vulkan: the watched image the record is about (one of the swap chain's images when the watch follows it).
+  std::uint64_t image = 0u;
 };
 
 // What a copy, clear, resolve or update writes. `subresource` is nullopt when every subresource is written
@@ -229,12 +246,14 @@ struct Point {
   UnmeasuredReason refused = UnmeasuredReason::NONE;
   std::optional<RegionStats> stats = std::nullopt;
   bool decoded = false;
+  std::uint64_t image = 0u;
 };
 
 // A writer and the measurements around it: the state before it and before the next writer (or the end of the frame).
 struct Event {
   WriterInfo writer;
   std::uint32_t frame_index = 0u;
+  std::uint64_t image = 0u;
   std::optional<std::uint64_t> before_point = std::nullopt;
   UnmeasuredReason before_reason = UnmeasuredReason::NONE;
   bool after_resolved = false;
@@ -288,15 +307,33 @@ struct WriterAggregate {
   std::map<std::int64_t, std::uint64_t> after_peak_buckets;
 };
 
+// D3D12: one execution of a game command list that copies into a scratch texture. D3D12 lets the game reset a command
+// list while the GPU still runs it, so the reset does not end the texture's use: it ends when the GPU passes
+// `fence_value` on the lifetime fence of `queue`. ReShade raises execute_command_list before the real
+// ExecuteCommandLists and outside any lock an add-on can take, so a fence signalled right away could land before the
+// game's work. The value is attached only after SUBMISSION_FENCE_MIN_FRAME_ENDS frame ends and
+// SUBMISSION_FENCE_MIN_DELAY, assuming the game's ExecuteCommandLists call has returned by then (stated in the design
+// doc).
+struct GpuSubmission {
+  // Null once the queue was destroyed: its destroy event then waits for the queue and removes the submissions marked
+  // with its `destroyed_queue_wait`; any left after that wait failed are kept until the device is destroyed.
+  reshade::api::command_queue* queue = nullptr;
+  std::uint64_t frame_end_index = 0u;
+  std::chrono::steady_clock::time_point executed_at = {};
+  std::optional<std::uint64_t> fence_value = std::nullopt;
+  std::uint64_t destroyed_queue_wait = 0u;
+};
+
 // D3D12/Vulkan: a region-sized texture that receives one measurement copy inside a game command list. It belongs to
 // that command list until the list is reset or destroyed, because a list may be executed again without being
-// re-recorded and would copy into it again.
+// re-recorded and would copy into it again. On D3D12 it is reused only once the GPU also passed every submission.
 struct ScratchEntry {
   reshade::api::resource texture = {0u};
   std::uint64_t owner_list = 0u;
   bool in_use = false;
   bool awaiting_reduction = false;
   bool release_after_reduction = false;
+  std::vector<GpuSubmission> submissions;
 };
 
 // D3D12/Vulkan: what the watch knows about one command list.
@@ -357,6 +394,9 @@ struct Session {
   // With preferClone, copies/clears/resolves/updates may name the original texture while the game's draws write the
   // clone; non-draw writers naming either one are measured.
   reshade::api::resource original_resource = {0u};
+  // D3D12/Vulkan watch on a swap-chain image: every image of that swap chain, so the watch follows the current back
+  // buffer (the game may render each frame into any of them, in any order). Empty otherwise.
+  std::vector<std::uint64_t> swap_chain_images;
   // Device-level update events carry no command list; on D3D11 they always come from the immediate context.
   reshade::api::command_list* immediate_cmd_list = nullptr;
   std::uint32_t subresource = 0u;
@@ -381,6 +421,9 @@ struct Session {
   VulkanCmdPipelineBarrier vulkan_cmd_pipeline_barrier = nullptr;
   std::vector<ScratchEntry> scratch_entries;
   std::uint32_t max_scratch_entries = 0u;
+  // Hook reservations that found no free scratch texture since the last frame end; the frame end grows the pool by
+  // this many (within the budget).
+  std::uint32_t scratch_pool_misses = 0u;
   std::uint32_t scratch_budget_mb = DEFAULT_SCRATCH_BUDGET_MB;
   std::unordered_map<std::uint64_t, ListState> lists;
   reshade::api::fence fence = {0u};
@@ -447,11 +490,36 @@ struct Session {
   std::vector<std::uint32_t> frames_with_unmeasured_writers;
 };
 
-// A D3D12/Vulkan scratch texture still referenced by a command list recorded during a finished watch. It is destroyed
-// when that list is reset or destroyed (the game guarantees the GPU is done with the list by then) or with the device.
+// A D3D12/Vulkan scratch texture of a finished watch that a command list may still copy into (`owner_list`, 0 once
+// that list was reset or destroyed) or that the GPU may still be writing (D3D12 `submissions`). It is destroyed when
+// both are over (Vulkan: at the reset, which the game may only do once the GPU is done) or with the device.
 struct RetiredScratch {
   reshade::api::resource texture = {0u};
   std::uint64_t owner_list = 0u;
+  std::vector<GpuSubmission> submissions;
+};
+
+// D3D12: the lifetime fence of one game queue. It is signalled with the native ID3D12CommandQueue::Signal, not ReShade's
+// command_queue::signal, which also flushes that queue's immediate command list without the queue's lock and would race
+// with the game thread submitting to it. Fences are created only at frame ends, on the presenting thread.
+struct QueueLifetimeFence {
+  reshade::api::fence fence = {0u};
+  std::uint64_t last_value = 0u;
+  // Native signals issued after releasing the watcher lock and not finished yet; the queue's destroy event waits for
+  // them before the queue goes away.
+  std::uint32_t signals_in_flight = 0u;
+};
+
+// D3D12/Vulkan: a region copy reserved under the watcher lock and recorded after releasing it, because recording calls
+// into the driver, which can call back into the game (for example its allocation callbacks), and the game may then
+// wait for one of its threads that is waiting for the watcher lock. The scratch texture already exists and stays alive
+// until the command list is reset, even if the watch ends meanwhile (the frame end then retires it to that list); the
+// session reference keeps the fixed watch settings the copy reads.
+struct PendingCopy {
+  std::shared_ptr<Session> session;
+  reshade::api::resource texture = {0u};
+  std::uint64_t image = 0u;
+  reshade::api::resource_usage state = reshade::api::resource_usage::undefined;
 };
 
 // The watcher is owned by the per-device data. `watched_resource_handle` is a lock-free gate (0 = no watch running), so
@@ -460,9 +528,74 @@ struct Watcher {
   std::shared_mutex mutex;
   std::atomic<std::uint64_t> watched_resource_handle = 0u;
   std::atomic<bool> has_retired_scratch = false;
-  std::unique_ptr<Session> session;
+  // Set while a session is installed, also after the watched texture was destroyed (the gate above is 0 then): its
+  // D3D12 scratch textures still need their submissions recorded.
+  std::atomic<bool> has_session = false;
+  // Shared with hooks that record a region copy after releasing the lock, so the session outlives them.
+  std::shared_ptr<Session> session;
   std::deque<std::shared_ptr<Request>> pending_requests;
   std::vector<RetiredScratch> retired_scratch;
+  // D3D12: lifetime fences by queue handle, and the number of frame ends so far (see GpuSubmission).
+  std::unordered_map<std::uint64_t, QueueLifetimeFence> queue_fences;
+  std::uint64_t frame_end_index = 0u;
+  std::uint64_t destroyed_queue_waits = 0u;
+  // Fences of destroyed queues, destroyed with the device: one whose wait timed out may still be signalled by the GPU.
+  std::vector<reshade::api::fence> orphan_fences;
+  // Lock diagnostics: the thread holding `mutex` and what it is doing (see WatcherLock).
+  std::atomic<std::uint32_t> owner_thread_id = 0u;
+  std::atomic<const char*> owner_step = nullptr;
+};
+
+// Holds `watcher->mutex` and records the owner's thread and step. A wait longer than LOCK_WAIT_REPORT_TIME is logged once
+// with the owner's thread and step (the waiting thread itself as owner means the lock was re-entered), then the wait
+// continues.
+class WatcherLock {
+ public:
+  WatcherLock(Watcher* watcher, const char* step) : watcher_(watcher) {
+    if (!watcher->mutex.try_lock()) {
+      const auto start = std::chrono::steady_clock::now();
+      bool reported = false;
+      while (!watcher->mutex.try_lock()) {
+        if (!reported && std::chrono::steady_clock::now() - start > LOCK_WAIT_REPORT_TIME) {
+          reported = true;
+          const auto owner_thread_id = watcher->owner_thread_id.load(std::memory_order_relaxed);
+          const auto* owner_step = watcher->owner_step.load(std::memory_order_relaxed);
+          reshade::log::message(
+              reshade::log::level::warning,
+              std::format(
+                  "devkit::watch_region(lock wait over 2 s: thread {} in {} waits for thread {} in {}{})",
+                  GetCurrentThreadId(),
+                  step,
+                  owner_thread_id,
+                  (owner_step != nullptr ? owner_step : "unknown"),
+                  (owner_thread_id == GetCurrentThreadId() ? ", re-entered on the same thread" : ""))
+                  .c_str());
+        }
+        std::this_thread::yield();
+      }
+    }
+    SetStep(step);
+  }
+  ~WatcherLock() { Unlock(); }
+  WatcherLock(const WatcherLock&) = delete;
+  WatcherLock& operator=(const WatcherLock&) = delete;
+
+  void SetStep(const char* step) {
+    watcher_->owner_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    watcher_->owner_step.store(step, std::memory_order_relaxed);
+  }
+
+  // Releases the lock before the end of the scope, so the caller can call into ReShade or the driver.
+  void Unlock() {
+    if (watcher_ == nullptr) return;
+    watcher_->owner_thread_id.store(0u, std::memory_order_relaxed);
+    watcher_->owner_step.store(nullptr, std::memory_order_relaxed);
+    watcher_->mutex.unlock();
+    watcher_ = nullptr;
+  }
+
+ private:
+  Watcher* watcher_;
 };
 
 namespace internal {
@@ -470,6 +603,75 @@ namespace internal {
 // Set while the watch issues its own native Vulkan barrier: ReShade reports it as a barrier event on this thread while
 // the watcher lock is held.
 static thread_local bool issuing_native_commands = false;
+
+// D3D12: calls `visit` on the submissions of every scratch texture the watcher knows: the running watch's and the
+// retired ones. Under the watcher lock.
+template <typename Visitor>
+inline void ForEachSubmissionList(Watcher* watcher, Visitor&& visit) {
+  if (watcher->session != nullptr) {
+    for (auto& entry : watcher->session->scratch_entries) {
+      visit(entry.submissions);
+    }
+  }
+  for (auto& retired : watcher->retired_scratch) {
+    visit(retired.submissions);
+  }
+}
+
+// D3D12: adds one execution of a command list to a texture's submissions. A newer execution on the same queue replaces
+// an older one that has no fence value yet: the value attached later also covers the older work on that queue.
+inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubmission& submission) {
+  for (auto& existing : *submissions) {
+    if (existing.queue == submission.queue && !existing.fence_value.has_value()) {
+      existing = submission;
+      return;
+    }
+  }
+  submissions->push_back(submission);
+}
+
+// D3D12: whether the GPU passed every submission, judged from completed fence values read without the lock (by queue
+// handle). A submission without a fence value, or of a destroyed queue, is not complete.
+[[nodiscard]] inline bool AreSubmissionsComplete(
+    const std::vector<GpuSubmission>& submissions,
+    const std::unordered_map<std::uint64_t, std::uint64_t>& completed_values) {
+  return std::ranges::all_of(submissions, [&](const GpuSubmission& submission) {
+    if (submission.queue == nullptr || !submission.fence_value.has_value()) return false;
+    const auto pair = completed_values.find(reinterpret_cast<std::uint64_t>(submission.queue));
+    return pair != completed_values.end() && pair->second >= submission.fence_value.value();
+  });
+}
+
+[[nodiscard]] inline bool IsD3D12DeviceRemoved(reshade::api::device* device) {
+  auto* native_device = reinterpret_cast<ID3D12Device*>(static_cast<std::uintptr_t>(device->get_native()));
+  return FAILED(native_device->GetDeviceRemovedReason());
+}
+
+// D3D12: the native signal (see QueueLifetimeFence for why not ReShade's). Safe from any thread: D3D12 queues are
+// free-threaded.
+[[nodiscard]] inline bool SignalQueueNative(
+    reshade::api::command_queue* queue,
+    reshade::api::fence fence,
+    std::uint64_t value) {
+  auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(static_cast<std::uintptr_t>(queue->get_native()));
+  auto* native_fence = reinterpret_cast<ID3D12Fence*>(static_cast<std::uintptr_t>(fence.handle));
+  return SUCCEEDED(native_queue->Signal(native_fence, value));
+}
+
+// D3D12, without the lock: waits up to LIFETIME_FENCE_WAIT_TIMEOUT for each fence; false if any wait failed and the
+// device was not removed (after a removal the GPU writes nothing any more).
+[[nodiscard]] inline bool WaitForFences(
+    reshade::api::device* device,
+    std::span<const std::pair<reshade::api::fence, std::uint64_t>> fences) {
+  const auto timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(LIFETIME_FENCE_WAIT_TIMEOUT).count();
+  bool all_reached = true;
+  for (const auto& [fence, value] : fences) {
+    if (!device->wait(fence, value, timeout_ns)) {
+      all_reached = false;
+    }
+  }
+  return all_reached || IsD3D12DeviceRemoved(device);
+}
 
 [[nodiscard]] inline std::string_view GetWriterKindName(WriterKind kind) {
   switch (kind) {
@@ -503,21 +705,34 @@ static thread_local bool issuing_native_commands = false;
   return api == reshade::api::device_api::d3d12 || api == reshade::api::device_api::vulkan;
 }
 
-// True when the view (render target, UAV, attachment) includes the watched mip level and array layer.
-[[nodiscard]] inline bool ViewCoversWatchedSubresource(
+// The watched image a resource stands for, or 0: the watched texture, any image of the followed swap chain, or the
+// original of a watched clone (which stands for the clone).
+[[nodiscard]] inline std::uint64_t GetWatchedImage(const Session& session, std::uint64_t handle) {
+  if (handle == 0u) return 0u;
+  if (handle == session.watched_resource.handle || handle == session.original_resource.handle) return session.watched_resource.handle;
+  return (std::ranges::find(session.swap_chain_images, handle) != session.swap_chain_images.end() ? handle : 0u);
+}
+
+// The watched image a view (render target, UAV, attachment) writes, when it includes the watched mip level and array
+// layer; 0 otherwise.
+[[nodiscard]] inline std::uint64_t GetWatchedImageOfView(
     const Session& session,
     reshade::api::device* device,
     reshade::api::resource_view view) {
-  if (view.handle == 0u) return false;
-  const auto resource = device->get_resource_from_view(view);
-  if (resource.handle != session.watched_resource.handle && resource.handle != session.original_resource.handle) return false;
+  if (view.handle == 0u) return 0u;
+  const auto image = GetWatchedImage(session, device->get_resource_from_view(view).handle);
+  if (image == 0u) return 0u;
   const auto view_desc = device->get_resource_view_desc(view);
   const auto& texture = view_desc.texture;
+  // ReShade's D3D11/D3D12 view descriptions leave the count at 0 for non-array dimensions (a D3D12 Texture2D RTV,
+  // DSV or UAV has layer_count 0): such a view covers exactly one level and one layer.
+  const auto level_count = (texture.level_count == 0u ? 1u : texture.level_count);
+  const auto layer_count = (texture.layer_count == 0u ? 1u : texture.layer_count);
   const auto covers_level = session.mip_level >= texture.first_level
-                            && (texture.level_count == UINT32_MAX || session.mip_level < texture.first_level + texture.level_count);
+                            && (level_count == UINT32_MAX || session.mip_level < texture.first_level + level_count);
   const auto covers_layer = session.array_layer >= texture.first_layer
-                            && (texture.layer_count == UINT32_MAX || session.array_layer < texture.first_layer + texture.layer_count);
-  return covers_level && covers_layer;
+                            && (layer_count == UINT32_MAX || session.array_layer < texture.first_layer + layer_count);
+  return (covers_level && covers_layer ? image : 0u);
 }
 
 [[nodiscard]] inline bool MatchesFilter(const Session& session, const WriterInfo& writer) {
@@ -529,44 +744,72 @@ static thread_local bool issuing_native_commands = false;
   });
 }
 
-// D3D12/Vulkan: copies the region, which is in `state` right now, into a free scratch entry owned by `owner_list`
-// (0 = owned by the frame end). Returns the entry, or why no copy was taken.
-[[nodiscard]] inline std::pair<std::optional<std::uint32_t>, UnmeasuredReason> CopyRegionToScratch(
+// D3D12/Vulkan, under the watcher lock: reserves a free scratch entry for `owner_list` (0 = owned by the frame end).
+// Hooks only take entries that already have a texture: creating an image inside the game's own command recording
+// calls into the driver and the game's allocation callbacks from a context the game does not expect (a deadlock
+// inside DOOM 2016's allocator). The frame end (`allow_new`) may add an entry without a texture and create it on the
+// presenting thread. Returns the entry, or nullopt with SCRATCH_BUDGET (pool at the budget) or SCRATCH_POOL_EMPTY
+// (all textures in use; the pool grows at the next frame end).
+[[nodiscard]] inline std::pair<std::optional<std::uint32_t>, UnmeasuredReason> ReserveScratchEntry(
     Session* session,
-    reshade::api::command_list* cmd_list,
     std::uint64_t owner_list,
-    reshade::api::resource_usage state) {
-  auto* device = cmd_list->get_device();
+    bool allow_new) {
   std::optional<std::uint32_t> entry_index = std::nullopt;
   for (std::uint32_t index = 0u; index < session->scratch_entries.size(); ++index) {
-    if (!session->scratch_entries[index].in_use) {
+    const auto& candidate = session->scratch_entries[index];
+    if (!candidate.in_use && (allow_new || candidate.texture.handle != 0u)) {
       entry_index = index;
       break;
     }
   }
   if (!entry_index.has_value()) {
     if (session->scratch_entries.size() >= session->max_scratch_entries) return {std::nullopt, UnmeasuredReason::SCRATCH_BUDGET};
-    reshade::api::resource texture = {0u};
-    if (!device->create_resource(
-            reshade::api::resource_desc(session->width, session->height, 1, 1, session->scratch_format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source),
-            nullptr,
-            reshade::api::resource_usage::copy_dest,
-            &texture)) {
-      return {std::nullopt, UnmeasuredReason::SCRATCH_BUDGET};
+    if (!allow_new) {
+      ++session->scratch_pool_misses;
+      return {std::nullopt, UnmeasuredReason::SCRATCH_POOL_EMPTY};
     }
-    session->scratch_entries.push_back(ScratchEntry{.texture = texture});
+    session->scratch_entries.emplace_back();
     entry_index = static_cast<std::uint32_t>(session->scratch_entries.size() - 1u);
   }
+  auto& entry = session->scratch_entries[entry_index.value()];
+  entry.in_use = true;
+  entry.owner_list = owner_list;
+  entry.awaiting_reduction = false;
+  entry.release_after_reduction = false;
+  return {entry_index, UnmeasuredReason::NONE};
+}
 
+// D3D12/Vulkan, outside the watcher lock and only on the presenting thread: a scratch texture for one region copy ({0}
+// on failure).
+[[nodiscard]] inline reshade::api::resource CreateScratchTexture(reshade::api::device* device, const Session& session) {
+  reshade::api::resource texture = {0u};
+  if (!device->create_resource(
+          reshade::api::resource_desc(session.width, session.height, 1, 1, session.scratch_format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source),
+          nullptr,
+          reshade::api::resource_usage::copy_dest,
+          &texture)) {
+    return {0u};
+  }
+  return texture;
+}
+
+// D3D12/Vulkan, outside the watcher lock: records the copy of the region of `image`, which is in `state` right now,
+// into `texture`. Reads only session fields that are fixed for the whole watch.
+inline void RecordRegionCopy(
+    const Session& session,
+    reshade::api::command_list* cmd_list,
+    std::uint64_t image,
+    reshade::api::resource texture,
+    reshade::api::resource_usage state) {
   // Transitions only the watched subresource. ReShade's barrier() transitions every subresource, which would corrupt
   // the state of the other slices or mips of an array texture, so textures with more than one subresource use the
   // native barrier on D3D12 and Vulkan.
   const auto transition_watched_subresource = [&](reshade::api::resource_usage old_state, reshade::api::resource_usage new_state) {
-    if (session->single_subresource) {
-      cmd_list->barrier(session->watched_resource, old_state, new_state);
+    if (session.single_subresource) {
+      cmd_list->barrier(reshade::api::resource{image}, old_state, new_state);
       return;
     }
-    if (session->device_api == reshade::api::device_api::d3d12) {
+    if (session.device_api == reshade::api::device_api::d3d12) {
       // Same conversion as ReShade's convert_usage_to_resource_states for the colour states used here.
       const auto to_d3d12_state = [](reshade::api::resource_usage usage) {
         if (usage == reshade::api::resource_usage::present) return D3D12_RESOURCE_STATE_PRESENT;
@@ -577,8 +820,8 @@ static thread_local bool issuing_native_commands = false;
           .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
           .Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
           .Transition = {
-              .pResource = reinterpret_cast<ID3D12Resource*>(static_cast<std::uintptr_t>(session->watched_resource.handle)),
-              .Subresource = session->subresource,
+              .pResource = reinterpret_cast<ID3D12Resource*>(static_cast<std::uintptr_t>(image)),
+              .Subresource = session.subresource,
               .StateBefore = to_d3d12_state(old_state),
               .StateAfter = to_d3d12_state(new_state),
           },
@@ -612,17 +855,17 @@ static thread_local bool issuing_native_commands = false;
         .dst_access_mask = MEMORY_READ_AND_WRITE_ACCESS,
         .old_layout = to_vulkan_layout(old_state),
         .new_layout = to_vulkan_layout(new_state),
-        .image = session->watched_resource.handle,
+        .image = image,
         .subresource_range = {
             .aspect_mask = 1u,  // VK_IMAGE_ASPECT_COLOR_BIT
-            .base_mip_level = session->mip_level,
+            .base_mip_level = session.mip_level,
             .level_count = 1u,
-            .base_array_layer = session->array_layer,
+            .base_array_layer = session.array_layer,
             .layer_count = 1u,
         },
     };
     issuing_native_commands = true;
-    session->vulkan_cmd_pipeline_barrier(
+    session.vulkan_cmd_pipeline_barrier(
         reinterpret_cast<void*>(static_cast<std::uintptr_t>(cmd_list->get_native())),
         ALL_COMMANDS_STAGE,
         ALL_COMMANDS_STAGE,
@@ -636,16 +879,9 @@ static thread_local bool issuing_native_commands = false;
     issuing_native_commands = false;
   };
 
-  auto& entry = session->scratch_entries[entry_index.value()];
-  entry.in_use = true;
-  entry.owner_list = owner_list;
-  entry.awaiting_reduction = false;
-  entry.release_after_reduction = false;
-
   transition_watched_subresource(state, reshade::api::resource_usage::copy_source);
-  cmd_list->copy_texture_region(session->watched_resource, session->subresource, &session->region, entry.texture, 0u, nullptr);
+  cmd_list->copy_texture_region(reshade::api::resource{image}, session.subresource, &session.region, texture, 0u, nullptr);
   transition_watched_subresource(reshade::api::resource_usage::copy_source, state);
-  return {entry_index, UnmeasuredReason::NONE};
 }
 
 [[nodiscard]] inline Point* FindPoint(Session* session, std::uint64_t point_id) {
@@ -655,13 +891,14 @@ static thread_local bool issuing_native_commands = false;
 
 // Commits one record in submission order: a measurement closes the open event (it is the state after that writer) and
 // a writer that matches the filter opens a new event. `refused` drops the record's measurement (for example a command
-// list executed on another queue); its writer is still accounted for.
+// list executed on another queue); its writer is still accounted for. Before and after are only taken from the same
+// image (a followed swap chain has several).
 inline void Commit(Session* session, const Record& record, UnmeasuredReason refused) {
   std::optional<std::uint64_t> point_id = std::nullopt;
   auto unmeasured_reason = record.reason;
   if (record.measurement.has_value() && refused == UnmeasuredReason::NONE) {
     point_id = session->points_base + session->points.size();
-    auto point = Point{.frame_index = session->frames_recorded};
+    auto point = Point{.frame_index = session->frames_recorded, .image = record.image};
     if (session->explicit_api) {
       point.scratch_entry = record.measurement;
       session->scratch_entries[record.measurement.value()].awaiting_reduction = true;
@@ -681,9 +918,14 @@ inline void Commit(Session* session, const Record& record, UnmeasuredReason refu
 
   if (session->open_event.has_value() && (point_id.has_value() || record.writer.has_value())) {
     auto& open_event = session->events[static_cast<std::size_t>(session->open_event.value() - session->events_base)];
+    const auto same_image = (open_event.image == record.image);
     open_event.after_resolved = true;
-    open_event.after_point = point_id;
-    open_event.after_reason = (point_id.has_value() ? UnmeasuredReason::NONE : unmeasured_reason);
+    open_event.after_point = (same_image ? point_id : std::nullopt);
+    if (!same_image) {
+      open_event.after_reason = UnmeasuredReason::NO_LATER_MEASUREMENT;
+    } else {
+      open_event.after_reason = (point_id.has_value() ? UnmeasuredReason::NONE : unmeasured_reason);
+    }
     session->open_event.reset();
   }
 
@@ -699,13 +941,19 @@ inline void Commit(Session* session, const Record& record, UnmeasuredReason refu
   for (auto& member : writer.members) {
     member.command_index += session->frame_command_base;
   }
-  const auto before_point = (point_id.has_value() ? point_id : session->last_point);
+  auto before_point = point_id;
+  if (!before_point.has_value() && session->last_point.has_value()) {
+    if (const auto* last = FindPoint(session, session->last_point.value()); last != nullptr && last->image == record.image) {
+      before_point = session->last_point;
+    }
+  }
   session->last_point.reset();
   if (session->warming_up || session->closing || !MatchesFilter(*session, writer)) return;
 
   session->events.push_back(Event{
       .writer = std::move(writer),
       .frame_index = session->frames_recorded,
+      .image = record.image,
       .before_point = before_point,
       .before_reason = (before_point.has_value() ? UnmeasuredReason::NONE : unmeasured_reason),
   });
@@ -838,20 +1086,24 @@ inline void RecordImmediateWriter(Session* session, reshade::api::command_list* 
   return &iterator->second;
 }
 
-// D3D12/Vulkan: records a writer (or, without `writer`, a pure measurement point) in its command list. `state` is the
-// exactly known state of the watched subresource at this point, or nullopt with the reason it is not known.
+// D3D12/Vulkan: records a writer (or, without `writer`, a pure measurement point) of the watched `image` in its command
+// list. `state` is the exactly known state of the watched subresource at this point, or nullopt with the reason it is
+// not known.
 // Writers are always measured when their state is known; outside the shaderHash filter only when the measurement can
-// close a matching writer (the first record of a list, or right after a writer of the same list).
-inline void RecordExplicit(
-    Session* session,
+// close a matching writer (the first record of a list, or right after a writer of the same list). Runs under the
+// watcher lock and only reserves the measurement; the caller records it with RecordRegionCopy after unlocking.
+[[nodiscard]] inline std::optional<PendingCopy> RecordExplicit(
+    const std::shared_ptr<Session>& session_owner,
     reshade::api::command_list* cmd_list,
+    std::uint64_t image,
     std::optional<WriterInfo> writer,
     std::optional<reshade::api::resource_usage> state,
     UnmeasuredReason unknown_state_reason) {
+  auto* session = session_owner.get();
   auto* list = GetListState(session, cmd_list);
-  if (list->bundle) return;
+  if (list->bundle) return std::nullopt;
 
-  auto record = Record{.writer = std::move(writer)};
+  auto record = Record{.writer = std::move(writer), .image = image};
 
   auto reason = UnmeasuredReason::NONE;
   if (!list->tracked) {
@@ -875,20 +1127,31 @@ inline void RecordExplicit(
     wanted = list->records.empty() || previous_is_writer;
   }
 
+  std::optional<PendingCopy> pending = std::nullopt;
   if (reason == UnmeasuredReason::NONE && wanted) {
-    auto [entry, copy_reason] = CopyRegionToScratch(session, cmd_list, reinterpret_cast<std::uint64_t>(cmd_list), state.value());
-    record.measurement = entry;
-    record.reason = copy_reason;
-    if (entry.has_value()) {
-      list->scratch_entries.push_back(entry.value());
+    const auto list_handle = reinterpret_cast<std::uint64_t>(cmd_list);
+    const auto [entry_index, reserve_reason] = ReserveScratchEntry(session, list_handle, false);
+    if (entry_index.has_value()) {
+      record.measurement = entry_index;
+      list->scratch_entries.push_back(entry_index.value());
+      pending = PendingCopy{
+          .session = session_owner,
+          .texture = session->scratch_entries[entry_index.value()].texture,
+          .image = image,
+          .state = state.value(),
+      };
+    } else {
+      record.reason = reserve_reason;
     }
   } else {
     record.reason = reason;
   }
 
-  if (!record.writer.has_value() && !record.measurement.has_value()) return;
+  if (!record.writer.has_value() && !record.measurement.has_value()) return std::nullopt;
   list->records.push_back(std::move(record));
+  return pending;
 }
+
 
 }  // namespace internal
 
@@ -900,7 +1163,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
   const auto explicit_api = internal::IsExplicitApi(device_api);
   if (!explicit_api && !internal::IsImmediateD3D11Context(cmd_list)) return;
 
-  std::unique_lock lock(watcher->mutex);
+  WatcherLock lock(watcher, "OnDrawOrDispatch");
   auto* session = watcher->session.get();
   if (session == nullptr || !session->failure.empty()) return;
   // Re-checked under the lock: the texture may have been destroyed while this thread waited.
@@ -916,23 +1179,24 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
     if (is_dispatch) {
       // The dispatch writes the watched subresource when it is bound as a compute UAV, through root/push descriptors or
       // through a descriptor table range visible to the compute stage.
-      bool writes_watched = false;
-      for (std::uint32_t slot = 0u; slot < MAX_COMPUTE_UAV_SLOTS && !writes_watched; ++slot) {
+      std::uint64_t written_image = 0u;
+      for (std::uint32_t slot = 0u; slot < MAX_COMPUTE_UAV_SLOTS && written_image == 0u; ++slot) {
         const auto view = renodx::utils::state::GetBoundResourceView(
             cmd_list, reshade::api::shader_stage::compute, reshade::api::descriptor_type::unordered_access_view, slot);
-        writes_watched = internal::ViewCoversWatchedSubresource(*session, device, view);
+        written_image = internal::GetWatchedImageOfView(*session, device, view);
       }
+      const auto bound_as_uav_slot = (written_image != 0u);
       std::optional<renodx::utils::state::BoundDescriptorTables> bound_tables = std::nullopt;
-      if (!writes_watched) {
+      if (written_image == 0u) {
         bound_tables = renodx::utils::state::CopyBoundDescriptorTables(cmd_list, renodx::utils::state::PipelineBindPoint::COMPUTE);
       }
       auto* descriptor_data = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
       if (bound_tables.has_value() && bound_tables->layout.handle != 0u && descriptor_data != nullptr) {
         renodx::utils::pipeline_layout::GetPipelineLayoutData(bound_tables->layout, [&](const auto* layout_data) {
           for (const auto& [param_index, table] : bound_tables->tables.entries()) {
-            if (writes_watched || table.handle == 0u || param_index >= layout_data->params.size()) continue;
+            if (written_image != 0u || table.handle == 0u || param_index >= layout_data->params.size()) continue;
             const auto scan_range = [&](const reshade::api::descriptor_range& range) {
-              if (writes_watched) return;
+              if (written_image != 0u) return;
               if (range.type != reshade::api::descriptor_type::texture_unordered_access_view
                   && range.type != reshade::api::descriptor_type::unordered_access_view) return;
               if (!renodx::utils::bitwise::HasFlag(range.visibility, reshade::api::shader_stage::compute)) return;
@@ -946,10 +1210,10 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
               const auto& heap_slots = heap_pair->second;
               const auto available = static_cast<std::uint32_t>(heap_slots.size() - base_offset);
               const auto scanned = std::min({(range.count == UINT32_MAX ? available : range.count), available, MAX_SCANNED_TABLE_DESCRIPTORS});
-              for (std::uint32_t index = 0u; index < scanned && !writes_watched; ++index) {
+              for (std::uint32_t index = 0u; index < scanned && written_image == 0u; ++index) {
                 const auto& descriptor = heap_slots[base_offset + index];
                 if (!descriptor.HasResourceView()) continue;
-                writes_watched = internal::ViewCoversWatchedSubresource(*session, device, descriptor.resource_view);
+                written_image = internal::GetWatchedImageOfView(*session, device, descriptor.resource_view);
               }
             };
             const auto& param = layout_data->params[param_index];
@@ -970,17 +1234,28 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
           }
         });
       }
-      if (!writes_watched) return;
-      internal::RecordExplicit(
-          session,
+      if (written_image == 0u) return;
+      // Only a UAV slot binding puts the texture in UNORDERED_ACCESS state for this dispatch. A descriptor table hit is
+      // reported as a possible writer with no measurement, because a barrier from a guessed state is invalid.
+      std::optional<reshade::api::resource_usage> dispatch_state = std::nullopt;
+      if (bound_as_uav_slot) {
+        dispatch_state = reshade::api::resource_usage::unordered_access;
+      }
+      auto pending = internal::RecordExplicit(
+          watcher->session,
           cmd_list,
+          written_image,
           WriterInfo{
               .kind = WriterKind::DISPATCH,
               .command_index = command_index,
               .compute_shader_hash = renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::compute_shader),
           },
-          reshade::api::resource_usage::unordered_access,
-          UnmeasuredReason::NONE);
+          dispatch_state,
+          UnmeasuredReason::DESCRIPTOR_TABLE);
+      lock.Unlock();
+      if (pending.has_value()) {
+        internal::RecordRegionCopy(*pending->session, cmd_list, pending->image, pending->texture, pending->state);
+      }
       return;
     }
 
@@ -999,20 +1274,22 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
       return;
     }
 
-    const auto& render_targets = renodx::utils::swapchain::GetRenderTargets(cmd_list);
-    const auto writes_watched = std::ranges::any_of(render_targets, [&](const reshade::api::resource_view& view) {
-      return internal::ViewCoversWatchedSubresource(*session, device, view);
-    });
-    if (!writes_watched) return;
+    std::uint64_t written_image = 0u;
+    for (const auto& view : renodx::utils::swapchain::GetRenderTargets(cmd_list)) {
+      written_image = internal::GetWatchedImageOfView(*session, device, view);
+      if (written_image != 0u) break;
+    }
+    if (written_image == 0u) return;
     // D3D12 draws outside a render pass need their render targets in RENDER_TARGET state. Vulkan draws are always
     // inside a render pass; one seen here comes from a list whose render pass state is not tracked.
     std::optional<reshade::api::resource_usage> draw_state = std::nullopt;
     if (session->device_api == reshade::api::device_api::d3d12) {
       draw_state = reshade::api::resource_usage::render_target;
     }
-    internal::RecordExplicit(
-        session,
+    auto pending = internal::RecordExplicit(
+        watcher->session,
         cmd_list,
+        written_image,
         WriterInfo{
             .kind = WriterKind::DRAW,
             .command_index = command_index,
@@ -1021,6 +1298,10 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
         },
         draw_state,
         UnmeasuredReason::STATE_UNKNOWN);
+    lock.Unlock();
+    if (pending.has_value()) {
+      internal::RecordRegionCopy(*pending->session, cmd_list, pending->image, pending->texture, pending->state);
+    }
     return;
   }
 
@@ -1063,7 +1344,7 @@ inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_li
   const auto explicit_api = (cmd_list != nullptr && internal::IsExplicitApi(cmd_list->get_device()->get_api()));
   if (cmd_list != nullptr && !explicit_api && !internal::IsImmediateD3D11Context(cmd_list)) return;
 
-  std::unique_lock lock(watcher->mutex);
+  WatcherLock lock(watcher, "OnResourceWrite");
   auto* session = watcher->session.get();
   if (session == nullptr || !session->failure.empty()) return;
   // Re-checked under the lock: the texture may have been destroyed while this thread waited.
@@ -1078,14 +1359,13 @@ inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_li
     if (kind == WriterKind::COPY) {
       ++list->command_count;
     }
-    bool writes_watched = false;
+    std::uint64_t written_image = 0u;
     if (target.view.handle != 0u) {
-      writes_watched = internal::ViewCoversWatchedSubresource(*session, cmd_list->get_device(), target.view);
-    } else {
-      writes_watched = (target.resource.handle == session->watched_resource.handle || target.resource.handle == session->original_resource.handle)
-                       && (!target.subresource.has_value() || target.subresource.value() == session->subresource);
+      written_image = internal::GetWatchedImageOfView(*session, cmd_list->get_device(), target.view);
+    } else if (!target.subresource.has_value() || target.subresource.value() == session->subresource) {
+      written_image = internal::GetWatchedImage(*session, target.resource.handle);
     }
-    if (!writes_watched) return;
+    if (written_image == 0u) return;
 
     // Clears give an exact state: on D3D12 the view must be in that state; on Vulkan ReShade transitions the cleared
     // ranges to COLOR_ATTACHMENT_OPTIMAL around the event but does not report the ranges, so only an image with a
@@ -1095,7 +1375,11 @@ inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_li
     if (session->device_api == reshade::api::device_api::vulkan && !session->single_subresource) {
       state.reset();
     }
-    internal::RecordExplicit(session, cmd_list, WriterInfo{.kind = kind, .command_index = command_index}, state, UnmeasuredReason::STATE_UNKNOWN);
+    auto pending = internal::RecordExplicit(watcher->session, cmd_list, written_image, WriterInfo{.kind = kind, .command_index = command_index}, state, UnmeasuredReason::STATE_UNKNOWN);
+    lock.Unlock();
+    if (pending.has_value()) {
+      internal::RecordRegionCopy(*pending->session, cmd_list, pending->image, pending->texture, pending->state);
+    }
     return;
   }
 
@@ -1124,7 +1408,7 @@ inline void OnBeginRenderPass(
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   if (!internal::IsExplicitApi(cmd_list->get_device()->get_api())) return;
 
-  std::unique_lock lock(watcher->mutex);
+  WatcherLock lock(watcher, "OnBeginRenderPass");
   auto* session = watcher->session.get();
   if (session == nullptr || !session->failure.empty()) return;
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
@@ -1132,29 +1416,35 @@ inline void OnBeginRenderPass(
   auto* list = internal::GetListState(session, cmd_list);
   if (list->bundle) return;
   list->render_pass_record.reset();
-  auto* device = cmd_list->get_device();
-  const auto writes_watched = std::ranges::any_of(render_targets, [&](const reshade::api::render_pass_render_target_desc& render_target) {
-    return internal::ViewCoversWatchedSubresource(*session, device, render_target.view);
-  });
-  if (writes_watched) {
+  std::optional<PendingCopy> pending = std::nullopt;
+  std::uint64_t written_image = 0u;
+  for (const auto& render_target : render_targets) {
+    written_image = internal::GetWatchedImageOfView(*session, cmd_list->get_device(), render_target.view);
+    if (written_image != 0u) break;
+  }
+  if (written_image != 0u) {
     std::optional<reshade::api::resource_usage> state = std::nullopt;
     if (session->device_api == reshade::api::device_api::d3d12 && !list->in_render_pass) {
       state = reshade::api::resource_usage::render_target;
     }
-    internal::RecordExplicit(session, cmd_list, WriterInfo{.kind = WriterKind::RENDER_PASS, .command_index = list->command_count}, state, UnmeasuredReason::STATE_UNKNOWN);
+    pending = internal::RecordExplicit(watcher->session, cmd_list, written_image, WriterInfo{.kind = WriterKind::RENDER_PASS, .command_index = list->command_count}, state, UnmeasuredReason::STATE_UNKNOWN);
     if (!list->records.empty() && list->records.back().writer.has_value()
         && list->records.back().writer->kind == WriterKind::RENDER_PASS) {
       list->render_pass_record = list->records.size() - 1u;
     }
   }
   list->in_render_pass = true;
+  lock.Unlock();
+  if (pending.has_value()) {
+    internal::RecordRegionCopy(*pending->session, cmd_list, pending->image, pending->texture, pending->state);
+  }
 }
 
 inline void OnEndRenderPass(Watcher* watcher, reshade::api::command_list* cmd_list) {
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   if (!internal::IsExplicitApi(cmd_list->get_device()->get_api())) return;
 
-  std::unique_lock lock(watcher->mutex);
+  WatcherLock lock(watcher, "OnEndRenderPass");
   auto* session = watcher->session.get();
   if (session == nullptr) return;
   auto* list = internal::GetListState(session, cmd_list);
@@ -1175,47 +1465,68 @@ inline void OnBarrier(
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   if (cmd_list->get_device()->get_api() != reshade::api::device_api::vulkan) return;
 
-  std::unique_lock lock(watcher->mutex);
+  WatcherLock lock(watcher, "OnBarrier");
   auto* session = watcher->session.get();
   if (session == nullptr || !session->failure.empty() || !session->single_subresource) return;
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
 
+  std::vector<PendingCopy> pendings;
   for (std::size_t index = 0u; index < resources.size(); ++index) {
-    if (resources[index].handle != session->watched_resource.handle) continue;
+    // Only the watched image itself: the original of a watched clone stands for the clone, but its layout is its own.
+    // A VkMemoryBarrier (global barrier) is reported as resource 0; without this check it would match the 0 that
+    // GetWatchedImage returns for an unwatched handle, and the region copy would read from image 0.
+    const auto barrier_image = resources[index].handle;
+    if (barrier_image == 0u || internal::GetWatchedImage(*session, barrier_image) != barrier_image) continue;
     switch (new_states[index]) {
       case reshade::api::resource_usage::render_target:
       case reshade::api::resource_usage::shader_resource:
       case reshade::api::resource_usage::copy_source:
       case reshade::api::resource_usage::copy_dest:
       case reshade::api::resource_usage::present:
-        internal::RecordExplicit(session, cmd_list, std::nullopt, new_states[index], UnmeasuredReason::STATE_UNKNOWN);
+        if (auto pending = internal::RecordExplicit(watcher->session, cmd_list, barrier_image, std::nullopt, new_states[index], UnmeasuredReason::STATE_UNKNOWN);
+            pending.has_value()) {
+          pendings.push_back(std::move(pending.value()));
+        }
         break;
       default:
         break;
     }
   }
+  lock.Unlock();
+  for (const auto& pending : pendings) {
+    internal::RecordRegionCopy(*pending.session, cmd_list, pending.image, pending.texture, pending.state);
+  }
 }
 
 // init_command_list and reset_command_list hook (D3D12 lists start recording when created; Vulkan reports
-// vkBeginCommandBuffer as a reset). The GPU is done with the list's previous recording at this point, so scratch
-// entries it copied into can be reused or, after a finished watch, destroyed.
+// vkBeginCommandBuffer as a reset). The list can no longer copy into its scratch entries. Vulkan only allows the reset
+// once the GPU is done with the list, so the entries are free at once. D3D12 allows it while the GPU still runs the
+// list, so an entry the list executed waits for its submissions (GpuSubmission); one it never executed is free at once.
 inline void OnCommandListReset(Watcher* watcher, reshade::api::command_list* cmd_list, bool destroyed) {
   const auto list_handle = reinterpret_cast<std::uint64_t>(cmd_list);
   if (watcher->has_retired_scratch.load(std::memory_order_acquire)) {
-    std::unique_lock lock(watcher->mutex);
-    auto* device = cmd_list->get_device();
-    std::erase_if(watcher->retired_scratch, [&](const RetiredScratch& retired) {
-      if (retired.owner_list != list_handle) return false;
-      device->destroy_resource(retired.texture);
-      return true;
-    });
-    watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
+    std::vector<reshade::api::resource> released;
+    {
+      WatcherLock lock(watcher, "OnCommandListReset");
+      // A texture the GPU may still be writing (D3D12 submissions) stays until the frame end sees its fence passed.
+      std::erase_if(watcher->retired_scratch, [&](RetiredScratch& retired) {
+        if (retired.owner_list != list_handle) return false;
+        retired.owner_list = 0u;
+        if (!retired.submissions.empty()) return false;
+        released.push_back(retired.texture);
+        return true;
+      });
+      watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
+    }
+    for (const auto texture : released) {
+      cmd_list->get_device()->destroy_resource(texture);
+    }
   }
 
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   if (!internal::IsExplicitApi(cmd_list->get_device()->get_api())) return;
 
-  std::unique_lock lock(watcher->mutex);
+  WatcherLock lock(watcher, "OnCommandListReset");
   auto* session = watcher->session.get();
   if (session == nullptr) return;
 
@@ -1227,8 +1538,10 @@ inline void OnCommandListReset(Watcher* watcher, reshade::api::command_list* cmd
         entry.release_after_reduction = true;
         continue;
       }
-      entry.in_use = false;
       entry.owner_list = 0u;
+      if (entry.submissions.empty()) {
+        entry.in_use = false;
+      }
     }
     if (destroyed) {
       session->lists.erase(pair);
@@ -1250,17 +1563,42 @@ inline void OnCommandListReset(Watcher* watcher, reshade::api::command_list* cmd
 
 // D3D12/Vulkan execute_command_list hook: commits the list's records in submission order. Records of a list executed
 // on another queue than the presenting one, or executed again without being reset, are accounted for as unmeasured.
+// On D3D12 every execution of a list that copies into scratch textures is also recorded as a submission of those
+// textures, whatever the watch does with the records, because the GPU runs the copies anyway; this includes the
+// retired textures of a finished watch.
 inline void OnExecuteCommandList(Watcher* watcher, reshade::api::command_queue* queue, reshade::api::command_list* cmd_list) {
-  if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
-  if (!internal::IsExplicitApi(cmd_list->get_device()->get_api())) return;
+  const auto has_session = watcher->has_session.load(std::memory_order_acquire);
+  if (!has_session && !watcher->has_retired_scratch.load(std::memory_order_acquire)) return;
+  const auto device_api = cmd_list->get_device()->get_api();
+  if (!internal::IsExplicitApi(device_api)) return;
 
-  std::unique_lock lock(watcher->mutex);
+  const auto list_handle = reinterpret_cast<std::uint64_t>(cmd_list);
+  WatcherLock lock(watcher, "OnExecuteCommandList");
+  const auto submission = GpuSubmission{
+      .queue = queue,
+      .frame_end_index = watcher->frame_end_index,
+      .executed_at = std::chrono::steady_clock::now(),
+  };
+  if (device_api == reshade::api::device_api::d3d12) {
+    for (auto& retired : watcher->retired_scratch) {
+      if (retired.owner_list == list_handle) {
+        internal::AddSubmission(&retired.submissions, submission);
+      }
+    }
+  }
   auto* session = watcher->session.get();
-  if (session == nullptr || !session->failure.empty()) return;
+  if (session == nullptr) return;
 
-  const auto pair = session->lists.find(reinterpret_cast<std::uint64_t>(cmd_list));
+  const auto pair = session->lists.find(list_handle);
   if (pair == session->lists.end()) return;
   auto& list = pair->second;
+  if (device_api == reshade::api::device_api::d3d12) {
+    for (const auto entry_index : list.scratch_entries) {
+      internal::AddSubmission(&session->scratch_entries[entry_index].submissions, submission);
+    }
+  }
+  // Records are only committed while the watched texture exists (destroy_resource gate) and the watch has not failed.
+  if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u || !session->failure.empty()) return;
 
   auto refused = UnmeasuredReason::NONE;
   if (queue != session->queue) {
@@ -1296,20 +1634,24 @@ inline void OnExecuteSecondaryCommandList(Watcher* watcher, reshade::api::comman
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   if (!internal::IsExplicitApi(cmd_list->get_device()->get_api())) return;
 
-  std::unique_lock lock(watcher->mutex);
+  WatcherLock lock(watcher, "OnExecuteSecondaryCommandList");
   auto* session = watcher->session.get();
   if (session == nullptr || !session->failure.empty()) return;
 
   auto* list = internal::GetListState(session, cmd_list);
   if (session->device_api == reshade::api::device_api::d3d12) {
-    auto* device = cmd_list->get_device();
-    const auto& render_targets = renodx::utils::swapchain::GetRenderTargets(cmd_list);
-    const auto writes_watched = list->render_pass_record.has_value()
-                                || std::ranges::any_of(render_targets, [&](const reshade::api::resource_view& view) {
-                                     return internal::ViewCoversWatchedSubresource(*session, device, view);
-                                   });
-    if (writes_watched) {
-      internal::RecordExplicit(session, cmd_list, WriterInfo{.kind = WriterKind::BUNDLE, .command_index = list->command_count}, std::nullopt, UnmeasuredReason::BUNDLE);
+    std::uint64_t written_image = 0u;
+    if (list->render_pass_record.has_value()) {
+      written_image = list->records[list->render_pass_record.value()].image;
+    } else {
+      for (const auto& view : renodx::utils::swapchain::GetRenderTargets(cmd_list)) {
+        written_image = internal::GetWatchedImageOfView(*session, cmd_list->get_device(), view);
+        if (written_image != 0u) break;
+      }
+    }
+    if (written_image != 0u) {
+      // No state is known for a bundle writer, so RecordExplicit reserves no copy.
+      static_cast<void>(internal::RecordExplicit(watcher->session, cmd_list, written_image, WriterInfo{.kind = WriterKind::BUNDLE, .command_index = list->command_count}, std::nullopt, UnmeasuredReason::BUNDLE));
     }
     return;
   }
@@ -1361,11 +1703,276 @@ inline void OnResourceDestroyed(Watcher* watcher, reshade::api::resource resourc
 inline void OnFinishPresent(Watcher* watcher, reshade::api::command_queue* queue) {
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
 
-  std::unique_lock lock(watcher->mutex);
-  auto* session = watcher->session.get();
+  std::shared_ptr<Session> session;
+  {
+    WatcherLock lock(watcher, "OnFinishPresent");
+    session = watcher->session;
+  }
+  // The fence state belongs to the presenting thread (ProcessAtFrameEnd and this hook, both inside present), and the
+  // signal runs inside present, where ReShade holds the queue's lock, so the game cannot submit to it concurrently.
   if (session == nullptr || session->queue != queue || !session->unsignaled_fence_value.has_value()) return;
   queue->signal(session->fence, session->unsignaled_fence_value.value());
   session->unsignaled_fence_value.reset();
+}
+
+// D3D12, on the presenting thread, with or without a running watch: frees the scratch textures the GPU is done with
+// (the running watch may reuse them, retired ones are destroyed). At a frame end (`frame_end`) it also counts the frame
+// end, creates the lifetime fences of queues that executed region copies, and attaches a fence value to each submission
+// old enough (GpuSubmission) and signals it. Fences are created and signalled without the watcher lock; a queue's
+// destroy event waits for signals in flight on it.
+inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, bool frame_end) {
+  if (device->get_api() != reshade::api::device_api::d3d12) return;
+  // Without a session or retired textures there is no submission to track (the frame end count only matters relative
+  // to submissions recorded later).
+  const auto has_session = watcher->has_session.load(std::memory_order_acquire);
+  if (!has_session && !watcher->has_retired_scratch.load(std::memory_order_acquire)) return;
+  const auto now = std::chrono::steady_clock::now();
+
+  // Stage 1 (locked): count the frame end, list the queues that need a fence and the fences to read.
+  std::vector<std::uint64_t> queues_without_fence;
+  std::vector<std::pair<std::uint64_t, reshade::api::fence>> fences_to_read;
+  {
+    WatcherLock lock(watcher, "ProcessLifetimes: planning");
+    if (frame_end) {
+      ++watcher->frame_end_index;
+      internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
+        for (const auto& submission : submissions) {
+          if (submission.queue == nullptr) continue;
+          const auto queue_handle = reinterpret_cast<std::uint64_t>(submission.queue);
+          if (watcher->queue_fences.contains(queue_handle)) continue;
+          if (std::ranges::find(queues_without_fence, queue_handle) != queues_without_fence.end()) continue;
+          queues_without_fence.push_back(queue_handle);
+        }
+      });
+    }
+    for (const auto& [queue_handle, queue_fence] : watcher->queue_fences) {
+      fences_to_read.emplace_back(queue_handle, queue_fence.fence);
+    }
+  }
+
+  // Stage 2 (unlocked): create the missing fences and read how far the GPU got.
+  std::vector<std::pair<std::uint64_t, reshade::api::fence>> created_fences;
+  for (const auto queue_handle : queues_without_fence) {
+    reshade::api::fence fence = {0u};
+    if (device->create_fence(0u, reshade::api::fence_flags::none, &fence)) {
+      created_fences.emplace_back(queue_handle, fence);
+    }
+  }
+  std::unordered_map<std::uint64_t, std::uint64_t> completed_values;
+  for (const auto& [queue_handle, fence] : fences_to_read) {
+    completed_values[queue_handle] = device->get_completed_fence_value(fence);
+  }
+
+  // Stage 3 (locked): install the fences, attach fence values, free what the GPU is done with.
+  struct PlannedSignal {
+    reshade::api::command_queue* queue = nullptr;
+    reshade::api::fence fence = {0u};
+    std::uint64_t value = 0u;
+  };
+  std::vector<PlannedSignal> planned_signals;
+  std::vector<reshade::api::fence> unused_fences;
+  std::vector<reshade::api::resource> released_textures;
+  {
+    WatcherLock lock(watcher, "ProcessLifetimes: attaching fence values");
+    for (const auto& [queue_handle, fence] : created_fences) {
+      // The queue may have been destroyed meanwhile: its destroy event cleared every submission that named it.
+      bool queue_has_submissions = false;
+      internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
+        for (const auto& submission : submissions) {
+          if (reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle) {
+            queue_has_submissions = true;
+          }
+        }
+      });
+      if (!queue_has_submissions) {
+        unused_fences.push_back(fence);
+        continue;
+      }
+      const auto inserted = watcher->queue_fences.try_emplace(queue_handle, QueueLifetimeFence{.fence = fence}).second;
+      if (!inserted) {
+        unused_fences.push_back(fence);
+      }
+    }
+
+    if (frame_end) {
+      for (auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
+        const auto queue_handle = fence_queue_handle;
+        const auto is_old_enough = [&](const GpuSubmission& submission) {
+          return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle
+                 && !submission.fence_value.has_value()
+                 && submission.frame_end_index + SUBMISSION_FENCE_MIN_FRAME_ENDS <= watcher->frame_end_index
+                 && now - submission.executed_at >= SUBMISSION_FENCE_MIN_DELAY;
+        };
+        bool has_old_enough = false;
+        internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
+          if (std::ranges::any_of(submissions, is_old_enough)) {
+            has_old_enough = true;
+          }
+        });
+        if (!has_old_enough) continue;
+
+        const auto value = ++queue_fence.last_value;
+        internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
+          if (!std::ranges::any_of(submissions, is_old_enough)) return;
+          // The new value also covers this queue's earlier fenced submission (signals on one queue complete in order).
+          std::erase_if(submissions, [&](const GpuSubmission& submission) {
+            return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle && submission.fence_value.has_value();
+          });
+          for (auto& submission : submissions) {
+            if (is_old_enough(submission)) {
+              submission.fence_value = value;
+            }
+          }
+        });
+        ++queue_fence.signals_in_flight;
+        planned_signals.push_back(PlannedSignal{
+            .queue = reinterpret_cast<reshade::api::command_queue*>(queue_handle),
+            .fence = queue_fence.fence,
+            .value = value,
+        });
+      }
+    }
+
+    // `completed_values` was read before this stage attached new values, so a texture is only freed for fence values
+    // the GPU had already passed.
+    if (watcher->session != nullptr) {
+      for (auto& entry : watcher->session->scratch_entries) {
+        // An in-use entry no list owns and no reduction waits for is only held by its submissions (empty once a
+        // destroyed queue's wait cleared them).
+        if (!entry.in_use || entry.owner_list != 0u || entry.awaiting_reduction) continue;
+        if (!internal::AreSubmissionsComplete(entry.submissions, completed_values)) continue;
+        entry.submissions.clear();
+        entry.in_use = false;
+      }
+    }
+    std::erase_if(watcher->retired_scratch, [&](const RetiredScratch& retired) {
+      if (retired.owner_list != 0u || !internal::AreSubmissionsComplete(retired.submissions, completed_values)) return false;
+      released_textures.push_back(retired.texture);
+      return true;
+    });
+    watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
+  }
+
+  // Stage 4 (unlocked): signal, then destroy what is no longer needed.
+  for (const auto& planned : planned_signals) {
+    if (!internal::SignalQueueNative(planned.queue, planned.fence, planned.value)) {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence signal failed; the scratch textures of that queue are kept until the device is destroyed)");
+    }
+  }
+  if (!planned_signals.empty()) {
+    WatcherLock lock(watcher, "ProcessLifetimes: signals done");
+    for (const auto& planned : planned_signals) {
+      if (auto pair = watcher->queue_fences.find(reinterpret_cast<std::uint64_t>(planned.queue)); pair != watcher->queue_fences.end()) {
+        --pair->second.signals_in_flight;
+      }
+    }
+  }
+  for (const auto texture : released_textures) {
+    device->destroy_resource(texture);
+  }
+  for (const auto fence : unused_fences) {
+    device->destroy_fence(fence);
+  }
+}
+
+// D3D12, without the lock: waits (LIFETIME_FENCE_WAIT_TIMEOUT per fence) until the GPU passed every fence value
+// already attached to a submission. Values not attached yet (submissions still inside the delay) cannot be waited for;
+// those textures are freed by a later frame end.
+inline void WaitForAttachedFenceValues(Watcher* watcher, reshade::api::device* device) {
+  if (device->get_api() != reshade::api::device_api::d3d12) return;
+  std::vector<std::pair<reshade::api::fence, std::uint64_t>> fences;
+  {
+    WatcherLock lock(watcher, "WaitForAttachedFenceValues");
+    for (const auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
+      const auto queue_handle = fence_queue_handle;
+      std::uint64_t highest_value = 0u;
+      internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
+        for (const auto& submission : submissions) {
+          if (reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle && submission.fence_value.has_value()) {
+            highest_value = std::max(highest_value, submission.fence_value.value());
+          }
+        }
+      });
+      if (highest_value != 0u) {
+        fences.emplace_back(queue_fence.fence, highest_value);
+      }
+    }
+  }
+  if (!internal::WaitForFences(device, fences)) {
+    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait timed out at the end of a watch; those scratch textures are freed by a later frame end)");
+  }
+}
+
+// D3D12 destroy_command_queue hook. ReShade raises it before releasing the native queue, so the queue is still valid
+// here, and a game that destroys a queue no longer submits to it: every list it executed was really submitted. The
+// queue's submissions are fenced with one more signal and waited for (without the lock); textures the GPU is then done
+// with are freed by the next frame end. If the queue never got a fence (created only at frame ends, never in hooks) or
+// the wait fails, its textures are kept until the device is destroyed, which waits for the device.
+inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queue* queue) {
+  auto* device = queue->get_device();
+  if (device->get_api() != reshade::api::device_api::d3d12) return;
+  const auto queue_handle = reinterpret_cast<std::uint64_t>(queue);
+
+  std::uint64_t wait_id = 0u;
+  reshade::api::fence fence = {0u};
+  std::uint64_t fence_value = 0u;
+  bool has_submissions = false;
+  bool signal_in_flight_timed_out = false;
+  const auto wait_start = std::chrono::steady_clock::now();
+  while (true) {
+    WatcherLock lock(watcher, "OnCommandQueueDestroyed");
+    const auto pair = watcher->queue_fences.find(queue_handle);
+    if (pair != watcher->queue_fences.end() && pair->second.signals_in_flight != 0u) {
+      // A frame end is signalling this queue right now; the queue must outlive that call. The wait is bounded: at
+      // process exit the signalling thread may already be terminated. The queue is then not used again, and its
+      // textures are kept until the device is destroyed.
+      if (std::chrono::steady_clock::now() - wait_start < LIFETIME_FENCE_WAIT_TIMEOUT) {
+        lock.Unlock();
+        std::this_thread::yield();
+        continue;
+      }
+      signal_in_flight_timed_out = true;
+    }
+    wait_id = ++watcher->destroyed_queue_waits;
+    internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
+      for (auto& submission : submissions) {
+        if (submission.queue != queue) continue;
+        submission.queue = nullptr;
+        submission.fence_value.reset();
+        submission.destroyed_queue_wait = wait_id;
+        has_submissions = true;
+      }
+    });
+    if (pair != watcher->queue_fences.end()) {
+      fence = pair->second.fence;
+      fence_value = ++pair->second.last_value;
+      watcher->orphan_fences.push_back(fence);
+      watcher->queue_fences.erase(pair);
+    }
+    break;
+  }
+  if (!has_submissions) return;
+  if (signal_in_flight_timed_out) {
+    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a frame end's signal on a destroyed queue did not finish; its scratch textures are kept until the device is destroyed)");
+    return;
+  }
+  if (fence.handle == 0u) {
+    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a queue was destroyed before its lifetime fence existed; its scratch textures are kept until the device is destroyed)");
+    return;
+  }
+
+  const std::array<std::pair<reshade::api::fence, std::uint64_t>, 1> fences = {std::pair{fence, fence_value}};
+  if (!internal::SignalQueueNative(queue, fence, fence_value) || !internal::WaitForFences(device, fences)) {
+    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait failed for a destroyed queue; its scratch textures are kept until the device is destroyed)");
+    return;
+  }
+
+  WatcherLock lock(watcher, "OnCommandQueueDestroyed: waited");
+  internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
+    std::erase_if(submissions, [&](const GpuSubmission& submission) {
+      return submission.destroyed_queue_wait == wait_id;
+    });
+  });
 }
 
 // Called from reshade_present, which ReShade raises after every add-on's present handler and after its own effects
@@ -1377,8 +1984,6 @@ inline void ProcessAtFrameEnd(
     std::uint32_t device_index,
     reshade::api::effect_runtime* runtime,
     std::span<const std::uint8_t> reduce_shader) {
-  std::unique_lock lock(watcher->mutex);
-
   auto* device = runtime->get_device();
   auto* queue = runtime->get_command_queue();
   const auto get_unmeasured_reason_name = [](UnmeasuredReason reason) -> std::string_view {
@@ -1403,6 +2008,10 @@ inline void ProcessAtFrameEnd(
         return "bundle";
       case UnmeasuredReason::NO_LATER_MEASUREMENT:
         return "no_later_measurement";
+      case UnmeasuredReason::SCRATCH_POOL_EMPTY:
+        return "scratch_pool_empty";
+      case UnmeasuredReason::DESCRIPTOR_TABLE:
+        return "descriptor_table";
     }
     return "unknown";
   };
@@ -1423,7 +2032,27 @@ inline void ProcessAtFrameEnd(
     request->cv.notify_all();
   };
 
-  if (auto* session = watcher->session.get(); session != nullptr) {
+  // D3D12 scratch texture lifetimes, with or without a running watch (see GpuSubmission).
+  ProcessLifetimes(watcher, device, true);
+
+  // The frame end runs in stages so that no ReShade or driver call happens under the watcher lock: a driver call can
+  // call back into the game (for example its allocation callbacks), and the game may then wait for one of its threads
+  // that waits for the lock. Stage 1 (locked) commits the frame-end measurement, plans the reductions from the points
+  // committed this frame and advances the frame boundary, so records committed meanwhile land in the next frame.
+  // Stage 2 (unlocked) records the copies, reductions and readback and waits for the GPU, working only on the plan and
+  // on state that belongs to the presenting thread (in-flight frames, readbacks, fence, reduction pass). Stage 3
+  // (locked) merges the results; a finished watch is detached from the watcher there and completed in stage 4
+  // (unlocked), where no hook can reach it any more.
+  // Queue operations without the lock are safe here: this runs inside present, and ReShade holds the presenting
+  // queue's lock for the whole present (Vulkan vkQueuePresentKHR; DXGI Present for D3D12, whose ExecuteCommandLists
+  // takes the same lock), so the game cannot submit to that queue meanwhile. D3D11 keeps measuring in stage 1: its hooks
+  // only run on the immediate context, on this same thread, so nothing else waits for the lock there.
+  std::shared_ptr<Session> session;
+  {
+    WatcherLock lock(watcher, "ProcessAtFrameEnd: taking the session");
+    session = watcher->session;
+  }
+  if (session != nullptr) {
     auto* cmd_list = queue->get_immediate_command_list();
 
     const auto stats_to_json = [&](const RegionStats& stats) {
@@ -1455,7 +2084,7 @@ inline void ProcessAtFrameEnd(
     const auto side_stats = [&](std::optional<std::uint64_t> point_id, UnmeasuredReason reason)
         -> std::optional<std::pair<std::optional<RegionStats>, UnmeasuredReason>> {
       if (!point_id.has_value()) return std::pair{std::optional<RegionStats>{}, reason};
-      const auto* point = internal::FindPoint(session, point_id.value());
+      const auto* point = internal::FindPoint(session.get(), point_id.value());
       if (point == nullptr) return std::pair{std::optional<RegionStats>{}, UnmeasuredReason::NO_LATER_MEASUREMENT};
       if (!point->decoded) return std::nullopt;
       if (point->refused != UnmeasuredReason::NONE || !point->stats.has_value()) {
@@ -1625,9 +2254,18 @@ inline void ProcessAtFrameEnd(
       }
     };
 
-    // Maps the oldest in-flight readback and stores the stats of its points. D3D12/Vulkan mapping does not wait for
-    // the GPU, so the frame's fence must have passed; with `wait` the CPU waits for it.
-    const auto drain_oldest = [&](bool wait) -> bool {
+    // One stats readback, copied out of its mapped texture (stage 2 or 4) and decoded into its points later.
+    struct MappedReadback {
+      InFlightFrame frame;
+      std::vector<std::uint32_t> rows = {};
+      std::uint32_t row_count = 0u;
+    };
+    std::vector<MappedReadback> mapped_readbacks;
+    std::string unlocked_failure;
+
+    // Maps the oldest in-flight readback. D3D12/Vulkan mapping does not wait for the GPU, so the frame's fence must
+    // have passed; with `wait` the CPU waits for it. Never called under the watcher lock.
+    const auto map_oldest = [&](bool wait) -> bool {
       const auto frame = session->in_flight.front();
       const auto has_readback = (frame.fence_value != (std::numeric_limits<std::uint64_t>::max)());
       if (session->explicit_api && has_readback) {
@@ -1638,7 +2276,13 @@ inline void ProcessAtFrameEnd(
               queue->signal(session->fence, session->unsignaled_fence_value.value());
               session->unsignaled_fence_value.reset();
             }
-            device->wait(session->fence, frame.fence_value);
+            // Bounded, so a GPU that never reaches the value (hang without a device removal) fails the watch instead of
+            // blocking present forever.
+            const auto timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(LIFETIME_FENCE_WAIT_TIMEOUT).count();
+            if (!device->wait(session->fence, frame.fence_value, timeout_ns)) {
+              unlocked_failure = "The GPU did not finish the region statistics within the wait timeout.";
+              return false;
+            }
           }
         } else if (wait) {
           queue->wait_idle();
@@ -1648,232 +2292,386 @@ inline void ProcessAtFrameEnd(
       }
       session->in_flight.pop_front();
 
-      reshade::api::subresource_data mapped_data = {};
-      if (has_readback
-          && !device->map_texture_region(session->readbacks[frame.ring_index], 0u, nullptr, reshade::api::map_access::read_only, &mapped_data)) {
-        session->failure = "Failed to map the stats readback texture.";
-        return false;
-      }
-      for (std::uint64_t point_id = frame.first_point; point_id < frame.first_point + frame.point_count; ++point_id) {
-        auto* point = internal::FindPoint(session, point_id);
-        if (point == nullptr) continue;
-        point->decoded = true;
-        if (!has_readback || point->refused != UnmeasuredReason::NONE || !point->slot.has_value()) continue;
-
-        const auto* row = reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(mapped_data.data) + (static_cast<std::size_t>(mapped_data.row_pitch) * point->slot.value()));
-        RegionStats stats = {};
-        std::copy_n(row, STATS_STRIDE, stats.raw.begin());
-        stats.finite_count = row[STATS_FINITE_COUNT];
-        stats.non_finite_count = row[STATS_NON_FINITE_COUNT];
-        stats.negative_count = row[STATS_NEGATIVE_COUNT];
-        stats.above_one_count = row[STATS_ABOVE_ONE_COUNT];
-        stats.black_count = row[STATS_BLACK_COUNT];
-        stats.above_nits_counts = {row[STATS_ABOVE_203_COUNT], row[STATS_ABOVE_400_COUNT], row[STATS_ABOVE_1000_COUNT], row[STATS_ABOVE_4000_COUNT]};
-        if (stats.finite_count != 0u) {
-          stats.max_luminance = std::bit_cast<float>(row[STATS_MAX_LUMINANCE_BITS]);
-          stats.min_luminance = std::bit_cast<float>(~row[STATS_MIN_LUMINANCE_INVERTED_BITS]);
-          stats.max_channel = std::bit_cast<float>(row[STATS_MAX_CHANNEL_BITS]);
-          const auto luminance_sum = (static_cast<std::uint64_t>(row[STATS_LUMINANCE_SUM_HIGH]) << 32u) | row[STATS_LUMINANCE_SUM_LOW];
-          stats.mean_luminance = static_cast<double>(luminance_sum) / (LUMINANCE_SUM_SCALE * static_cast<double>(stats.finite_count));
-        }
-        if (session->verify_point.has_value() && session->verify_point.value() == point_id) {
-          session->verify_gpu_stats = stats;
-        }
-        if (session->end_point.has_value() && session->end_point.value() == point_id) {
-          session->end_stats = stats;
-        }
-        point->stats = stats;
-      }
+      auto mapped = MappedReadback{.frame = frame};
       if (has_readback) {
+        reshade::api::subresource_data mapped_data = {};
+        if (!device->map_texture_region(session->readbacks[frame.ring_index], 0u, nullptr, reshade::api::map_access::read_only, &mapped_data)) {
+          unlocked_failure = "Failed to map the stats readback texture.";
+          return false;
+        }
+        mapped.row_count = MAX_SLOTS;
+        mapped.rows.resize(static_cast<std::size_t>(MAX_SLOTS) * STATS_STRIDE);
+        for (std::uint32_t slot = 0u; slot < MAX_SLOTS; ++slot) {
+          std::copy_n(
+              reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(mapped_data.data) + (static_cast<std::size_t>(mapped_data.row_pitch) * slot)),
+              STATS_STRIDE,
+              mapped.rows.begin() + (static_cast<std::ptrdiff_t>(slot) * STATS_STRIDE));
+        }
         device->unmap_texture_region(session->readbacks[frame.ring_index], 0u);
       }
-
-      if (frame.counted) {
-        ++session->frames_decoded;
-        if (frame.truncated) {
-          ++session->truncated_frames;
-        }
-      }
-      process_events();
+      mapped_readbacks.push_back(std::move(mapped));
       return true;
     };
 
+    // Stores the stats of the mapped readbacks in their points, in order. Under the lock, or on a detached session.
+    const auto decode_mapped_readbacks = [&]() {
+      for (const auto& mapped : mapped_readbacks) {
+        const auto& frame = mapped.frame;
+        for (std::uint64_t point_id = frame.first_point; point_id < frame.first_point + frame.point_count; ++point_id) {
+          auto* point = internal::FindPoint(session.get(), point_id);
+          if (point == nullptr) continue;
+          point->decoded = true;
+          if (mapped.row_count == 0u || point->refused != UnmeasuredReason::NONE || !point->slot.has_value()) continue;
+
+          const auto* row = mapped.rows.data() + (static_cast<std::size_t>(point->slot.value()) * STATS_STRIDE);
+          RegionStats stats = {};
+          std::copy_n(row, STATS_STRIDE, stats.raw.begin());
+          stats.finite_count = row[STATS_FINITE_COUNT];
+          stats.non_finite_count = row[STATS_NON_FINITE_COUNT];
+          stats.negative_count = row[STATS_NEGATIVE_COUNT];
+          stats.above_one_count = row[STATS_ABOVE_ONE_COUNT];
+          stats.black_count = row[STATS_BLACK_COUNT];
+          stats.above_nits_counts = {row[STATS_ABOVE_203_COUNT], row[STATS_ABOVE_400_COUNT], row[STATS_ABOVE_1000_COUNT], row[STATS_ABOVE_4000_COUNT]};
+          if (stats.finite_count != 0u) {
+            stats.max_luminance = std::bit_cast<float>(row[STATS_MAX_LUMINANCE_BITS]);
+            stats.min_luminance = std::bit_cast<float>(~row[STATS_MIN_LUMINANCE_INVERTED_BITS]);
+            stats.max_channel = std::bit_cast<float>(row[STATS_MAX_CHANNEL_BITS]);
+            const auto luminance_sum = (static_cast<std::uint64_t>(row[STATS_LUMINANCE_SUM_HIGH]) << 32u) | row[STATS_LUMINANCE_SUM_LOW];
+            stats.mean_luminance = static_cast<double>(luminance_sum) / (LUMINANCE_SUM_SCALE * static_cast<double>(stats.finite_count));
+          }
+          if (session->verify_point.has_value() && session->verify_point.value() == point_id) {
+            session->verify_gpu_stats = stats;
+          }
+          if (session->end_point.has_value() && session->end_point.value() == point_id) {
+            session->end_stats = stats;
+          }
+          point->stats = stats;
+        }
+        if (frame.counted) {
+          ++session->frames_decoded;
+          if (frame.truncated) {
+            ++session->truncated_frames;
+          }
+        }
+      }
+      mapped_readbacks.clear();
+      process_events();
+    };
+
+    // Stage 1 (locked): plan.
+    struct PlannedReduction {
+      std::uint64_t point_id = 0u;
+      std::uint32_t entry_index = 0u;
+      reshade::api::resource texture = {0u};
+      std::uint32_t slot = 0u;
+      bool verify = false;
+    };
+    std::vector<PlannedReduction> planned_reductions;
+    std::vector<std::uint32_t> reduced_entries;
+    std::optional<std::uint32_t> back_buffer_entry = std::nullopt;
+    std::uint64_t back_buffer_point = 0u;
+    reshade::api::resource back_buffer = {0u};
+    reshade::api::resource back_buffer_texture = {0u};
+    std::optional<InFlightFrame> new_frame = std::nullopt;
+    bool has_measurements = false;
+    bool frame_planned = false;
     bool request_canceled = false;
+    std::uint32_t scratch_growth = 0u;
     {
-      std::scoped_lock request_lock(session->request->mutex);
-      request_canceled = session->request->canceled;
+      WatcherLock lock(watcher, "ProcessAtFrameEnd: planning the frame end");
+      if (watcher->session != session) return;
+      {
+        std::scoped_lock request_lock(session->request->mutex);
+        request_canceled = session->request->canceled;
+      }
+      if (session->failure.empty() && watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) {
+        session->failure = "The watched texture was destroyed during the watch (for example by a resize).";
+      }
+
+      if (!request_canceled && session->failure.empty()) {
+        frame_planned = true;
+        const auto is_last_frame = (!session->warming_up && !session->closing && session->frames_recorded + 1u >= session->frames);
+
+        if (session->explicit_api) {
+          // Final measurement of the frame: only the presented back buffer is in a known state (present) here; any
+          // other texture's last writer is closed by the next exact point (usually in the next frame). A watch on a
+          // swap-chain image follows the swap chain, so this is whichever of its images is presented.
+          const auto current_back_buffer = runtime->get_current_back_buffer();
+          const auto wants_final_point = session->open_event.has_value() || is_last_frame;
+          if (current_back_buffer.handle != 0u && internal::GetWatchedImage(*session, current_back_buffer.handle) == current_back_buffer.handle && wants_final_point) {
+            back_buffer = current_back_buffer;
+            const auto [entry_index, reserve_reason] = internal::ReserveScratchEntry(session.get(), 0u, true);
+            back_buffer_entry = entry_index;
+            internal::Commit(session.get(), Record{.measurement = back_buffer_entry, .reason = reserve_reason, .image = back_buffer.handle}, UnmeasuredReason::NONE);
+            if (back_buffer_entry.has_value()) {
+              back_buffer_point = session->points_base + session->points.size() - 1u;
+              back_buffer_texture = session->scratch_entries[back_buffer_entry.value()].texture;
+              if (is_last_frame) {
+                session->end_point = back_buffer_point;
+                if (session->verify) {
+                  session->verify_point = session->end_point;
+                }
+              }
+            }
+          }
+
+          // Reductions of every point committed this frame, in commit order; the barriers order them after the game's
+          // copies, which ran earlier on this queue.
+          const auto frame_end_point = session->points_base + session->points.size();
+          for (auto point_id = std::max(session->frame_first_point, session->points_base); point_id < frame_end_point; ++point_id) {
+            auto* point = internal::FindPoint(session.get(), point_id);
+            if (point == nullptr || !point->scratch_entry.has_value()) continue;
+            reduced_entries.push_back(point->scratch_entry.value());
+            if (point->refused == UnmeasuredReason::NONE && planned_reductions.size() >= MAX_SLOTS) {
+              point->refused = UnmeasuredReason::SLOT_LIMIT;
+              session->truncated = true;
+            }
+            if (point->refused != UnmeasuredReason::NONE) continue;
+            point->slot = static_cast<std::uint32_t>(planned_reductions.size());
+            planned_reductions.push_back(PlannedReduction{
+                .point_id = point_id,
+                .entry_index = point->scratch_entry.value(),
+                .texture = session->scratch_entries[point->scratch_entry.value()].texture,
+                .slot = point->slot.value(),
+                .verify = (session->verify_point.has_value() && session->verify_point.value() == point_id && !session->verify_copied),
+            });
+          }
+          has_measurements = !planned_reductions.empty();
+        } else if (session->open_event.has_value() || is_last_frame) {
+          // D3D11: the region is measured in place on the immediate context.
+          const auto final_slot = internal::MeasureRegion(session.get(), cmd_list);
+          if (session->failure.empty()) {
+            internal::Commit(
+                session.get(),
+                Record{.measurement = final_slot, .reason = (final_slot.has_value() ? UnmeasuredReason::NONE : UnmeasuredReason::SLOT_LIMIT)},
+                UnmeasuredReason::NONE);
+            if (final_slot.has_value() && is_last_frame) {
+              session->end_point = session->points_base + session->points.size() - 1u;
+            }
+          }
+          // Nothing writes the texture between this measurement and the copy below, so both see the same pixels.
+          if (session->verify && is_last_frame && final_slot.has_value()
+              && device->create_resource(
+                  reshade::api::resource_desc(session->width, session->height, 1, 1, session->scratch_format, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
+                  nullptr,
+                  reshade::api::resource_usage::copy_dest,
+                  &session->verify_readback)) {
+            cmd_list->copy_texture_region(session->watched_resource, session->subresource, &session->region, session->verify_readback, 0u, nullptr);
+            session->verify_point = session->points_base + session->points.size() - 1u;
+            session->verify_copied = true;
+          }
+        }
+        if (!session->explicit_api) {
+          has_measurements = (session->slots_used != 0u);
+        }
+
+        const auto frame_first_point = std::max(session->frame_first_point, session->points_base);
+        const auto frame_point_count = session->points_base + session->points.size() - frame_first_point;
+        if (session->failure.empty() && (has_measurements || frame_point_count != 0u)) {
+          new_frame = InFlightFrame{
+              .frame_index = session->frames_recorded,
+              .first_point = frame_first_point,
+              .point_count = frame_point_count,
+              .counted = !session->warming_up && !session->closing,
+              .truncated = session->truncated,
+              .fence_value = (std::numeric_limits<std::uint64_t>::max)(),
+          };
+        }
+
+        session->slots_used = 0u;
+        session->command_count = 0u;
+        session->stats_cleared = false;
+        session->truncated = false;
+        session->frame_first_point = session->points_base + session->points.size();
+        session->frame_command_base = 0u;
+        if (session->warming_up) {
+          session->warming_up = false;
+        } else if (session->closing) {
+          ++session->closing_frames;
+        } else {
+          ++session->frames_recorded;
+          session->closing = session->explicit_api && session->frames_recorded >= session->frames;
+        }
+      }
+      // The pool grows by what the hooks were short of since the last frame end, within the budget; the textures are
+      // created in stage 2 on this thread and added in stage 3.
+      scratch_growth = std::min<std::uint32_t>(
+          session->scratch_pool_misses,
+          session->max_scratch_entries - std::min<std::uint32_t>(session->max_scratch_entries, static_cast<std::uint32_t>(session->scratch_entries.size())));
+      session->scratch_pool_misses = 0u;
     }
-    if (session->failure.empty() && watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) {
-      session->failure = "The watched texture was destroyed during the watch (for example by a resize).";
-    }
 
-    if (!request_canceled && session->failure.empty()) {
-      const auto is_last_frame = (!session->warming_up && !session->closing && session->frames_recorded + 1u >= session->frames);
-      std::uint32_t reduced_points = 0u;
-
-      if (session->explicit_api) {
-        // Final measurement of the frame: only the presented back buffer is in a known state (present) here; any other
-        // texture's last writer is closed by the next exact point (usually in the next frame).
-        const auto back_buffer = runtime->get_current_back_buffer();
-        const auto wants_final_point = session->open_event.has_value() || is_last_frame;
-        if (back_buffer.handle == session->watched_resource.handle && wants_final_point) {
-          const auto [entry, reason] = internal::CopyRegionToScratch(session, cmd_list, 0u, reshade::api::resource_usage::present);
-          internal::Commit(session, Record{.measurement = entry, .reason = reason}, UnmeasuredReason::NONE);
-          if (entry.has_value() && is_last_frame) {
-            session->end_point = session->points_base + session->points.size() - 1u;
-            if (session->verify) {
-              session->verify_point = session->end_point;
-            }
-          }
+    // Stage 2 (unlocked): GPU work on the plan.
+    if (frame_planned) {
+      if (back_buffer_entry.has_value() && back_buffer_texture.handle == 0u) {
+        back_buffer_texture = internal::CreateScratchTexture(device, *session);
+      }
+      if (back_buffer_entry.has_value() && back_buffer_texture.handle != 0u) {
+        internal::RecordRegionCopy(*session, cmd_list, back_buffer.handle, back_buffer_texture, reshade::api::resource_usage::present);
+      }
+      bool stats_cleared = false;
+      for (auto& reduction : planned_reductions) {
+        if (back_buffer_entry.has_value() && reduction.entry_index == back_buffer_entry.value()) {
+          reduction.texture = back_buffer_texture;
         }
-
-        // Reductions of every point committed this frame, in commit order; the barriers order them after the game's
-        // copies, which ran earlier on this queue.
-        const auto frame_end_point = session->points_base + session->points.size();
-        for (auto point_id = std::max(session->frame_first_point, session->points_base); point_id < frame_end_point; ++point_id) {
-          auto* point = internal::FindPoint(session, point_id);
-          if (point == nullptr || !point->scratch_entry.has_value()) continue;
-          auto& entry = session->scratch_entries[point->scratch_entry.value()];
-          if (point->refused == UnmeasuredReason::NONE && reduced_points >= MAX_SLOTS) {
-            point->refused = UnmeasuredReason::SLOT_LIMIT;
-            session->truncated = true;
-          }
-          if (point->refused == UnmeasuredReason::NONE && session->failure.empty()) {
-            if (reduced_points == 0u) {
-              const std::array<std::uint32_t, 4> zeros = {};
-              cmd_list->clear_unordered_access_view_uint(session->stats_uav, zeros.data());
-              cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::unordered_access);
-            }
-            const auto slot = reduced_points++;
-            cmd_list->barrier(entry.texture, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::copy_source);
-            cmd_list->copy_texture_region(entry.texture, 0u, nullptr, session->scratch, 0u, nullptr);
-            cmd_list->barrier(session->scratch, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
-            session->constants = {
-                std::bit_cast<float>(session->width),
-                std::bit_cast<float>(session->height),
-                std::bit_cast<float>(static_cast<std::uint32_t>(session->signal)),
-                std::bit_cast<float>(slot),
-            };
-            if (!session->pass.Render(cmd_list)) {
-              session->failure = "The region reduction pass failed to render.";
-            }
-            cmd_list->barrier(session->scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
-            if (session->verify_point.has_value() && session->verify_point.value() == point_id && !session->verify_copied
-                && device->create_resource(
-                    reshade::api::resource_desc(session->width, session->height, 1, 1, session->scratch_format, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
-                    nullptr,
-                    reshade::api::resource_usage::copy_dest,
-                    &session->verify_readback)) {
-              cmd_list->copy_texture_region(entry.texture, 0u, nullptr, session->verify_readback, 0u, nullptr);
-              session->verify_copied = true;
-            }
-            cmd_list->barrier(entry.texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest);
-            point->slot = slot;
-          }
-          entry.awaiting_reduction = false;
-          if (entry.release_after_reduction || entry.owner_list == 0u) {
-            entry.in_use = false;
-            entry.owner_list = 0u;
-            entry.release_after_reduction = false;
-          }
+        if (reduction.texture.handle == 0u || !unlocked_failure.empty()) continue;
+        if (!stats_cleared) {
+          const std::array<std::uint32_t, 4> zeros = {};
+          cmd_list->clear_unordered_access_view_uint(session->stats_uav, zeros.data());
+          cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::unordered_access);
+          stats_cleared = true;
         }
-      } else if (session->open_event.has_value() || is_last_frame) {
-        // D3D11: the region is measured in place on the immediate context.
-        const auto final_slot = internal::MeasureRegion(session, cmd_list);
-        if (session->failure.empty()) {
-          internal::Commit(
-              session,
-              Record{.measurement = final_slot, .reason = (final_slot.has_value() ? UnmeasuredReason::NONE : UnmeasuredReason::SLOT_LIMIT)},
-              UnmeasuredReason::NONE);
-          if (final_slot.has_value() && is_last_frame) {
-            session->end_point = session->points_base + session->points.size() - 1u;
-          }
+        cmd_list->barrier(reduction.texture, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::copy_source);
+        cmd_list->copy_texture_region(reduction.texture, 0u, nullptr, session->scratch, 0u, nullptr);
+        cmd_list->barrier(session->scratch, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::shader_resource);
+        session->constants = {
+            std::bit_cast<float>(session->width),
+            std::bit_cast<float>(session->height),
+            std::bit_cast<float>(static_cast<std::uint32_t>(session->signal)),
+            std::bit_cast<float>(reduction.slot),
+        };
+        if (!session->pass.Render(cmd_list)) {
+          unlocked_failure = "The region reduction pass failed to render.";
         }
-        // Nothing writes the texture between this measurement and the copy below, so both see the same pixels.
-        if (session->verify && is_last_frame && final_slot.has_value()
+        cmd_list->barrier(session->scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_dest);
+        if (reduction.verify
             && device->create_resource(
                 reshade::api::resource_desc(session->width, session->height, 1, 1, session->scratch_format, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
                 nullptr,
                 reshade::api::resource_usage::copy_dest,
                 &session->verify_readback)) {
-          cmd_list->copy_texture_region(session->watched_resource, session->subresource, &session->region, session->verify_readback, 0u, nullptr);
-          session->verify_point = session->points_base + session->points.size() - 1u;
+          cmd_list->copy_texture_region(reduction.texture, 0u, nullptr, session->verify_readback, 0u, nullptr);
           session->verify_copied = true;
         }
+        cmd_list->barrier(reduction.texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest);
       }
 
-      const auto has_measurements = (session->explicit_api ? reduced_points != 0u : session->slots_used != 0u);
-      const auto frame_first_point = std::max(session->frame_first_point, session->points_base);
-      const auto frame_point_count = session->points_base + session->points.size() - frame_first_point;
-      if (session->failure.empty() && (has_measurements || frame_point_count != 0u)) {
-        auto frame = InFlightFrame{
-            .frame_index = session->frames_recorded,
-            .first_point = frame_first_point,
-            .point_count = frame_point_count,
-            .counted = !session->warming_up && !session->closing,
-            .truncated = session->truncated,
-            .fence_value = (std::numeric_limits<std::uint64_t>::max)(),
-        };
-        if (has_measurements) {
-          // Keep at most two frames in flight so the newest copy never overwrites an unread readback.
-          while (session->in_flight.size() >= 2u && session->failure.empty()) {
-            drain_oldest(true);
-          }
-          frame.ring_index = static_cast<std::uint32_t>(session->readback_pushes++ % READBACK_RING_SIZE);
-          if (session->explicit_api) {
-            cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::copy_source);
-            cmd_list->copy_texture_region(session->stats_texture, 0u, nullptr, session->readbacks[frame.ring_index], 0u, nullptr);
-            cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::unordered_access);
-            frame.fence_value = ++session->fence_value;
-            if (session->fence.handle != 0u && session->device_api == reshade::api::device_api::d3d12) {
-              queue->signal(session->fence, frame.fence_value);
-            } else if (session->fence.handle != 0u) {
-              // A value left unsignalled because finish_present did not follow (failed present) is signalled now.
-              if (session->unsignaled_fence_value.has_value()) {
-                queue->signal(session->fence, session->unsignaled_fence_value.value());
-              }
-              session->unsignaled_fence_value = frame.fence_value;
+      if (new_frame.has_value() && has_measurements && unlocked_failure.empty()) {
+        // Keep at most two frames in flight so the newest copy never overwrites an unread readback.
+        while (session->in_flight.size() >= 2u && unlocked_failure.empty()) {
+          map_oldest(true);
+        }
+        auto& frame = new_frame.value();
+        frame.ring_index = static_cast<std::uint32_t>(session->readback_pushes++ % READBACK_RING_SIZE);
+        if (session->explicit_api) {
+          cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::copy_source);
+          cmd_list->copy_texture_region(session->stats_texture, 0u, nullptr, session->readbacks[frame.ring_index], 0u, nullptr);
+          cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::unordered_access);
+          frame.fence_value = ++session->fence_value;
+          if (session->fence.handle != 0u && session->device_api == reshade::api::device_api::d3d12) {
+            queue->signal(session->fence, frame.fence_value);
+          } else if (session->fence.handle != 0u) {
+            // A value left unsignalled because finish_present did not follow (failed present) is signalled now.
+            if (session->unsignaled_fence_value.has_value()) {
+              queue->signal(session->fence, session->unsignaled_fence_value.value());
             }
-          } else {
-            cmd_list->copy_texture_region(session->stats_texture, 0u, nullptr, session->readbacks[frame.ring_index], 0u, nullptr);
-            frame.fence_value = 0u;
+            session->unsignaled_fence_value = frame.fence_value;
+          }
+        } else {
+          cmd_list->copy_texture_region(session->stats_texture, 0u, nullptr, session->readbacks[frame.ring_index], 0u, nullptr);
+          frame.fence_value = 0u;
+        }
+      }
+      if (new_frame.has_value() && unlocked_failure.empty()) {
+        session->in_flight.push_back(new_frame.value());
+      }
+      // D3D12/Vulkan: map whatever the GPU has already finished.
+      while (session->explicit_api && !session->in_flight.empty() && unlocked_failure.empty()) {
+        if (!map_oldest(false)) break;
+      }
+    }
+    std::vector<reshade::api::resource> new_scratch_textures;
+    for (std::uint32_t index = 0u; index < scratch_growth; ++index) {
+      const auto texture = internal::CreateScratchTexture(device, *session);
+      if (texture.handle == 0u) break;
+      new_scratch_textures.push_back(texture);
+    }
+
+    // Stage 3 (locked): merge.
+    std::shared_ptr<Session> finished_session;
+    std::vector<reshade::api::resource> released_textures;
+    {
+      WatcherLock lock(watcher, "ProcessAtFrameEnd: merging the frame end");
+      if (watcher->session != session) {
+        // Only Shutdown removes a running session outside the frame end; it destroyed the session's entries.
+        if (back_buffer_texture.handle != 0u && back_buffer_entry.has_value()) {
+          released_textures.push_back(back_buffer_texture);
+        }
+        released_textures.insert(released_textures.end(), new_scratch_textures.begin(), new_scratch_textures.end());
+      } else {
+        for (const auto texture : new_scratch_textures) {
+          session->scratch_entries.push_back(ScratchEntry{.texture = texture});
+        }
+        if (back_buffer_entry.has_value()) {
+          auto& entry = session->scratch_entries[back_buffer_entry.value()];
+          if (back_buffer_texture.handle != 0u) {
+            entry.texture = back_buffer_texture;
+          } else if (auto* point = internal::FindPoint(session.get(), back_buffer_point); point != nullptr) {
+            point->refused = UnmeasuredReason::SCRATCH_BUDGET;
+            point->slot.reset();
           }
         }
-        session->in_flight.push_back(frame);
-      }
-      // D3D12/Vulkan: decode whatever the GPU has already finished.
-      while (session->explicit_api && !session->in_flight.empty() && session->failure.empty()) {
-        if (!drain_oldest(false)) break;
-      }
+        for (const auto entry_index : reduced_entries) {
+          auto& entry = session->scratch_entries[entry_index];
+          entry.awaiting_reduction = false;
+          if (entry.release_after_reduction) {
+            entry.owner_list = 0u;
+            entry.release_after_reduction = false;
+          }
+          // D3D12 entries with submissions are freed by ProcessLifetimes once the GPU passed them.
+          if (entry.owner_list == 0u && entry.submissions.empty()) {
+            entry.in_use = false;
+          }
+        }
+        if (!unlocked_failure.empty() && session->failure.empty()) {
+          session->failure = unlocked_failure;
+        }
+        decode_mapped_readbacks();
 
-      session->slots_used = 0u;
-      session->command_count = 0u;
-      session->stats_cleared = false;
-      session->truncated = false;
-      session->frame_first_point = session->points_base + session->points.size();
-      session->frame_command_base = 0u;
-      if (session->warming_up) {
-        session->warming_up = false;
-      } else if (session->closing) {
-        ++session->closing_frames;
-      } else {
-        ++session->frames_recorded;
-        session->closing = session->explicit_api && session->frames_recorded >= session->frames;
+        const auto closed = !session->open_event.has_value() && (!session->verify || session->verify_point.has_value());
+        const auto finished = request_canceled || !session->failure.empty()
+                              || (session->frames_recorded >= session->frames && (!session->explicit_api || closed || session->closing_frames >= MAX_CLOSING_FRAMES));
+        if (finished) {
+          // Detached here, so no hook reaches it any more. D3D12/Vulkan scratch entries still owned by a command list
+          // may be copied into again if the game executes that list later, and D3D12 entries with submissions may
+          // still be written by the GPU, so they move to the watcher and are destroyed when both are over.
+          finished_session = std::move(watcher->session);
+          watcher->watched_resource_handle.store(0u, std::memory_order_release);
+          watcher->has_session.store(false, std::memory_order_release);
+          for (auto& entry : session->scratch_entries) {
+            if (entry.texture.handle == 0u) continue;
+            if (entry.in_use && (entry.owner_list != 0u || !entry.submissions.empty())) {
+              watcher->retired_scratch.push_back(RetiredScratch{
+                  .texture = entry.texture,
+                  .owner_list = entry.owner_list,
+                  .submissions = std::move(entry.submissions),
+              });
+            } else {
+              released_textures.push_back(entry.texture);
+            }
+            entry.texture = {0u};
+          }
+          watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
+        }
       }
     }
 
-    const auto closed = !session->open_event.has_value() && (!session->verify || session->verify_point.has_value());
-    const auto finished = request_canceled || !session->failure.empty()
-                          || (session->frames_recorded >= session->frames && (!session->explicit_api || closed || session->closing_frames >= MAX_CLOSING_FRAMES));
-    if (finished) {
+    // Stage 4 (unlocked): complete a finished watch on its detached session.
+    if (finished_session != nullptr) {
       if (session->unsignaled_fence_value.has_value()) {
         queue->signal(session->fence, session->unsignaled_fence_value.value());
         session->unsignaled_fence_value.reset();
       }
       queue->wait_idle();
-      while (!session->in_flight.empty() && session->failure.empty()) {
-        drain_oldest(true);
+      while (!session->in_flight.empty() && unlocked_failure.empty()) {
+        map_oldest(true);
       }
+      // The presenting queue is idle; the game's other queues may still run region copies into retired textures.
+      WaitForAttachedFenceValues(watcher, device);
+      if (!unlocked_failure.empty() && session->failure.empty()) {
+        session->failure = unlocked_failure;
+      }
+      decode_mapped_readbacks();
       if (session->open_event.has_value()) {
         auto& open_event = session->events[static_cast<std::size_t>(session->open_event.value() - session->events_base)];
         open_event.after_resolved = true;
@@ -1928,6 +2726,9 @@ inline void ProcessAtFrameEnd(
               session->events_decoded - session->events_unmeasured,
               session->events_changed,
               unit);
+          if (!session->swap_chain_images.empty()) {
+            summary += std::format(" Followed the swap chain: all {} of its images count as the watched texture.", session->swap_chain_images.size());
+          }
           if (session->truncated_frames != 0u) {
             summary += std::format(" {} frame(s) hit the {}-slot or scratch budget limit.", session->truncated_frames, MAX_SLOTS);
           }
@@ -2027,6 +2828,9 @@ inline void ProcessAtFrameEnd(
             result_json["scratchEntries"] = session->scratch_entries.size();
             result_json["scratchEntriesMax"] = session->max_scratch_entries;
             result_json["closingFrames"] = session->closing_frames;
+            if (!session->swap_chain_images.empty()) {
+              result_json["swapChainImages"] = session->swap_chain_images.size();
+            }
           }
           if (session->frames == 1u) {
             result_json["trace"] = std::move(session->trace);
@@ -2156,27 +2960,27 @@ inline void ProcessAtFrameEnd(
         }
       }
 
-      watcher->watched_resource_handle.store(0u, std::memory_order_release);
-      // D3D12/Vulkan scratch entries still owned by a command list may be copied into again if the game executes that
-      // list later, so they are kept until the list is reset or destroyed. The GPU is idle here.
-      for (auto& entry : session->scratch_entries) {
-        if (entry.texture.handle == 0u) continue;
-        if (entry.in_use && entry.owner_list != 0u) {
-          watcher->retired_scratch.push_back(RetiredScratch{.texture = entry.texture, .owner_list = entry.owner_list});
-        } else {
-          device->destroy_resource(entry.texture);
-        }
-        entry.texture = {0u};
-      }
-      watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
-      internal::DestroySessionObjects(session, device);
-      watcher->session.reset();
+      internal::DestroySessionObjects(session.get(), device);
+    }
+    for (const auto texture : released_textures) {
+      device->destroy_resource(texture);
+    }
+    if (finished_session != nullptr) {
+      // Frees what the wait at the end of the watch showed the GPU is done with, without waiting for the next frame end.
+      ProcessLifetimes(watcher, device, false);
     }
   }
 
-  while (watcher->session == nullptr && !watcher->pending_requests.empty()) {
-    const auto request = watcher->pending_requests.front();
-    watcher->pending_requests.pop_front();
+  // Starts the next queued watch. Validation and GPU object creation run outside the lock; only this function installs
+  // a session, and it runs on the presenting thread, so no other watch can be installed meanwhile.
+  while (true) {
+    std::shared_ptr<Request> request;
+    {
+      WatcherLock lock(watcher, "ProcessAtFrameEnd: taking the next request");
+      if (watcher->session != nullptr || watcher->pending_requests.empty()) break;
+      request = watcher->pending_requests.front();
+      watcher->pending_requests.pop_front();
+    }
     {
       std::scoped_lock request_lock(request->mutex);
       if (request->completed || request->canceled) continue;
@@ -2236,7 +3040,7 @@ inline void ProcessAtFrameEnd(
     }
     if (device_api == reshade::api::device_api::vulkan) {
       if ((resource_desc.usage & reshade::api::resource_usage::copy_source) == 0) {
-        complete_request(request, make_error("The image was created without VK_IMAGE_USAGE_TRANSFER_SRC_BIT, so its region cannot be copied."));
+        complete_request(request, make_error("The image was created without VK_IMAGE_USAGE_TRANSFER_SRC_BIT, so its region cannot be copied. Enable the Devkit setting \"Watch Region: Copyable Vulkan Images\" (Settings > Other) and restart the game."));
         continue;
       }
       // Per-subresource barriers need vkCmdPipelineBarrier itself; called through the loader so ReShade sees it too.
@@ -2278,50 +3082,59 @@ inline void ProcessAtFrameEnd(
       continue;
     }
 
-    auto session = std::make_unique<Session>();
-    session->request = request;
-    session->watched_resource = target.resolved_resource;
-    session->original_resource = device->get_resource_from_view(request->resource_view);
-    session->immediate_cmd_list = queue->get_immediate_command_list();
-    session->subresource = first_level + (first_layer * levels);
-    session->mip_level = first_level;
-    session->array_layer = first_layer;
-    session->single_subresource = (levels * layers == 1u);
-    session->region = region;
-    session->width = region.width();
-    session->height = region.height();
-    session->signal = request->signal;
-    session->frames = request->frames;
-    session->shader_hash = request->shader_hash;
-    session->include_unchanged = request->include_unchanged;
-    session->verify = request->verify;
-    session->scratch_format = scratch_format;
-    session->used_clone = target.used_clone;
-    session->resource_format_name = formatting::StreamToString(scratch_format);
-    session->device_api = device_api;
-    session->explicit_api = internal::IsExplicitApi(device_api);
-    session->warming_up = session->explicit_api;
-    session->queue = queue;
-    session->vulkan_cmd_pipeline_barrier = vulkan_cmd_pipeline_barrier;
-    session->scratch_budget_mb = request->scratch_budget_mb;
+    auto new_session = std::make_shared<Session>();
+    new_session->request = request;
+    new_session->watched_resource = target.resolved_resource;
+    new_session->original_resource = device->get_resource_from_view(request->resource_view);
+    new_session->immediate_cmd_list = queue->get_immediate_command_list();
+    new_session->subresource = first_level + (first_layer * levels);
+    new_session->mip_level = first_level;
+    new_session->array_layer = first_layer;
+    new_session->single_subresource = (levels * layers == 1u);
+    new_session->region = region;
+    new_session->width = region.width();
+    new_session->height = region.height();
+    new_session->signal = request->signal;
+    new_session->frames = request->frames;
+    new_session->shader_hash = request->shader_hash;
+    new_session->include_unchanged = request->include_unchanged;
+    new_session->verify = request->verify;
+    new_session->scratch_format = scratch_format;
+    new_session->used_clone = target.used_clone;
+    new_session->resource_format_name = formatting::StreamToString(scratch_format);
+    new_session->device_api = device_api;
+    new_session->explicit_api = internal::IsExplicitApi(device_api);
+    new_session->warming_up = new_session->explicit_api;
+    new_session->queue = queue;
+    new_session->vulkan_cmd_pipeline_barrier = vulkan_cmd_pipeline_barrier;
+    new_session->scratch_budget_mb = request->scratch_budget_mb;
+    if (new_session->explicit_api) {
+      std::vector<std::uint64_t> images;
+      for (std::uint32_t index = 0u; index < runtime->get_back_buffer_count(); ++index) {
+        images.push_back(runtime->get_back_buffer(index).handle);
+      }
+      if (std::ranges::find(images, new_session->watched_resource.handle) != images.end()) {
+        new_session->swap_chain_images = std::move(images);
+      }
+    }
     const auto scratch_entry_bytes = std::max<std::uint64_t>(
-        static_cast<std::uint64_t>(reshade::api::format_row_pitch(scratch_format, session->width)) * session->height, 1u);
-    session->max_scratch_entries = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
-        (static_cast<std::uint64_t>(session->scratch_budget_mb) * 1024u * 1024u) / scratch_entry_bytes, 1u, MAX_SCRATCH_ENTRIES));
+        static_cast<std::uint64_t>(reshade::api::format_row_pitch(scratch_format, new_session->width)) * new_session->height, 1u);
+    new_session->max_scratch_entries = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
+        (static_cast<std::uint64_t>(new_session->scratch_budget_mb) * 1024u * 1024u) / scratch_entry_bytes, 1u, MAX_SCRATCH_ENTRIES));
 
     const auto created = device->create_resource(
-                             reshade::api::resource_desc(session->width, session->height, 1, 1, scratch_format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest),
+                             reshade::api::resource_desc(new_session->width, new_session->height, 1, 1, scratch_format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest),
                              nullptr,
                              reshade::api::resource_usage::copy_dest,
-                             &session->scratch)
-                         && device->create_resource_view(session->scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(scratch_format), &session->scratch_srv)
+                             &new_session->scratch)
+                         && device->create_resource_view(new_session->scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(scratch_format), &new_session->scratch_srv)
                          && device->create_resource(
                              reshade::api::resource_desc(STATS_STRIDE, MAX_SLOTS, 1, 1, reshade::api::format::r32_uint, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::copy_dest),
                              nullptr,
                              reshade::api::resource_usage::unordered_access,
-                             &session->stats_texture)
-                         && device->create_resource_view(session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_view_desc(reshade::api::format::r32_uint), &session->stats_uav)
-                         && std::ranges::all_of(session->readbacks, [&](auto& readback) {
+                             &new_session->stats_texture)
+                         && device->create_resource_view(new_session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_view_desc(reshade::api::format::r32_uint), &new_session->stats_uav)
+                         && std::ranges::all_of(new_session->readbacks, [&](auto& readback) {
                               return device->create_resource(
                                   reshade::api::resource_desc(STATS_STRIDE, MAX_SLOTS, 1, 1, reshade::api::format::r32_uint, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
                                   nullptr,
@@ -2329,25 +3142,33 @@ inline void ProcessAtFrameEnd(
                                   &readback);
                             });
     if (!created) {
-      internal::DestroySessionObjects(session.get(), device);
+      internal::DestroySessionObjects(new_session.get(), device);
       complete_request(request, make_error("Failed to create the GPU resources for the region reduction."));
       continue;
     }
     // Without a fence (Vulkan without timeline semaphores), a readback is only read after waiting for the queue.
-    if (session->explicit_api && !device->create_fence(0u, reshade::api::fence_flags::none, &session->fence)) {
-      session->fence = {0u};
+    if (new_session->explicit_api && !device->create_fence(0u, reshade::api::fence_flags::none, &new_session->fence)) {
+      new_session->fence = {0u};
+    }
+    // D3D12/Vulkan hooks never create scratch textures (see ReserveScratchEntry), so the pool starts here.
+    if (new_session->explicit_api) {
+      for (std::uint32_t index = 0u; index < std::min(INITIAL_SCRATCH_ENTRIES, new_session->max_scratch_entries); ++index) {
+        const auto texture = internal::CreateScratchTexture(device, *new_session);
+        if (texture.handle == 0u) break;
+        new_session->scratch_entries.push_back(ScratchEntry{.texture = texture});
+      }
     }
 
-    session->pass.pipeline_subobjects.compute_shader = reduce_shader;
-    session->pass.shader_resource_slots.views = {session->scratch_srv};
-    session->pass.unordered_access_slots.views = {session->stats_uav};
-    session->pass.push_constants[renodx::utils::render::ConstantBuffersSlots{.slot = 0, .space = 0}] =
-        std::span<const float>(session->constants.data(), session->constants.size());
+    new_session->pass.pipeline_subobjects.compute_shader = reduce_shader;
+    new_session->pass.shader_resource_slots.views = {new_session->scratch_srv};
+    new_session->pass.unordered_access_slots.views = {new_session->stats_uav};
+    new_session->pass.push_constants[renodx::utils::render::ConstantBuffersSlots{.slot = 0, .space = 0}] =
+        std::span<const float>(new_session->constants.data(), new_session->constants.size());
     // D3D11 saves and restores the compute slots itself; D3D12/Vulkan render on ReShade's own immediate command list.
-    session->pass.revert_state_after_render = false;
-    session->pass.dispatch_group_counts = std::make_tuple(
-        (session->width + GROUP_SIZE - 1u) / GROUP_SIZE,
-        (session->height + GROUP_SIZE - 1u) / GROUP_SIZE,
+    new_session->pass.revert_state_after_render = false;
+    new_session->pass.dispatch_group_counts = std::make_tuple(
+        (new_session->width + GROUP_SIZE - 1u) / GROUP_SIZE,
+        (new_session->height + GROUP_SIZE - 1u) / GROUP_SIZE,
         1u);
 
     reshade::log::message(
@@ -2355,25 +3176,81 @@ inline void ProcessAtFrameEnd(
         std::format(
             "devkit::watch_region(device #{}, resource {}, {}x{} at ({}, {}), {} frame(s))",
             device_index,
-            formatting::FormatHandle(session->watched_resource.handle),
-            session->width,
-            session->height,
+            formatting::FormatHandle(new_session->watched_resource.handle),
+            new_session->width,
+            new_session->height,
             region.left,
             region.top,
-            session->frames)
+            new_session->frames)
             .c_str());
 
-    const auto watched_resource_handle = session->watched_resource.handle;
-    watcher->session = std::move(session);
+    const auto watched_resource_handle = new_session->watched_resource.handle;
+    WatcherLock lock(watcher, "ProcessAtFrameEnd: starting a watch");
+    watcher->session = std::move(new_session);
+    watcher->has_session.store(true, std::memory_order_release);
     watcher->watched_resource_handle.store(watched_resource_handle, std::memory_order_release);
   }
 }
 
 // Fails whatever is still queued or running when the device goes away, and destroys every scratch texture (no command
-// list of the device can run any more).
+// list of the device can run any more). On D3D12 the GPU may still be running region copies of the game's queues: those
+// are waited for first (LIFETIME_FENCE_WAIT_TIMEOUT per queue, device-removed check), with one more signal on each queue
+// that has submissions without a fence value; the game no longer submits while its device is destroyed.
 inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
-  std::unique_lock lock(watcher->mutex);
-  watcher->watched_resource_handle.store(0u, std::memory_order_release);
+  struct FinalSignal {
+    reshade::api::command_queue* queue = nullptr;
+    reshade::api::fence fence = {0u};
+    std::uint64_t value = 0u;
+    bool needs_signal = false;
+  };
+  std::vector<FinalSignal> final_signals;
+  std::vector<reshade::api::fence> fences_to_destroy;
+
+  // Everything is taken out under the lock and destroyed after releasing it.
+  std::shared_ptr<Session> session;
+  std::vector<RetiredScratch> retired_scratch;
+  std::deque<std::shared_ptr<Request>> pending_requests;
+  {
+    WatcherLock lock(watcher, "Shutdown");
+    watcher->watched_resource_handle.store(0u, std::memory_order_release);
+    for (auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
+      const auto queue_handle = fence_queue_handle;
+      std::uint64_t highest_value = 0u;
+      bool has_unfenced = false;
+      internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
+        for (const auto& submission : submissions) {
+          if (reinterpret_cast<std::uint64_t>(submission.queue) != queue_handle) continue;
+          if (submission.fence_value.has_value()) {
+            highest_value = std::max(highest_value, submission.fence_value.value());
+          } else {
+            has_unfenced = true;
+          }
+        }
+      });
+      if (has_unfenced) {
+        highest_value = ++queue_fence.last_value;
+      }
+      if (highest_value != 0u) {
+        final_signals.push_back(FinalSignal{
+            .queue = reinterpret_cast<reshade::api::command_queue*>(queue_handle),
+            .fence = queue_fence.fence,
+            .value = highest_value,
+            .needs_signal = has_unfenced,
+        });
+      }
+      fences_to_destroy.push_back(queue_fence.fence);
+    }
+    watcher->queue_fences.clear();
+    fences_to_destroy.insert(fences_to_destroy.end(), watcher->orphan_fences.begin(), watcher->orphan_fences.end());
+    watcher->orphan_fences.clear();
+    session = std::move(watcher->session);
+    watcher->has_session.store(false, std::memory_order_release);
+    retired_scratch = std::move(watcher->retired_scratch);
+    watcher->retired_scratch.clear();
+    watcher->has_retired_scratch.store(false, std::memory_order_release);
+    pending_requests = std::move(watcher->pending_requests);
+    watcher->pending_requests.clear();
+  }
 
   const auto fail_request = [](const std::shared_ptr<Request>& request) {
     {
@@ -2387,25 +3264,37 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
     }
     request->cv.notify_all();
   };
-  if (watcher->session != nullptr) {
-    for (const auto& entry : watcher->session->scratch_entries) {
+  if (!final_signals.empty()) {
+    std::vector<std::pair<reshade::api::fence, std::uint64_t>> fences;
+    for (const auto& final_signal : final_signals) {
+      if (final_signal.needs_signal && !internal::SignalQueueNative(final_signal.queue, final_signal.fence, final_signal.value)) {
+        reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence signal failed at device destruction)");
+      }
+      fences.emplace_back(final_signal.fence, final_signal.value);
+    }
+    if (!internal::WaitForFences(device, fences)) {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait timed out at device destruction; the scratch textures are destroyed with the device)");
+    }
+  }
+
+  if (session != nullptr) {
+    for (const auto& entry : session->scratch_entries) {
       if (entry.texture.handle != 0u) {
         device->destroy_resource(entry.texture);
       }
     }
-    internal::DestroySessionObjects(watcher->session.get(), device);
-    fail_request(watcher->session->request);
-    watcher->session.reset();
+    internal::DestroySessionObjects(session.get(), device);
+    fail_request(session->request);
   }
-  for (const auto& retired : watcher->retired_scratch) {
+  for (const auto& retired : retired_scratch) {
     device->destroy_resource(retired.texture);
   }
-  watcher->retired_scratch.clear();
-  watcher->has_retired_scratch.store(false, std::memory_order_release);
-  for (const auto& request : watcher->pending_requests) {
+  for (const auto fence : fences_to_destroy) {
+    device->destroy_fence(fence);
+  }
+  for (const auto& request : pending_requests) {
     fail_request(request);
   }
-  watcher->pending_requests.clear();
 }
 
 [[nodiscard]] inline ToolResult HandleWatchRegionTool(const json& arguments, const ToolContext& context) {

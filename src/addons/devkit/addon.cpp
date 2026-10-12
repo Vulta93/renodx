@@ -133,6 +133,8 @@ std::atomic_bool snapshot_pane_show_non_executed_command_lists = false;
 std::atomic_bool shaders_pane_show_vertex_shaders = false;
 std::atomic_bool shaders_pane_show_pixel_shaders = true;
 std::atomic_bool shaders_pane_show_compute_shaders = true;
+// Opt-in: adds copy-source usage to the game's Vulkan images at creation, so devkit_watch_region can copy them.
+std::atomic_bool watch_region_copy_source_usage = false;
 
 uint32_t skip_draw_count = 0;
 
@@ -2821,7 +2823,7 @@ void CancelPendingResourceAnalysisRequest(
   }
   auto* device_data = device_data_list[device_index];
 
-  std::unique_lock watcher_lock(device_data->watch_region_watcher.mutex);
+  const devkit_watch_region::WatcherLock watcher_lock(&device_data->watch_region_watcher, "EnqueuePendingWatchRegionRequest");
   device_data->watch_region_watcher.pending_requests.push_back(request);
   return true;
 }
@@ -2835,7 +2837,7 @@ void CancelPendingWatchRegionRequest(
   }
   auto* device_data = device_data_list[device_index];
 
-  std::unique_lock watcher_lock(device_data->watch_region_watcher.mutex);
+  const devkit_watch_region::WatcherLock watcher_lock(&device_data->watch_region_watcher, "CancelPendingWatchRegionRequest");
   std::erase(device_data->watch_region_watcher.pending_requests, request);
 }
 
@@ -8044,6 +8046,8 @@ struct SettingsDeviceOption {
 
   if (BeginSettingsSection("Other")) {
     DrawSettingDecimalTextbox("FPS Limit", "FPSLimit", &renodx::utils::swapchain::fps_limit);
+    DrawSettingBoolCheckbox("Watch Region: Copyable Vulkan Images (restart)", "WatchRegionCopySourceUsage", &watch_region_copy_source_usage);
+    ImGui::SetItemTooltip("Adds copy-source usage to the game's Vulkan images so devkit_watch_region can measure them. Only images created after it is enabled: restart the game.");
 
     EndSettingsSection();
   }
@@ -9005,6 +9009,7 @@ void InitializeUserSettings() {
            {"TraceDescriptorTables", &renodx::utils::descriptor::trace_descriptor_tables},
            {"TraceConstantBuffers", &renodx::utils::constants::capture_constant_buffers},
            {"SnapshotTraceWithSnapshot", &snapshot_trace_with_snapshot},
+           {"WatchRegionCopySourceUsage", &watch_region_copy_source_usage},
            {"SnapshotPaneShowVertexShaders", &snapshot_pane_show_vertex_shaders},
            {"SnapshotPaneShowPixelShaders", &snapshot_pane_show_pixel_shaders},
            {"SnapshotPaneShowComputeShaders", &snapshot_pane_show_compute_shaders},
@@ -9341,6 +9346,37 @@ void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain
   devkit_watch_region::OnFinishPresent(&device_data->watch_region_watcher, queue);
 }
 
+void OnDestroyCommandQueue(reshade::api::command_queue* queue) {
+  auto* device_data = renodx::utils::data::Get<DeviceData>(queue->get_device());
+  if (device_data == nullptr) return;
+  devkit_watch_region::OnCommandQueueDestroyed(&device_data->watch_region_watcher, queue);
+}
+
+// Vulkan images can only be copied with VK_IMAGE_USAGE_TRANSFER_SRC_BIT, and devkit_watch_region measures by copying.
+// With the opt-in setting the flag is added to every image the game creates from then on. Same rules as the Vulkan
+// clone targets in utils/resource_upgrade.hpp OnCreateResource: shared and sparse images, and formats without copy
+// support, are left alone. ReShade hands the same desc to every add-on's handler and RenoDX resource upgrades only add
+// usage bits, so the flag survives whatever the handler order.
+bool OnCreateResource(
+    reshade::api::device* device,
+    reshade::api::resource_desc& desc,
+    reshade::api::subresource_data* /*initial_data*/,
+    reshade::api::resource_usage /*initial_state*/) {
+  if (!watch_region_copy_source_usage.load(std::memory_order_relaxed)) return false;
+  if (device->get_api() != reshade::api::device_api::vulkan) return false;
+  if (desc.type == reshade::api::resource_type::buffer || desc.type == reshade::api::resource_type::unknown) return false;
+  constexpr auto special_flags = reshade::api::resource_flags::shared
+                                 | reshade::api::resource_flags::shared_nt_handle
+                                 | reshade::api::resource_flags::sparse_binding;
+  if (renodx::utils::bitwise::HasAnyFlag(desc.flags, special_flags)
+      || renodx::utils::bitwise::HasAnyFlag(desc.usage, reshade::api::resource_usage::copy_source)
+      || !device->check_format_support(desc.texture.format, reshade::api::resource_usage::copy_source)) {
+    return false;
+  }
+  desc.usage = renodx::utils::bitwise::SetFlag(desc.usage, reshade::api::resource_usage::copy_source);
+  return true;
+}
+
 void OnPresent(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -9577,6 +9613,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
       reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
+      reshade::register_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
       reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
@@ -9627,6 +9665,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::barrier>(OnBarrier);
       reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
       reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
+      reshade::unregister_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
