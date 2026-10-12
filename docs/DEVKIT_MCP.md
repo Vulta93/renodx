@@ -253,43 +253,115 @@ The PNG is for quick visual inspection, not for HDR truth.
   and the share of pixels above 203/400/1000/4000 nits. Only use it on a resource that actually holds that encoding, such as
   the swap chain or an HDR10/scRGB output target.
 
-### Watching a region over time (`devkit_watch_region`, D3D11)
+### Watching a region over time (`devkit_watch_region`, D3D11, D3D12, Vulkan)
 
 `devkit_watch_region` answers "which draw changes this region of this buffer, and how?" without a snapshot or screenshots.
 The state of a texture after command N equals its state before the next command that writes it, so the devkit measures the
-region on the GPU before every command that writes the texture and once more at present. Writers are draws with the texture
-bound as a render target, dispatches with it bound as a compute UAV, and copies, render target and UAV clears, resolves and
-`UpdateSubresource` calls that target it. Each measurement copies the region into a scratch texture and reduces it with a small compute shader
-(`watch_region_reduce.cs_5_x.hlsl`) into a stats texture that is read back two frames later.
+region before every command that writes the texture and once more at the end of every frame. Writers are draws with the
+texture bound as a render target, dispatches with it bound as a compute UAV, and copies, render target and UAV clears,
+resolves and updates that target it. The reduction is a small compute shader (`watch_region_reduce.cs_5_x.hlsl`) that writes
+one row of an R32_UINT stats texture per measurement; the stats texture is read back two frames later.
+
+The end of a frame is ReShade's `reshade_present` event. ReShade raises `present` for every add-on first and only then runs its
+effect runtime, which ends with `reshade_present`, so the end-of-frame measurement includes everything other add-ons wrote in
+their present handlers (for example a mod's swap chain proxy pass), whatever the add-on load order. A swap chain without a
+ReShade effect runtime never reaches `reshade_present`, so a watch on it times out.
+
+On the back buffer the end-of-frame measurement (`endOfWatch`, the final step of a trace and `verify` at that point) also
+includes everything ReShade draws there before `reshade_present`: in `runtime::on_present` (`external/reshade/source/runtime.cpp`)
+the enabled effects run first (`render_effects`), then `draw_gui` draws the overlay (`runtime_gui.cpp`: the ReShade menu, the
+splash/loading banner, the FPS/clock/frame-time/preset-name statistics, add-on settings windows while the menu is open, and
+whatever add-ons draw in the `reshade_overlay` event, which fires every frame even with the menu closed, for example the HDR
+Analysis Logger's region outline), and only then is `reshade_present` raised. With a resolved or format-converted back buffer
+the result is copied back before the event, so it is included as well. For clean final numbers, disable visible effects, close
+the ReShade menu, turn off the FPS/clock statistics and any add-on on-screen drawing before watching the back buffer.
+Measurements on any other texture are not affected.
 
 Arguments: `resourceViewHandle` and `preferClone` (as for `devkit_analyze_resource`; the backing resource or its clone is
 watched), the optional region (`regionX`/`regionY`/`regionWidth`/`regionHeight`, default: whole texture), `signal`
-(`raw`/`pq`/`scrgb`), `frames` (default 1, max 3600), `shaderHash` (measure only writers using that shader) and
-`includeUnchanged` (also list writers that did not change the region, `frames: 1` only) and `verify` (read the region back to
-the CPU at the last present and compare it with the GPU statistics of that same moment: `verify.status` is `match`,
-`mismatch` with the differing fields, or `skipped` when nothing was measured at the last present, for example with
-`shaderHash`, whose last filtered writer is closed at the next writer). The call blocks until done.
+(`raw`/`pq`/`scrgb`), `frames` (default 1, max 3600), `shaderHash` (measure only writers using that shader),
+`includeUnchanged` (also list writers that did not change the region, `frames: 1` only), `verify` (read the region back to
+the CPU at one measurement point at the end of the watch and compare it with the GPU statistics of that same point:
+`verify.status` is `match`, `mismatch` with the differing fields, or `skipped` when no such point was measured; on D3D11 and on a D3D12/Vulkan back buffer the point is the end of the last frame) and
+`scratchBudgetMB` (D3D12/Vulkan, default 512, see below). The call blocks until done.
 
 - `frames: 1` returns `trace`: every writer that changed the region, in command order, with `commandIndex` (ordinal among the
-  frame's draws, dispatches and copies; offset from `devkit_list_draws` indexes, so match by shader hash and order), shader
-  hashes and region stats before and after (`maxLuminance`, `minLuminance`, `meanLuminance`, `maxChannel`, pixel counts above 1.0,
-  negative, non-finite, black, and above 203/400/1000/4000 nits with a signal).
-- Every call returns `writers`, aggregated per writer (kind + pixel/vertex/compute hash): executions, frames seen, how often the
-  region changed, min/mean/max of the region peak and mean before and after, how often the peak was lowered or raised, how often
-  values went from above 1.0 to at most 1.0, and `afterPeakMode` (the most repeated after-peak, a ceiling candidate).
+  frame's draws, dispatches and copies, in submission order on D3D12/Vulkan; offset from `devkit_list_draws` indexes, so match
+  by shader hash and order), shader hashes and region stats before and after (`maxLuminance`, `minLuminance`, `meanLuminance`,
+  `maxChannel`, pixel counts above 1.0, negative, non-finite, black, and above 203/400/1000/4000 nits with a signal). Render
+  pass writers (D3D12 render passes, Vulkan render pass instances) also list their `draws`.
+- Every call returns `writers`, aggregated per writer (kind + pixel/vertex/compute hash; render passes by the set of their pixel
+  shaders): executions, frames seen, how often the region changed, min/mean/max of the region peak and mean before and after,
+  how often the peak was lowered or raised, how often values went from above 1.0 to at most 1.0, and `afterPeakMode` (the most
+  repeated after-peak, a ceiling candidate).
+- Writers whose state before or after could not be measured are never dropped: each one is in `trace` with `measured: false`,
+  `unmeasuredSide` and `unmeasuredReason`, counted in `writers[].unmeasuredExecutions`/`unmeasuredReasons`, in
+  `unmeasured.reasons`, and its frame is listed in `unmeasured.frames`. Reasons: `slot_limit` (more than 1023 measurements in a
+  frame), `scratch_budget`, `state_unknown`, `inside_render_pass`, `other_queue`, `resubmitted`, `untracked_command_list`,
+  `bundle`, `no_later_measurement`.
+- `endOfWatch` holds the region stats measured at the end of the last frame (D3D11: always; D3D12/Vulkan: only for the
+  presented back buffer). It includes every write made during present, including passes other add-ons draw there.
 - Statistics are luminance (BT.709 weights on raw values, or nits for `pq`/`scrgb`); the GPU path computes no percentiles.
 
-Limits: D3D11 immediate context only (deferred contexts are skipped); 2D, non-MSAA textures in 8-bit, 10-bit, R11G11B10, 16-bit
-or 32-bit float formats; up to 1023 measured writers per frame (`truncatedFrames` reports frames that hit it). Each measured
-writer costs a region copy and a small dispatch, so use a region or `shaderHash` for long watches of busy buffers.
+**D3D11** measures in place on the immediate context: the region is copied into a scratch texture and reduced right away. The
+compute slots the pass uses (CS shader, b0, t0, u0) are saved and restored with native D3D11 calls. Deferred contexts are skipped.
+
+**D3D12 and Vulkan** never change the game's pipeline, root signature, descriptor heap, descriptor set or push constant
+bindings. At a measurement point inside a game command list, the region is only copied into a pooled scratch texture: the
+watched subresource is transitioned from its exactly known state to copy source and back (a native per-subresource barrier
+for textures with more than one subresource, since ReShade's `barrier()` transitions all of them). The lists' records are
+committed at `execute_command_list`, so measurements follow submission order, not recording order; all reductions run at the
+end of the frame on ReShade's immediate command list of the presenting queue, after barriers that order them behind the
+game's copies. The stats readback is guarded by a fence (Vulkan: signalled at `finish_present`). Scratch textures copied into
+by a command list stay reserved until that list is reset or destroyed (it may be executed again), also after the watch ends.
+`scratchBudgetMB` caps their total size: a full-resolution 4K FP16 region needs 66 MB per measurement, so use a region or
+`shaderHash` on busy buffers; measurements beyond the budget are reported as `scratch_budget`.
+
+The state of the watched subresource is only taken where it is exactly known; everywhere else the writer is reported as
+unmeasured and its "before" comes from the last measurement point in submission order, if no other writer came in between:
+
+| Point | D3D12 | Vulkan |
+|---|---|---|
+| Draw with the texture as render target (outside a render pass) | RENDER_TARGET | (draws are always inside a render pass) |
+| Render pass begin with the texture as attachment | RENDER_TARGET | not measured (`state_unknown`): the event is also raised for NextSubpass and inherited secondary command buffers, and the initial layout is not exposed |
+| Draws inside a render pass | members of the render pass writer | members of the render pass writer |
+| Render target clear | RENDER_TARGET | COLOR_ATTACHMENT_OPTIMAL for single-subresource images (ReShade's own transition around the event); `inside_render_pass` for vkCmdClearAttachments |
+| Dispatch / UAV clear | UNORDERED_ACCESS | GENERAL |
+| Copy or resolve destination | not measured (implicit promotion from COMMON) | not measured (GENERAL or TRANSFER_DST) |
+| The game's barrier on the texture | not used (no subresource, enhanced barriers report access) | the new layout, for single-subresource images and layouts ReShade maps one-to-one (not `general`) |
+| End of frame | PRESENT, only for the presented back buffer | PRESENT_SRC, only for the presented back buffer |
+
+For any other texture, the last writer of a frame is closed by the next exact point, usually in the next frame; the watch runs
+up to 4 extra frames for that and reports `no_later_measurement` otherwise. The first frame of a D3D12/Vulkan watch is a
+warm-up: command lists that were already recording when the watch started have an unknown render pass state and are reported
+as `untracked_command_list` until they are reset.
+
+Refused or limited cases on D3D12/Vulkan, all stated in the output:
+
+- Command lists executed on a queue other than the presenting one (async compute, copy queues), and D3D12 non-direct lists:
+  `other_queue`.
+- A command list executed again without being reset (or a Vulkan secondary command buffer inserted again): `resubmitted`;
+  when this happens twice in the same frame, the first execution's measurements are invalidated too.
+- D3D12 bundles cannot contain copies or barriers: a bundle executed while the texture is a render target is a `bundle`
+  writer. Vulkan secondary command buffers are inserted into the primary at `execute_secondary_command_list`; their render pass
+  draws are merged into the primary's render pass.
+- D3D12 textures with `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` and Vulkan images without `TRANSFER_SRC` usage are
+  refused. Device-level texture updates are ignored.
+- The measurement copies and barriers cost GPU time and VRAM; use a region or `shaderHash` for long watches.
+
+Limits on every API: 2D, non-MSAA textures in 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats; up to 1023 measured
+writers per frame (`truncatedFrames` reports frames that hit it or the scratch budget).
 
 - Only commands the game issues are hooked. Passes that add-ons draw through the ReShade API (for example a mod's swap chain
-  proxy pass at present) are invisible; their effect shows up only if it lands before the present-time measurement. When a mod
+  proxy pass at present) are not reported as writers; their effect lands in the end-of-frame measurement. When a mod
   redirects the game's rendering into clones, watch the clone (`preferClone: true`).
 - Draws that write the texture through a pixel-shader UAV are not detected.
 - If the watched texture is destroyed during the watch (for example on resize), the watch stops and returns an error.
-- When another add-on performs a write itself inside the same ReShade event (for example a mod redirecting a clear onto its
-  clone), its handler may run before the Devkit's, so that writer's "before" already includes the write.
+- When another add-on performs a write itself inside the same ReShade event as a game writer (for example a mod redirecting a
+  clear onto its clone), its handler may run before or after the Devkit's, so that write lands on either side of the
+  measurement.
+- Follow-up: `devkit_analyze_resource` still reads the texture inside the Devkit's own `present` handler, so on a back buffer
+  it can miss what add-ons loaded after the Devkit draw at present (the ordering problem fixed here for the watch).
 
 ## 11. Current practical caveats
 
