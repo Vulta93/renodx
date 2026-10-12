@@ -439,9 +439,13 @@ struct Session {
   VulkanCmdPipelineBarrier vulkan_cmd_pipeline_barrier = nullptr;
   std::vector<ScratchEntry> scratch_entries;
   std::uint32_t max_scratch_entries = 0u;
-  // Hook reservations that found no free scratch texture since the last frame end; the frame end grows the pool by
-  // this many (within the budget).
+  // Hook reservations that found no free scratch texture since the last frame end.
   std::uint32_t scratch_pool_misses = 0u;
+  // Reservations asked for since the last frame end (found or not, hooks and frame end): the frame end grows the pool
+  // so that the next frame starts with this many free textures, within the budget.
+  std::uint32_t scratch_frame_demand = 0u;
+  // Largest pool size a frame end wanted (the pool plus its shortfall), even beyond the budget.
+  std::uint32_t scratch_entries_needed = 0u;
   std::uint32_t scratch_budget_mb = DEFAULT_SCRATCH_BUDGET_MB;
   std::unordered_map<std::uint64_t, ListState> lists;
   reshade::api::fence fence = {0u};
@@ -780,6 +784,7 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
     Session* session,
     std::uint64_t owner_list,
     bool allow_new) {
+  ++session->scratch_frame_demand;
   std::optional<std::uint32_t> entry_index = std::nullopt;
   for (std::uint32_t index = 0u; index < session->scratch_entries.size(); ++index) {
     const auto& candidate = session->scratch_entries[index];
@@ -2598,12 +2603,36 @@ inline void ProcessAtFrameEnd(
           }
         }
       }
-      // The pool grows by what the hooks were short of since the last frame end, within the budget; the textures are
-      // created in stage 2 on this thread and added in stage 3.
-      scratch_growth = std::min<std::uint32_t>(
-          session->scratch_pool_misses,
-          session->max_scratch_entries - std::min<std::uint32_t>(session->max_scratch_entries, static_cast<std::uint32_t>(session->scratch_entries.size())));
+      // The pool grows so that the next frame starts with as many free textures as this frame asked for (at least by
+      // what the hooks were short of), within the budget. Free after this frame end: the entries not in use, plus the
+      // ones stage 3 releases (reduced, no command list owner left, no GPU submission; D3D12 entries with submissions
+      // are freed later by ProcessLifetimes). Closing frames only need the point after the last writer, so they grow
+      // the pool only by what the hooks were short of: the watch may end at this frame end, and textures created for a
+      // whole frame's demand would be destroyed at once. The textures are created in stage 2 on this thread and added
+      // in stage 3.
+      if (session->explicit_api && frame_planned) {
+        std::uint32_t free_after = 0u;
+        for (const auto& entry : session->scratch_entries) {
+          if (!entry.in_use && entry.texture.handle != 0u) ++free_after;
+        }
+        auto released_entries = reduced_entries;
+        std::ranges::sort(released_entries);
+        released_entries.erase(std::ranges::unique(released_entries).begin(), released_entries.end());
+        for (const auto entry_index : released_entries) {
+          const auto& entry = session->scratch_entries[entry_index];
+          if (entry.in_use && (entry.owner_list == 0u || entry.release_after_reduction) && entry.submissions.empty()
+              && std::ranges::find(cross_queue_reduced_entries, entry_index) == cross_queue_reduced_entries.end()) {
+            ++free_after;
+          }
+        }
+        const auto pool_size = static_cast<std::uint32_t>(session->scratch_entries.size());
+        const auto demand_shortfall = (session->scratch_frame_demand > free_after ? session->scratch_frame_demand - free_after : 0u);
+        const auto shortfall = (session->closing ? session->scratch_pool_misses : std::max(session->scratch_pool_misses, demand_shortfall));
+        session->scratch_entries_needed = std::max(session->scratch_entries_needed, pool_size + shortfall);
+        scratch_growth = std::min(shortfall, session->max_scratch_entries - std::min(session->max_scratch_entries, pool_size));
+      }
       session->scratch_pool_misses = 0u;
+      session->scratch_frame_demand = 0u;
     }
 
     // Stage 2 (unlocked): GPU work on the plan.
@@ -2690,6 +2719,12 @@ inline void ProcessAtFrameEnd(
       const auto texture = internal::CreateScratchTexture(device, *session);
       if (texture.handle == 0u) break;
       new_scratch_textures.push_back(texture);
+    }
+    // Creating many textures in one frame end can cause a hitch: logged so that a stutter during a watch is explained.
+    if (!new_scratch_textures.empty()) {
+      reshade::log::message(
+          reshade::log::level::info,
+          std::format("devkit::watch_region(created {} of {} wanted scratch texture(s) at a frame end)", new_scratch_textures.size(), scratch_growth).c_str());
     }
 
     // Stage 3 (locked): merge.
@@ -2861,6 +2896,13 @@ inline void ProcessAtFrameEnd(
           if (session->truncated_frames != 0u) {
             summary += std::format(" {} frame(s) hit the {}-slot or scratch budget limit.", session->truncated_frames, MAX_SLOTS);
           }
+          if (session->explicit_api && session->scratch_entries_needed > session->max_scratch_entries) {
+            summary += std::format(
+                " The scratch budget allows {} texture(s) but a frame needed up to {}: use a region or shaderHash (or raise"
+                " scratchBudgetMB).",
+                session->max_scratch_entries,
+                session->scratch_entries_needed);
+          }
           if (session->events_cross_queue != 0u) {
             summary += std::format(
                 " {} writer execution(s) ran on another queue than the presenting one (crossQueue: ordered by CPU submission"
@@ -2965,6 +3007,7 @@ inline void ProcessAtFrameEnd(
             result_json["scratchBudgetMB"] = session->scratch_budget_mb;
             result_json["scratchEntries"] = session->scratch_entries.size();
             result_json["scratchEntriesMax"] = session->max_scratch_entries;
+            result_json["scratchEntriesNeeded"] = session->scratch_entries_needed;
             result_json["closingFrames"] = session->closing_frames;
             if (!session->swap_chain_images.empty()) {
               result_json["swapChainImages"] = session->swap_chain_images.size();

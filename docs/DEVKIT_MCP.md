@@ -334,9 +334,18 @@ texture count, budget / (region width x height x bytes per pixel), capped at 409
 (512 MB for a 512x512 `r10g10b10a2` region is 512 textures of 1 MB). The hooks never create
 scratch textures: creating an image inside the game's own command recording calls the driver and the game's allocation
 callbacks from a context the game does not expect (it deadlocked DOOM 2016's allocator). A pool of up to 16 is created when
-the watch starts, and the frame end (on the presenting thread) grows it by however many the hooks were short of, within the
-budget; a hook that finds no free texture reports that writer as `scratch_pool_empty`, so the first busy frames of a watch
-can show some of those.
+the watch starts. Each frame end (on the presenting thread) counts the textures that frame asked for, found or not, and
+grows the pool so the next frame starts with that many free, within the budget; a texture still held (D3D12: until its
+lifetime fence passed, at least two frame ends and 100 ms) does not count as free, so on D3D12 the pool settles near
+that many frames' worth.
+Closing frames grow it only by what the hooks were short of. The warm-up frame sizes the pool for the first measured
+frame, so a 1-frame watch is usually fully sized but not always: lists already recording when the watch started are
+untracked and reserve nothing in the warm-up frame. A hook that finds no free texture reports that writer as
+`scratch_pool_empty`. `scratchEntriesNeeded` is the largest pool a frame end wanted; above `scratchEntriesMax` the summary
+says the budget was too small (use a region or `shaderHash`, or raise `scratchBudgetMB`). Each frame end that creates
+textures logs how many (`created N of M wanted scratch texture(s)`), since creating many at once can cause a hitch. The
+pool belongs to one watch: it is destroyed when the watch ends (textures still owned by a game command list or not yet
+passed by the GPU are destroyed once they are), and the next watch starts again from 16.
 
 The watch's lock only covers bookkeeping. On D3D12/Vulkan no GPU work (barriers, copies, reductions, fence signals, maps),
 no object creation or destruction and no wait runs under it, because a driver call can call back into the game (for
@@ -441,9 +450,15 @@ writers per frame (`truncatedFrames` reports frames that hit it or the scratch b
   measurement.
 - Follow-up: `devkit_analyze_resource` still reads the texture inside the Devkit's own `present` handler, so on a back buffer
   it can miss what add-ons loaded after the Devkit draw at present (the ordering problem fixed here for the watch).
-- Cross-queue points are reduced at least two frame ends and 100 ms after their execution, so they need more scratch
-  textures (`scratch_pool_empty` on busy targets: use a region or `shaderHash`), and a 1-frame watch on such a game
-  takes about a second to close.
+- Cross-queue points are reduced at least two frame ends and 100 ms after their execution, so they hold scratch
+  textures longer (on busy targets the pool can reach the budget: use a region or `shaderHash`), and a 1-frame watch on
+  such a game takes about a second to close.
+- On targets with hundreds of writers per frame (for example an Unreal Engine 5 G-buffer), a 1-frame watch can come up
+  empty: Unreal records the next frame while the pool grows. Use `shaderHash` to watch only the writers you care about
+  (keeps the per-command trace), or `frames` >= 2 (aggregated writers only, no trace); both only reduce the loss. In
+  Gears of War: E-Day's G-buffer (cross-queue), `shaderHash` on one draw shader measured 5 of its 72 draws in a 1-frame
+  watch and 145 of 288 over 4 frames, the rest `scratch_pool_empty`. Growing the pool by about 1400 textures at one
+  frame end took about 450 ms there (a one-time hitch, logged).
 - A command list the game executes again on its own queue without resetting it, after one of its cross-queue points was
   reduced, can overwrite that point's copy while the presenting queue still reads it (wrong statistics for that point; the
   overlapping use is undefined in D3D12, not seen in testing). Engines that reset their lists every frame (Unreal Engine) do not do this.
