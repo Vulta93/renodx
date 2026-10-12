@@ -300,7 +300,8 @@ the CPU at one measurement point at the end of the watch and compare it with the
   frame), `scratch_budget`, `scratch_pool_empty`, `state_unknown`, `inside_render_pass`, `other_queue`, `resubmitted`,
   `untracked_command_list`, `bundle`, `no_later_measurement`, `descriptor_table` (a D3D12/Vulkan dispatch that can reach
   the texture only through a bound descriptor table: bindless engines keep most textures in one table, so this does not
-  prove a write and gives no known state; no barrier or copy is issued for it).
+  prove a write and gives no known state; no barrier or copy is issued for it), `cross_queue_not_ready` (D3D12: see
+  cross-queue points below).
 - `endOfWatch` holds the region stats measured at the end of the last frame (D3D11: always; D3D12/Vulkan: only for the
   presented back buffer). It includes every write made during present, including passes other add-ons draw there.
 - Statistics are luminance (BT.709 weights on raw values, or nits for `pq`/`scrgb`); the GPU path computes no percentiles.
@@ -328,7 +329,9 @@ then (100 ms covers the submit thread being paused by the OS). When the game des
 `destroy_command_queue` before releasing the native queue), its submissions get one more signal and are waited for there;
 a queue destroyed before it got a fence, or whose wait fails, keeps its textures until the device is destroyed (logged).
 `scratchBudgetMB` caps their total size: a full-resolution 4K FP16 region needs 66 MB per measurement, so use a region or
-`shaderHash` on busy buffers; measurements beyond the budget are reported as `scratch_budget`. The hooks never create
+`shaderHash` on busy buffers; measurements beyond the budget are reported as `scratch_budget`. The budget becomes a
+texture count, budget / (region width x height x bytes per pixel), capped at 4096 and reported as `scratchEntriesMax`
+(512 MB for a 512x512 `r10g10b10a2` region is 512 textures of 1 MB). The hooks never create
 scratch textures: creating an image inside the game's own command recording calls the driver and the game's allocation
 callbacks from a context the game does not expect (it deadlocked DOOM 2016's allocator). A pool of up to 16 is created when
 the watch starts, and the frame end (on the presenting thread) grows it by however many the hooks were short of, within the
@@ -383,14 +386,28 @@ whose neighbouring measurement is on another image reports that side as `no_late
 instead of comparing two images.
 
 For any other texture, the last writer of a frame is closed by the next exact point, usually in the next frame; the watch runs
-up to 4 extra frames for that and reports `no_later_measurement` otherwise. The first frame of a D3D12/Vulkan watch is a
+up to 8 extra frames for that (longer for cross-queue points, below) and reports `no_later_measurement` otherwise. The first frame of a D3D12/Vulkan watch is a
 warm-up: command lists that were already recording when the watch started have an unknown render pass state and are reported
 as `untracked_command_list` until they are reset.
 
+**Cross-queue points (D3D12).** A game may render on a direct queue other than the presenting one (Gears of War: E-Day,
+Unreal Engine 5 with Streamline). Those lists' copies run on the game's queue, the reductions on the presenting queue, so
+such a point is reduced only once the GPU finished the copy: each frame end checks on the CPU whether the game queue's
+lifetime fence passed the point's submission (two frame ends and 100 ms after its execute event at the earliest, see
+above). The presenting queue is never made to wait on the GPU, so a fence that never arrives (queue destroyed, device
+lost) cannot freeze present. A point still not ready when the watch ends is reported as `cross_queue_not_ready`; while
+such points are pending, closing goes on past 8 frames until they are ready or 1 s has passed. The scratch texture stays
+in COPY_DEST from its creation through the copy on the game's queue (only the watched image is transitioned there), and the
+reduction on the presenting queue transitions it COPY_DEST -> COPY_SOURCE and back. It is reused or destroyed only after
+both the game queue's fence and the presenting queue's fence (covering the reduction) passed. These writers are marked
+`crossQueue: true` in `trace`, counted in `writers[].crossQueueExecutions` and in the summary. **Stated assumption:**
+measurements from different queues are ordered by CPU submission order (`execute_command_list` order). That is correct
+only if the game synchronizes its queues; a game that doesn't would already be racing.
+
 Refused or limited cases on D3D12/Vulkan, all stated in the output:
 
-- Command lists executed on a queue other than the presenting one (async compute, copy queues), and D3D12 non-direct lists:
-  `other_queue`.
+- Command lists executed on a queue other than the presenting one: on Vulkan, and D3D12 compute and copy (non-direct)
+  lists: `other_queue`.
 - A command list executed again without being reset (or a Vulkan secondary command buffer inserted again): `resubmitted`;
   when this happens twice in the same frame, the first execution's measurements are invalidated too.
 - D3D12 bundles cannot contain copies or barriers: a bundle executed while the texture is a render target is a `bundle`
@@ -424,9 +441,12 @@ writers per frame (`truncatedFrames` reports frames that hit it or the scratch b
   measurement.
 - Follow-up: `devkit_analyze_resource` still reads the texture inside the Devkit's own `present` handler, so on a back buffer
   it can miss what add-ons loaded after the Devkit draw at present (the ordering problem fixed here for the watch).
-- `other_queue`: lists executed on a queue other than the presenting one are refused. In Gears of War: E-Day (Unreal Engine 5
-  with Streamline) the game renders on one queue and presents on another, so every writer is `other_queue` there. Planned:
-  let the presenting queue wait on the game queue's lifetime fence before the reductions.
+- Cross-queue points are reduced at least two frame ends and 100 ms after their execution, so they need more scratch
+  textures (`scratch_pool_empty` on busy targets: use a region or `shaderHash`), and a 1-frame watch on such a game
+  takes about a second to close.
+- A command list the game executes again on its own queue without resetting it, after one of its cross-queue points was
+  reduced, can overwrite that point's copy while the presenting queue still reads it (wrong statistics for that point; the
+  overlapping use is undefined in D3D12, not seen in testing). Engines that reset their lists every frame (Unreal Engine) do not do this.
 - On Vulkan, a watch on a RenoDX clone (`preferClone: true`) sees no writers. When the mod redirects the final pass into its
   clone, a watch on the original swap-chain image shows that pass as a writer with "0 changed" (the mod writes the image
   outside the hooked commands).
@@ -436,8 +456,11 @@ writers per frame (`truncatedFrames` reports frames that hit it or the scratch b
   (`nv.sl.dlss_g.tex2d.fake-swapchain-buffer`), not the swap-chain images; watch those, not the swap chain.
 - Follow-up: the hooks still do their lookups (render targets, view descriptions) under the watcher lock; doing them before
   taking it would remove the lookup rule above.
-- Known issue, not caused by the watch: the game process can hang on exit with the Devkit loaded (seen in Gears of War:
-  E-Day, D3D12; present before the MCP work; DOOM 2016 exited normally on 2026-10-12). Cause not yet investigated.
+- `verify` cannot decode `r16g16b16a16_unorm` or `r32g32b32a32_float` on the CPU yet and reports `skipped` for them, so
+  watches on such targets are unverified (for example Gears of War: E-Day's `r16g16b16a16_unorm` G-buffer).
+- Known issue, not caused by the watch: the game process can hang on exit with the Devkit loaded and has to be ended from
+  Task Manager; this predates the MCP work. Seen in Gears of War: E-Day (D3D12) and on every exit of Sleeping Dogs:
+  Definitive Edition (D3D11); two DOOM 2016 (Vulkan) exits after watches did not hang. Cause not yet investigated.
 
 ## 11. Current practical caveats
 
