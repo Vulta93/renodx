@@ -91,7 +91,11 @@ constexpr std::uint32_t MAX_SCRATCH_ENTRIES = 4096u;
 // D3D12/Vulkan scratch textures created when a watch starts; the pool then grows at frame ends as needed.
 constexpr std::uint32_t INITIAL_SCRATCH_ENTRIES = 16u;
 // D3D12/Vulkan: extra frames a watch may run to measure the state after the last writer of its last frame.
-constexpr std::uint32_t MAX_CLOSING_FRAMES = 4u;
+constexpr std::uint32_t MAX_CLOSING_FRAMES = 8u;
+// D3D12: while cross-queue points still wait for the game queue's lifetime fence (which needs SUBMISSION_FENCE_MIN_DELAY,
+// longer than MAX_CLOSING_FRAMES at high frame rates), closing goes on until they are reduced or this much time passed;
+// the rest are reported as cross_queue_not_ready.
+constexpr auto CROSS_QUEUE_CLOSING_TIMEOUT = std::chrono::seconds(1);
 constexpr auto LOCK_WAIT_REPORT_TIME = std::chrono::seconds(2);
 // D3D12: a game submission of a region copy gets its lifetime fence value only after this many frame ends and this much
 // time since its execute_command_list event (see GpuSubmission).
@@ -161,6 +165,9 @@ enum class UnmeasuredReason : std::uint8_t {
   // A dispatch that can reach the texture only through a bound descriptor table: bindless engines keep most
   // textures in one table, so this does not prove a write, and the texture's state is unknown.
   DESCRIPTOR_TABLE = 11,
+  // D3D12: a cross-queue point whose copy the GPU had not finished on the game's queue (lifetime fence not passed) when
+  // the watch ended, or one taken while closing that no writer needed.
+  CROSS_QUEUE_NOT_READY = 12,
 };
 
 struct Request {
@@ -247,6 +254,11 @@ struct Point {
   std::optional<RegionStats> stats = std::nullopt;
   bool decoded = false;
   std::uint64_t image = 0u;
+  // D3D12: copied by a game command list on another direct queue than the presenting one. Such a point is decoded only
+  // through InFlightFrame::late_points, never through its frame's range.
+  bool cross_queue = false;
+  // Waiting in Session::deferred_points for the game queue's lifetime fence before it can be reduced.
+  bool deferred = false;
 };
 
 // A writer and the measurements around it: the state before it and before the next writer (or the end of the frame).
@@ -259,6 +271,9 @@ struct Event {
   bool after_resolved = false;
   std::optional<std::uint64_t> after_point = std::nullopt;
   UnmeasuredReason after_reason = UnmeasuredReason::NONE;
+  // Executed on another queue than the presenting one: ordered against the presenting queue's writers by CPU submission
+  // order only (see DEVKIT_MCP.md).
+  bool cross_queue = false;
 };
 
 struct InFlightFrame {
@@ -270,6 +285,8 @@ struct InFlightFrame {
   bool counted = true;
   bool truncated = false;
   std::uint64_t fence_value = 0u;
+  // Cross-queue points of earlier frames (or this one) reduced at this frame end.
+  std::vector<std::uint64_t> late_points;
 };
 
 struct RunningRange {
@@ -297,6 +314,7 @@ struct WriterAggregate {
   std::uint64_t peak_raised_executions = 0u;
   std::uint64_t dropped_above_one_executions = 0u;
   std::uint64_t unmeasured_executions = 0u;
+  std::uint64_t cross_queue_executions = 0u;
   std::map<UnmeasuredReason, std::uint64_t> unmeasured_reasons = {};
   std::uint32_t frames_seen = 0u;
   std::uint32_t last_frame_index = (std::numeric_limits<std::uint32_t>::max)();
@@ -474,6 +492,11 @@ struct Session {
   bool warming_up = false;
   bool closing = false;
   std::uint32_t closing_frames = 0u;
+  std::chrono::steady_clock::time_point closing_started_at = {};
+  // D3D12: cross-queue points not reduced yet, in commit order. A frame end reduces those whose copy the GPU has
+  // finished, judged on the CPU from the game queue's lifetime fence (Watcher::completed_fence_values), never by making
+  // the presenting queue wait on the GPU: a fence that never arrives must not freeze present.
+  std::vector<std::uint64_t> deferred_points;
 
   std::uint32_t frames_recorded = 0u;
   std::uint32_t frames_decoded = 0u;
@@ -486,6 +509,7 @@ struct Session {
   std::uint64_t events_decoded = 0u;
   std::uint64_t events_changed = 0u;
   std::uint64_t events_unmeasured = 0u;
+  std::uint64_t events_cross_queue = 0u;
   std::map<UnmeasuredReason, std::uint64_t> unmeasured_reasons = {};
   std::vector<std::uint32_t> frames_with_unmeasured_writers;
 };
@@ -537,6 +561,8 @@ struct Watcher {
   std::vector<RetiredScratch> retired_scratch;
   // D3D12: lifetime fences by queue handle, and the number of frame ends so far (see GpuSubmission).
   std::unordered_map<std::uint64_t, QueueLifetimeFence> queue_fences;
+  // Completed value of each queue's lifetime fence, read by the last ProcessLifetimes (by queue handle).
+  std::unordered_map<std::uint64_t, std::uint64_t> completed_fence_values;
   std::uint64_t frame_end_index = 0u;
   std::uint64_t destroyed_queue_waits = 0u;
   // Fences of destroyed queues, destroyed with the device: one whose wait timed out may still be signalled by the GPU.
@@ -893,20 +919,33 @@ inline void RecordRegionCopy(
 // a writer that matches the filter opens a new event. `refused` drops the record's measurement (for example a command
 // list executed on another queue); its writer is still accounted for. Before and after are only taken from the same
 // image (a followed swap chain has several).
-inline void Commit(Session* session, const Record& record, UnmeasuredReason refused) {
+// `cross_queue` (D3D12): the record's list ran on another direct queue than the presenting one; its point is reduced
+// once the GPU finished the copy there (Session::deferred_points).
+inline void Commit(Session* session, const Record& record, UnmeasuredReason refused, bool cross_queue = false) {
   std::optional<std::uint64_t> point_id = std::nullopt;
   auto unmeasured_reason = record.reason;
   if (record.measurement.has_value() && refused == UnmeasuredReason::NONE) {
     point_id = session->points_base + session->points.size();
-    auto point = Point{.frame_index = session->frames_recorded, .image = record.image};
+    auto point = Point{.frame_index = session->frames_recorded, .image = record.image, .cross_queue = cross_queue};
     if (session->explicit_api) {
       point.scratch_entry = record.measurement;
       session->scratch_entries[record.measurement.value()].awaiting_reduction = true;
     } else {
       point.slot = record.measurement;
     }
+    const auto becomes_verify_point = (session->closing && session->verify && !session->verify_point.has_value());
+    if (cross_queue) {
+      // While closing, only a point that ends the open writer or becomes the verify point is worth waiting for.
+      if (!session->closing || session->open_event.has_value() || becomes_verify_point) {
+        point.deferred = true;
+        session->deferred_points.push_back(point_id.value());
+      } else {
+        point.refused = UnmeasuredReason::CROSS_QUEUE_NOT_READY;
+        point.decoded = true;
+      }
+    }
     session->points.push_back(point);
-    if (session->closing && session->verify && !session->verify_point.has_value()) {
+    if (becomes_verify_point && point.refused == UnmeasuredReason::NONE) {
       session->verify_point = point_id;
     }
   } else if (refused != UnmeasuredReason::NONE) {
@@ -956,6 +995,7 @@ inline void Commit(Session* session, const Record& record, UnmeasuredReason refu
       .image = record.image,
       .before_point = before_point,
       .before_reason = (before_point.has_value() ? UnmeasuredReason::NONE : unmeasured_reason),
+      .cross_queue = cross_queue,
   });
   session->open_event = session->events_base + session->events.size() - 1u;
 }
@@ -1600,16 +1640,24 @@ inline void OnExecuteCommandList(Watcher* watcher, reshade::api::command_queue* 
   // Records are only committed while the watched texture exists (destroy_resource gate) and the watch has not failed.
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u || !session->failure.empty()) return;
 
+  // D3D12 direct lists on another queue are measured late (cross-queue points); other queues and Vulkan are refused.
+  const auto on_presenting_queue = (queue == session->queue);
+  const auto cross_queue = (!on_presenting_queue && device_api == reshade::api::device_api::d3d12 && list.direct);
   auto refused = UnmeasuredReason::NONE;
-  if (queue != session->queue) {
+  if (!on_presenting_queue && !cross_queue) {
     refused = UnmeasuredReason::OTHER_QUEUE;
   } else if (list.executed_frame.has_value()) {
     refused = UnmeasuredReason::RESUBMITTED;
-    // Executed twice before the end of the frame: the second execution overwrites the copies of the first.
-    if (list.executed_frame.value() == session->frames_recorded) {
-      for (const auto point_id : list.committed_points) {
-        if (auto* point = internal::FindPoint(session, point_id); point != nullptr) {
-          point->refused = UnmeasuredReason::RESUBMITTED;
+    // Executed again: this execution overwrites the copies of the earlier one, which are lost if they were not reduced
+    // yet (an earlier execution in this frame, or a cross-queue point still waiting).
+    for (const auto point_id : list.committed_points) {
+      auto* point = internal::FindPoint(session, point_id);
+      if (point == nullptr) continue;
+      if (list.executed_frame.value() == session->frames_recorded || point->deferred) {
+        point->refused = UnmeasuredReason::RESUBMITTED;
+        // A later point of the closing frames becomes the verify point instead.
+        if (session->verify_point.has_value() && session->verify_point.value() == point_id) {
+          session->verify_point.reset();
         }
       }
     }
@@ -1617,7 +1665,7 @@ inline void OnExecuteCommandList(Watcher* watcher, reshade::api::command_queue* 
 
   for (const auto& record : list.records) {
     const auto next_point = session->points_base + session->points.size();
-    internal::Commit(session, record, refused);
+    internal::Commit(session, record, refused, cross_queue);
     if (session->points_base + session->points.size() != next_point) {
       list.committed_points.push_back(next_point);
     }
@@ -1774,6 +1822,7 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
   std::vector<reshade::api::resource> released_textures;
   {
     WatcherLock lock(watcher, "ProcessLifetimes: attaching fence values");
+    watcher->completed_fence_values = completed_values;
     for (const auto& [queue_handle, fence] : created_fences) {
       // The queue may have been destroyed meanwhile: its destroy event cleared every submission that named it.
       bool queue_has_submissions = false;
@@ -2012,6 +2061,8 @@ inline void ProcessAtFrameEnd(
         return "scratch_pool_empty";
       case UnmeasuredReason::DESCRIPTOR_TABLE:
         return "descriptor_table";
+      case UnmeasuredReason::CROSS_QUEUE_NOT_READY:
+        return "cross_queue_not_ready";
     }
     return "unknown";
   };
@@ -2131,6 +2182,10 @@ inline void ProcessAtFrameEnd(
                                                                }).first->second;
         ++session->events_decoded;
         ++aggregate.executions;
+        if (event.cross_queue) {
+          ++session->events_cross_queue;
+          ++aggregate.cross_queue_executions;
+        }
         if (aggregate.last_frame_index != event.frame_index) {
           aggregate.last_frame_index = event.frame_index;
           ++aggregate.frames_seen;
@@ -2142,6 +2197,9 @@ inline void ProcessAtFrameEnd(
             {"commandIndex", writer.command_index},
             {"writer", std::string(internal::GetWriterKindName(writer.kind))},
         };
+        if (event.cross_queue) {
+          entry["crossQueue"] = true;
+        }
         bool list_in_trace = false;
         if (before_stats.has_value() && after_stats.has_value()) {
           const auto& before_value = before_stats.value();
@@ -2317,7 +2375,17 @@ inline void ProcessAtFrameEnd(
     const auto decode_mapped_readbacks = [&]() {
       for (const auto& mapped : mapped_readbacks) {
         const auto& frame = mapped.frame;
+        // The frame's own range, except cross-queue points (reduced in whichever frame end found them ready, and
+        // listed there in late_points), then this frame end's late points.
+        std::vector<std::uint64_t> point_ids;
         for (std::uint64_t point_id = frame.first_point; point_id < frame.first_point + frame.point_count; ++point_id) {
+          const auto* point = internal::FindPoint(session.get(), point_id);
+          if (point != nullptr && !point->cross_queue) {
+            point_ids.push_back(point_id);
+          }
+        }
+        point_ids.insert(point_ids.end(), frame.late_points.begin(), frame.late_points.end());
+        for (const auto point_id : point_ids) {
           auto* point = internal::FindPoint(session.get(), point_id);
           if (point == nullptr) continue;
           point->decoded = true;
@@ -2368,6 +2436,8 @@ inline void ProcessAtFrameEnd(
     };
     std::vector<PlannedReduction> planned_reductions;
     std::vector<std::uint32_t> reduced_entries;
+    std::vector<std::uint64_t> late_points;
+    std::vector<std::uint32_t> cross_queue_reduced_entries;
     std::optional<std::uint32_t> back_buffer_entry = std::nullopt;
     std::uint64_t back_buffer_point = 0u;
     reshade::api::resource back_buffer = {0u};
@@ -2420,7 +2490,7 @@ inline void ProcessAtFrameEnd(
           const auto frame_end_point = session->points_base + session->points.size();
           for (auto point_id = std::max(session->frame_first_point, session->points_base); point_id < frame_end_point; ++point_id) {
             auto* point = internal::FindPoint(session.get(), point_id);
-            if (point == nullptr || !point->scratch_entry.has_value()) continue;
+            if (point == nullptr || !point->scratch_entry.has_value() || point->deferred) continue;
             reduced_entries.push_back(point->scratch_entry.value());
             if (point->refused == UnmeasuredReason::NONE && planned_reductions.size() >= MAX_SLOTS) {
               point->refused = UnmeasuredReason::SLOT_LIMIT;
@@ -2436,6 +2506,37 @@ inline void ProcessAtFrameEnd(
                 .verify = (session->verify_point.has_value() && session->verify_point.value() == point_id && !session->verify_copied),
             });
           }
+
+          // Cross-queue points whose copy the GPU has finished on the game's queue, judged on the CPU from that queue's
+          // lifetime fence; the reduction below then runs on the presenting queue strictly after it. The others wait
+          // for a later frame end. Refused ones (resubmitted) are dropped: decoded, with no statistics.
+          std::erase_if(session->deferred_points, [&](std::uint64_t point_id) {
+            auto* point = internal::FindPoint(session.get(), point_id);
+            if (point == nullptr) return true;
+            const auto entry_index = point->scratch_entry.value();
+            if (point->refused == UnmeasuredReason::NONE) {
+              if (planned_reductions.size() >= MAX_SLOTS) return false;
+              const auto& submissions = session->scratch_entries[entry_index].submissions;
+              if (!internal::AreSubmissionsComplete(submissions, watcher->completed_fence_values)) return false;
+            }
+            point->deferred = false;
+            reduced_entries.push_back(entry_index);
+            if (point->refused != UnmeasuredReason::NONE) {
+              point->decoded = true;
+              return true;
+            }
+            point->slot = static_cast<std::uint32_t>(planned_reductions.size());
+            planned_reductions.push_back(PlannedReduction{
+                .point_id = point_id,
+                .entry_index = entry_index,
+                .texture = session->scratch_entries[entry_index].texture,
+                .slot = point->slot.value(),
+                .verify = (session->verify_point.has_value() && session->verify_point.value() == point_id && !session->verify_copied),
+            });
+            late_points.push_back(point_id);
+            cross_queue_reduced_entries.push_back(entry_index);
+            return true;
+          });
           has_measurements = !planned_reductions.empty();
         } else if (session->open_event.has_value() || is_last_frame) {
           // D3D11: the region is measured in place on the immediate context.
@@ -2475,6 +2576,7 @@ inline void ProcessAtFrameEnd(
               .counted = !session->warming_up && !session->closing,
               .truncated = session->truncated,
               .fence_value = (std::numeric_limits<std::uint64_t>::max)(),
+              .late_points = std::move(late_points),
           };
         }
 
@@ -2491,6 +2593,9 @@ inline void ProcessAtFrameEnd(
         } else {
           ++session->frames_recorded;
           session->closing = session->explicit_api && session->frames_recorded >= session->frames;
+          if (session->closing) {
+            session->closing_started_at = std::chrono::steady_clock::now();
+          }
         }
       }
       // The pool grows by what the hooks were short of since the last frame end, within the budget; the textures are
@@ -2611,6 +2716,15 @@ inline void ProcessAtFrameEnd(
             point->slot.reset();
           }
         }
+        // The reduction of a cross-queue entry reads it on the presenting queue: the entry is reused or destroyed only
+        // after the GPU passed that too (its fence value is attached like any submission's, ProcessLifetimes).
+        for (const auto entry_index : cross_queue_reduced_entries) {
+          internal::AddSubmission(&session->scratch_entries[entry_index].submissions, GpuSubmission{
+              .queue = session->queue,
+              .frame_end_index = watcher->frame_end_index,
+              .executed_at = std::chrono::steady_clock::now(),
+          });
+        }
         for (const auto entry_index : reduced_entries) {
           auto& entry = session->scratch_entries[entry_index];
           entry.awaiting_reduction = false;
@@ -2628,10 +2742,25 @@ inline void ProcessAtFrameEnd(
         }
         decode_mapped_readbacks();
 
-        const auto closed = !session->open_event.has_value() && (!session->verify || session->verify_point.has_value());
+        const auto closed = !session->open_event.has_value() && (!session->verify || session->verify_point.has_value())
+                            && session->deferred_points.empty();
+        const auto closing_limit_reached = session->closing_frames >= MAX_CLOSING_FRAMES
+                                           && (session->deferred_points.empty()
+                                               || std::chrono::steady_clock::now() - session->closing_started_at >= CROSS_QUEUE_CLOSING_TIMEOUT);
         const auto finished = request_canceled || !session->failure.empty()
-                              || (session->frames_recorded >= session->frames && (!session->explicit_api || closed || session->closing_frames >= MAX_CLOSING_FRAMES));
+                              || (session->frames_recorded >= session->frames && (!session->explicit_api || closed || closing_limit_reached));
         if (finished) {
+          // Cross-queue points still waiting are reported, never waited for: their fence may never arrive.
+          for (const auto point_id : session->deferred_points) {
+            if (auto* point = internal::FindPoint(session.get(), point_id); point != nullptr) {
+              point->deferred = false;
+              point->decoded = true;
+              if (point->refused == UnmeasuredReason::NONE) {
+                point->refused = UnmeasuredReason::CROSS_QUEUE_NOT_READY;
+              }
+            }
+          }
+          session->deferred_points.clear();
           // Detached here, so no hook reaches it any more. D3D12/Vulkan scratch entries still owned by a command list
           // may be copied into again if the game executes that list later, and D3D12 entries with submissions may
           // still be written by the GPU, so they move to the watcher and are destroyed when both are over.
@@ -2732,6 +2861,12 @@ inline void ProcessAtFrameEnd(
           if (session->truncated_frames != 0u) {
             summary += std::format(" {} frame(s) hit the {}-slot or scratch budget limit.", session->truncated_frames, MAX_SLOTS);
           }
+          if (session->events_cross_queue != 0u) {
+            summary += std::format(
+                " {} writer execution(s) ran on another queue than the presenting one (crossQueue: ordered by CPU submission"
+                " order, correct only if the game synchronizes its queues).",
+                session->events_cross_queue);
+          }
           if (session->events_unmeasured != 0u) {
             summary += std::format(" {} writer execution(s) NOT measured:", session->events_unmeasured);
             for (const auto& [reason, count] : session->unmeasured_reasons) {
@@ -2759,6 +2894,9 @@ inline void ProcessAtFrameEnd(
             };
             if (aggregate.unmeasured_executions != 0u) {
               writer_json["unmeasuredReasons"] = reasons_to_json(aggregate.unmeasured_reasons);
+            }
+            if (aggregate.cross_queue_executions != 0u) {
+              writer_json["crossQueueExecutions"] = aggregate.cross_queue_executions;
             }
             if (aggregate.pixel_shader_hash != 0u) {
               writer_json["pixelShaderHash"] = formatting::FormatShaderHash(aggregate.pixel_shader_hash);
@@ -2849,7 +2987,7 @@ inline void ProcessAtFrameEnd(
             reshade::api::subresource_data verify_data = {};
             if (!session->verify_gpu_stats.has_value() || !session->verify_copied
                 || !device->map_texture_region(session->verify_readback, 0u, nullptr, reshade::api::map_access::read_only, &verify_data)) {
-              result_json["verify"] = json{{"status", "skipped"}, {"reason", "No measurement point was available at the end of the watch (D3D12/Vulkan: the texture is not the presented back buffer and no exact measurement point followed the last frame within the closing frames), or the CPU readback failed."}};
+              result_json["verify"] = json{{"status", "skipped"}, {"reason", "No measurement point was available at the end of the watch (D3D12/Vulkan: the texture is not the presented back buffer and no exact measurement point followed the last frame within the closing frames, or that point was cross_queue_not_ready), or the CPU readback failed."}};
               summary += "\nVerify: skipped (no measurement at the end of the watch).";
             } else {
               // Same definitions as watch_region_reduce: non-finite pixels are excluded, luminance is clamped at 0 for
