@@ -297,8 +297,10 @@ the CPU at one measurement point at the end of the watch and compare it with the
 - Writers whose state before or after could not be measured are never dropped: each one is in `trace` with `measured: false`,
   `unmeasuredSide` and `unmeasuredReason`, counted in `writers[].unmeasuredExecutions`/`unmeasuredReasons`, in
   `unmeasured.reasons`, and its frame is listed in `unmeasured.frames`. Reasons: `slot_limit` (more than 1023 measurements in a
-  frame), `scratch_budget`, `state_unknown`, `inside_render_pass`, `other_queue`, `resubmitted`, `untracked_command_list`,
-  `bundle`, `no_later_measurement`.
+  frame), `scratch_budget`, `scratch_pool_empty`, `state_unknown`, `inside_render_pass`, `other_queue`, `resubmitted`,
+  `untracked_command_list`, `bundle`, `no_later_measurement`, `descriptor_table` (a D3D12/Vulkan dispatch that can reach
+  the texture only through a bound descriptor table: bindless engines keep most textures in one table, so this does not
+  prove a write and gives no known state; no barrier or copy is issued for it).
 - `endOfWatch` holds the region stats measured at the end of the last frame (D3D11: always; D3D12/Vulkan: only for the
   presented back buffer). It includes every write made during present, including passes other add-ons draw there.
 - Statistics are luminance (BT.709 weights on raw values, or nits for `pq`/`scrgb`); the GPU path computes no percentiles.
@@ -314,8 +316,49 @@ committed at `execute_command_list`, so measurements follow submission order, no
 end of the frame on ReShade's immediate command list of the presenting queue, after barriers that order them behind the
 game's copies. The stats readback is guarded by a fence (Vulkan: signalled at `finish_present`). Scratch textures copied into
 by a command list stay reserved until that list is reset or destroyed (it may be executed again), also after the watch ends.
+On D3D12 that is not enough: D3D12 lets a game reset a command list while the GPU still runs it (Vulkan does not), so
+every execution of a list that copies into a scratch texture is recorded as a submission on its queue, and the texture is
+reused or destroyed only after the GPU passed a lifetime fence signalled on that queue (a per-queue fence, created only at
+frame ends on the presenting thread, signalled with the native `ID3D12CommandQueue::Signal`: ReShade's
+`command_queue::signal` also flushes that queue's immediate command list without the queue's lock). A list reset without
+any execution frees its textures at once. **Stated assumption:** ReShade raises `execute_command_list` before the real
+`ExecuteCommandLists` and outside any lock an add-on can take, with no event after the real submission, so a submission
+gets its fence value only after two frame ends and at least 100 ms; the game's submit call is assumed to have returned by
+then (100 ms covers the submit thread being paused by the OS). When the game destroys a queue (ReShade raises
+`destroy_command_queue` before releasing the native queue), its submissions get one more signal and are waited for there;
+a queue destroyed before it got a fence, or whose wait fails, keeps its textures until the device is destroyed (logged).
 `scratchBudgetMB` caps their total size: a full-resolution 4K FP16 region needs 66 MB per measurement, so use a region or
-`shaderHash` on busy buffers; measurements beyond the budget are reported as `scratch_budget`.
+`shaderHash` on busy buffers; measurements beyond the budget are reported as `scratch_budget`. The hooks never create
+scratch textures: creating an image inside the game's own command recording calls the driver and the game's allocation
+callbacks from a context the game does not expect (it deadlocked DOOM 2016's allocator). A pool of up to 16 is created when
+the watch starts, and the frame end (on the presenting thread) grows it by however many the hooks were short of, within the
+budget; a hook that finds no free texture reports that writer as `scratch_pool_empty`, so the first busy frames of a watch
+can show some of those.
+
+The watch's lock only covers bookkeeping. On D3D12/Vulkan no GPU work (barriers, copies, reductions, fence signals, maps),
+no object creation or destruction and no wait runs under it, because a driver call can call back into the game (for
+example its allocation callbacks), and the game may then wait for one of its own threads that is waiting for that lock (a
+deadlock found in DOOM 2016). Hooks reserve a measurement under the lock and record it after unlocking; the frame end
+plans under the lock, does the GPU work unlocked, and merges the results under the lock. A finished watch is detached
+first; its scratch textures still owned by a command list (or, on D3D12, still written by the GPU) stay alive until that
+is over. D3D11 still measures under the lock on the immediate context: its hooks only run on that one thread (deferred
+contexts are skipped before the lock). Any wait for the lock longer than 2 s is logged in `ReShade.log` with the owner's
+thread and step (`devkit::watch_region(lock wait over 2 s: ...)`).
+
+Lookups are allowed under the lock. The ones in use take only leaf locks, always after the watcher lock: RenoDX's
+`pipeline_infos` and `pipeline_layout_data` maps (shared), the descriptor `DeviceData::mutex` (shared, dispatch table
+scan; order: pipeline layout map, then descriptor mutex, then ReShade's view map), and ReShade's D3D12
+`device_impl::_resource_mutex` (shared, view lookups). Checked in the source: the exclusive sections of all of them only
+edit maps, raise no ReShade event and never call back into the Devkit, and the Devkit never takes the watcher lock inside
+them. **Stated assumption (from the Vulkan spec, not checked in source):** on Vulkan the view lookups call the driver's
+`vkGetPrivateData`, which has no allocator parameter and cannot call back into the game or the Devkit. A new lookup under
+the watcher lock is allowed only if it takes no lock, or only a leaf lock that never raises a ReShade event or calls back
+into the Devkit. Check this before adding one.
+
+Every CPU wait for the GPU in the watch has a timeout (2 s: lifetime fences at the end of a watch, at queue and device
+destruction, the stats readback fence, and a destroyed queue's wait for a frame end's signal in flight), and none holds
+the lock. The one exception is ReShade's `command_queue::wait_idle` (end of a watch), which has no timeout parameter; a
+GPU hang ends it through the driver's device removal.
 
 The state of the watched subresource is only taken where it is exactly known; everywhere else the writer is reported as
 unmeasured and its "before" comes from the last measurement point in submission order, if no other writer came in between:
@@ -326,10 +369,18 @@ unmeasured and its "before" comes from the last measurement point in submission 
 | Render pass begin with the texture as attachment | RENDER_TARGET | not measured (`state_unknown`): the event is also raised for NextSubpass and inherited secondary command buffers, and the initial layout is not exposed |
 | Draws inside a render pass | members of the render pass writer | members of the render pass writer |
 | Render target clear | RENDER_TARGET | COLOR_ATTACHMENT_OPTIMAL for single-subresource images (ReShade's own transition around the event); `inside_render_pass` for vkCmdClearAttachments |
-| Dispatch / UAV clear | UNORDERED_ACCESS | GENERAL |
+| Dispatch with the texture as a UAV bound to a slot (root/push descriptor) / UAV clear | UNORDERED_ACCESS | GENERAL |
+| Dispatch that reaches the texture only through a bound descriptor table | not measured (`descriptor_table`) | not measured (`descriptor_table`) |
 | Copy or resolve destination | not measured (implicit promotion from COMMON) | not measured (GENERAL or TRANSFER_DST) |
 | The game's barrier on the texture | not used (no subresource, enhanced barriers report access) | the new layout, for single-subresource images and layouts ReShade maps one-to-one (not `general`) |
 | End of frame | PRESENT, only for the presented back buffer | PRESENT_SRC, only for the presented back buffer |
+
+**Swap chains (D3D12/Vulkan).** Each image of a swap chain is a separate texture, and a game may render each frame into any
+of them, in any order (DOOM 2016 on Vulkan does not cycle them round-robin). A watch on one of them therefore follows the
+swap chain: every image of the presenting swap chain counts as the watched texture, so every frame is measured
+(`swapChainImages` in the output, and a line in the summary). Before and after are always taken from the same image; a writer
+whose neighbouring measurement is on another image reports that side as `no_later_measurement` (or with its own reason)
+instead of comparing two images.
 
 For any other texture, the last writer of a frame is closed by the next exact point, usually in the next frame; the watch runs
 up to 4 extra frames for that and reports `no_later_measurement` otherwise. The first frame of a D3D12/Vulkan watch is a
@@ -347,6 +398,17 @@ Refused or limited cases on D3D12/Vulkan, all stated in the output:
   draws are merged into the primary's render pass.
 - D3D12 textures with `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` and Vulkan images without `TRANSFER_SRC` usage are
   refused. Device-level texture updates are ignored.
+- Many Vulkan games create their render targets without `TRANSFER_SRC` (in DOOM 2016 only the swap chain and RenoDX's clones
+  have it). The opt-in Devkit setting **Watch Region: Copyable Vulkan Images** (Settings > Other, ReShade.ini key
+  `WatchRegionCopySourceUsage` in `[renodx-dev]`, off by default) adds `copy_source` usage to every image the game creates
+  from then on, in the Devkit's `create_resource` handler. It only affects images created after it is enabled: turn it on and
+  restart the game. It follows the rules of the Vulkan clone targets in `utils/resource_upgrade.hpp` (`OnCreateResource`):
+  shared and sparse images and formats without copy support are left alone. Interaction with RenoDX mods: ReShade passes the
+  same `desc` to every add-on's `create_resource` handler, and resource upgrades only OR in their own usage bits (in-place
+  upgrades) or start from the created image's desc (clones), so the flag is kept whatever the add-on order. One exception:
+  when the mod's handler runs before the Devkit's, the fallback desc a resource upgrade records for the original format does
+  not have the flag, so fallback copies the mod creates later cannot be watched. The flag can disable some driver
+  compression of those images; compare frame times with the setting on and off.
 - The measurement copies and barriers cost GPU time and VRAM; use a region or `shaderHash` for long watches.
 
 Limits on every API: 2D, non-MSAA textures in 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats; up to 1023 measured
@@ -362,6 +424,20 @@ writers per frame (`truncatedFrames` reports frames that hit it or the scratch b
   measurement.
 - Follow-up: `devkit_analyze_resource` still reads the texture inside the Devkit's own `present` handler, so on a back buffer
   it can miss what add-ons loaded after the Devkit draw at present (the ordering problem fixed here for the watch).
+- `other_queue`: lists executed on a queue other than the presenting one are refused. In Gears of War: E-Day (Unreal Engine 5
+  with Streamline) the game renders on one queue and presents on another, so every writer is `other_queue` there. Planned:
+  let the presenting queue wait on the game queue's lifetime fence before the reductions.
+- On Vulkan, a watch on a RenoDX clone (`preferClone: true`) sees no writers. When the mod redirects the final pass into its
+  clone, a watch on the original swap-chain image shows that pass as a writer with "0 changed" (the mod writes the image
+  outside the hooked commands).
+- On D3D11, `framesMeasured` counts frames with at least one measurement: a texture no hooked command writes is measured
+  only at the end of the last frame, so it reports 1.
+- With DLSS Frame Generation loaded (Streamline), the game renders into Streamline's own back buffers
+  (`nv.sl.dlss_g.tex2d.fake-swapchain-buffer`), not the swap-chain images; watch those, not the swap chain.
+- Follow-up: the hooks still do their lookups (render targets, view descriptions) under the watcher lock; doing them before
+  taking it would remove the lookup rule above.
+- Known issue, not caused by the watch: the game process can hang on exit with the Devkit loaded (seen in Gears of War:
+  E-Day, D3D12; present before the MCP work; DOOM 2016 exited normally on 2026-10-12). Cause not yet investigated.
 
 ## 11. Current practical caveats
 
