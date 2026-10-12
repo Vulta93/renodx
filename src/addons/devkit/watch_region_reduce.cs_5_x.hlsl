@@ -44,10 +44,28 @@
 #define COUNT_BLACK 8
 #define COUNT_KINDS 9
 
-Texture2D<float4> source : register(t0);
-RWTexture2D<uint> stats : register(u0);
+// Vulkan uses this same source through a precompiled SPIR-V 1.0 module (watch_region_reduce.comp.spv): the default
+// Slang build emits SPIR-V 1.5, which is invalid on Vulkan 1.0/1.1 devices. After changing this file, regenerate it with
+//   slangc watch_region_reduce.cs_5_x.hlsl -stage compute -entry main -target spirv -profile spirv_1_0 -O3 -g0
+//     -o watch_region_reduce.comp.spv
+// and validate it with spirv-val --target-env vulkan1.0. The bindings match utils::render::RenderPass's Vulkan
+// descriptor set (SRV at binding 0, UAV at binding 1) and its push constant range.
+#if defined(__SLANG__)
+#define VULKAN_BINDING(index) [[vk::binding(index, 0)]]
+#define VULKAN_R32UI_FORMAT [[vk::image_format("r32ui")]]
+#define VULKAN_PUSH_CONSTANT [[vk::push_constant]]
+#define CONSTANTS_REGISTER
+#else
+#define VULKAN_BINDING(index)
+#define VULKAN_R32UI_FORMAT
+#define VULKAN_PUSH_CONSTANT
+#define CONSTANTS_REGISTER : register(b0)
+#endif
 
-cbuffer Constants : register(b0) {
+VULKAN_BINDING(0) Texture2D<float4> source : register(t0);
+VULKAN_BINDING(1) VULKAN_R32UI_FORMAT RWTexture2D<uint> stats : register(u0);
+
+VULKAN_PUSH_CONSTANT cbuffer Constants CONSTANTS_REGISTER {
   uint region_width;
   uint region_height;
   uint signal;
