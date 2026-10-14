@@ -92,15 +92,11 @@ constexpr std::uint32_t MAX_SCRATCH_ENTRIES = 4096u;
 constexpr std::uint32_t INITIAL_SCRATCH_ENTRIES = 16u;
 // D3D12/Vulkan: extra frames a watch may run to measure the state after the last writer of its last frame.
 constexpr std::uint32_t MAX_CLOSING_FRAMES = 8u;
-// D3D12: while cross-queue points still wait for the game queue's lifetime fence (which needs SUBMISSION_FENCE_MIN_DELAY,
-// longer than MAX_CLOSING_FRAMES at high frame rates), closing goes on until they are reduced or this much time passed;
-// the rest are reported as cross_queue_not_ready.
+// D3D12: while cross-queue points still wait for the game queue's lifetime fence (the GPU can run several frames behind
+// the CPU), closing goes on past MAX_CLOSING_FRAMES until they are reduced or this much time passed; the rest are
+// reported as cross_queue_not_ready. This only bounds the watch's duration; fence values never depend on time.
 constexpr auto CROSS_QUEUE_CLOSING_TIMEOUT = std::chrono::seconds(1);
 constexpr auto LOCK_WAIT_REPORT_TIME = std::chrono::seconds(2);
-// D3D12: a game submission of a region copy gets its lifetime fence value only after this many frame ends and this much
-// time since its execute_command_list event (see GpuSubmission).
-constexpr std::uint64_t SUBMISSION_FENCE_MIN_FRAME_ENDS = 2u;
-constexpr auto SUBMISSION_FENCE_MIN_DELAY = std::chrono::milliseconds(100);
 // D3D12/Vulkan: every CPU wait for the GPU in the watch (lifetime fences at the end of a watch and when a queue or the
 // device is destroyed, the stats readback fence) and the wait for a frame end's signals in flight on a destroyed queue.
 constexpr auto LIFETIME_FENCE_WAIT_TIMEOUT = std::chrono::seconds(2);
@@ -327,17 +323,16 @@ struct WriterAggregate {
 
 // D3D12: one execution of a game command list that copies into a scratch texture. D3D12 lets the game reset a command
 // list while the GPU still runs it, so the reset does not end the texture's use: it ends when the GPU passes
-// `fence_value` on the lifetime fence of `queue`. ReShade raises execute_command_list before the real
-// ExecuteCommandLists and outside any lock an add-on can take, so a fence signalled right away could land before the
-// game's work. The value is attached only after SUBMISSION_FENCE_MIN_FRAME_ENDS frame ends and
-// SUBMISSION_FENCE_MIN_DELAY, assuming the game's ExecuteCommandLists call has returned by then (stated in the design
-// doc).
+// `fence_value` on the lifetime fence of `queue`. ReShade raises execute_command_list under the queue's lock, releases
+// the lock and only then calls the real ExecuteCommandLists, so a fence signalled from inside the event could land
+// before the game's work. A submission whose event came before a frame end gets the value queued at that frame end
+// instead (stated assumption, DEVKIT_MCP.md: the game's submit call has returned by then).
 struct GpuSubmission {
   // Null once the queue was destroyed: its destroy event then waits for the queue and removes the submissions marked
   // with its `destroyed_queue_wait`; any left after that wait failed are kept until the device is destroyed.
   reshade::api::command_queue* queue = nullptr;
+  // Watcher::frame_end_index when the event was recorded: below the current index once a frame end has passed it.
   std::uint64_t frame_end_index = 0u;
-  std::chrono::steady_clock::time_point executed_at = {};
   std::optional<std::uint64_t> fence_value = std::nullopt;
   std::uint64_t destroyed_queue_wait = 0u;
 };
@@ -1622,7 +1617,6 @@ inline void OnExecuteCommandList(Watcher* watcher, reshade::api::command_queue* 
   const auto submission = GpuSubmission{
       .queue = queue,
       .frame_end_index = watcher->frame_end_index,
-      .executed_at = std::chrono::steady_clock::now(),
   };
   if (device_api == reshade::api::device_api::d3d12) {
     for (auto& retired : watcher->retired_scratch) {
@@ -1770,18 +1764,19 @@ inline void OnFinishPresent(Watcher* watcher, reshade::api::command_queue* queue
 
 // D3D12, on the presenting thread, with or without a running watch: frees the scratch textures the GPU is done with
 // (the running watch may reuse them, retired ones are destroyed). At a frame end (`frame_end`) it also counts the frame
-// end, creates the lifetime fences of queues that executed region copies, and attaches a fence value to each submission
-// old enough (GpuSubmission) and signals it. Fences are created and signalled without the watcher lock; a queue's
-// destroy event waits for signals in flight on it.
+// end, creates the lifetime fences of queues that executed region copies, and covers every submission recorded before
+// this frame end with one new fence value per queue, signalled on that queue (GpuSubmission). Runs inside present,
+// before the real Present, so a game that submits its frame before presenting has submitted it by then. Fences are
+// created and signalled without the watcher lock; a queue's destroy event waits for signals in flight on it.
 inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, bool frame_end) {
   if (device->get_api() != reshade::api::device_api::d3d12) return;
   // Without a session or retired textures there is no submission to track (the frame end count only matters relative
   // to submissions recorded later).
   const auto has_session = watcher->has_session.load(std::memory_order_acquire);
   if (!has_session && !watcher->has_retired_scratch.load(std::memory_order_acquire)) return;
-  const auto now = std::chrono::steady_clock::now();
 
-  // Stage 1 (locked): count the frame end, list the queues that need a fence and the fences to read.
+  // Stage 1 (locked): count the frame end, list the queues that need a fence and the fences to read. Submissions
+  // recorded from here on carry the new index and wait for the next frame end.
   std::vector<std::uint64_t> queues_without_fence;
   std::vector<std::pair<std::uint64_t, reshade::api::fence>> fences_to_read;
   {
@@ -1851,29 +1846,28 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
     if (frame_end) {
       for (auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
         const auto queue_handle = fence_queue_handle;
-        const auto is_old_enough = [&](const GpuSubmission& submission) {
+        const auto is_submitted_before_frame_end = [&](const GpuSubmission& submission) {
           return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle
                  && !submission.fence_value.has_value()
-                 && submission.frame_end_index + SUBMISSION_FENCE_MIN_FRAME_ENDS <= watcher->frame_end_index
-                 && now - submission.executed_at >= SUBMISSION_FENCE_MIN_DELAY;
+                 && submission.frame_end_index < watcher->frame_end_index;
         };
-        bool has_old_enough = false;
+        bool has_submitted_before_frame_end = false;
         internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
-          if (std::ranges::any_of(submissions, is_old_enough)) {
-            has_old_enough = true;
+          if (std::ranges::any_of(submissions, is_submitted_before_frame_end)) {
+            has_submitted_before_frame_end = true;
           }
         });
-        if (!has_old_enough) continue;
+        if (!has_submitted_before_frame_end) continue;
 
         const auto value = ++queue_fence.last_value;
         internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
-          if (!std::ranges::any_of(submissions, is_old_enough)) return;
+          if (!std::ranges::any_of(submissions, is_submitted_before_frame_end)) return;
           // The new value also covers this queue's earlier fenced submission (signals on one queue complete in order).
           std::erase_if(submissions, [&](const GpuSubmission& submission) {
             return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle && submission.fence_value.has_value();
           });
           for (auto& submission : submissions) {
-            if (is_old_enough(submission)) {
+            if (is_submitted_before_frame_end(submission)) {
               submission.fence_value = value;
             }
           }
@@ -1930,8 +1924,8 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
 }
 
 // D3D12, without the lock: waits (LIFETIME_FENCE_WAIT_TIMEOUT per fence) until the GPU passed every fence value
-// already attached to a submission. Values not attached yet (submissions still inside the delay) cannot be waited for;
-// those textures are freed by a later frame end.
+// already attached to a submission. Submissions recorded since the last frame end have no value yet and cannot be
+// waited for; those textures are freed by a later frame end.
 inline void WaitForAttachedFenceValues(Watcher* watcher, reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d12) return;
   std::vector<std::pair<reshade::api::fence, std::uint64_t>> fences;
@@ -2757,7 +2751,6 @@ inline void ProcessAtFrameEnd(
           internal::AddSubmission(&session->scratch_entries[entry_index].submissions, GpuSubmission{
               .queue = session->queue,
               .frame_end_index = watcher->frame_end_index,
-              .executed_at = std::chrono::steady_clock::now(),
           });
         }
         for (const auto entry_index : reduced_entries) {
