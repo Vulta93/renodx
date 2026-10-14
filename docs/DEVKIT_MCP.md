@@ -322,12 +322,16 @@ every execution of a list that copies into a scratch texture is recorded as a su
 reused or destroyed only after the GPU passed a lifetime fence signalled on that queue (a per-queue fence, created only at
 frame ends on the presenting thread, signalled with the native `ID3D12CommandQueue::Signal`: ReShade's
 `command_queue::signal` also flushes that queue's immediate command list without the queue's lock). A list reset without
-any execution frees its textures at once. **Stated assumption:** ReShade raises `execute_command_list` before the real
-`ExecuteCommandLists` and outside any lock an add-on can take, with no event after the real submission, so a submission
-gets its fence value only after two frame ends and at least 100 ms; the game's submit call is assumed to have returned by
-then (100 ms covers the submit thread being paused by the OS). When the game destroys a queue (ReShade raises
-`destroy_command_queue` before releasing the native queue), its submissions get one more signal and are waited for there;
-a queue destroyed before it got a fence, or whose wait fails, keeps its textures until the device is destroyed (logged).
+any execution frees its textures at once. A submission is covered by the fence value queued at the first frame end after
+its `execute_command_list` event: at present, before the real `Present`, the watch signals each queue that executed
+region copies since the last frame end, once (a signal is a queue command, so it lands after the lists already submitted
+to that queue). No timing is involved. **Stated assumption:** ReShade raises `execute_command_list` under the queue's
+lock, releases the lock and only then calls the real `ExecuteCommandLists`, with no event after the real submission; a
+submission whose event came before a frame end is assumed to be submitted by that frame end. The only gap is another
+thread caught between ReShade releasing the lock and its real `ExecuteCommandLists` at that exact moment. When the game
+destroys a queue (ReShade raises `destroy_command_queue` before releasing the native queue), its submissions get one more
+signal and are waited for there; a queue destroyed before it got a fence, or whose wait fails, keeps its textures until
+the device is destroyed (logged).
 `scratchBudgetMB` caps their total size: a full-resolution 4K FP16 region needs 66 MB per measurement, so use a region or
 `shaderHash` on busy buffers; measurements beyond the budget are reported as `scratch_budget`. The budget becomes a
 texture count, budget / (region width x height x bytes per pixel), capped at 4096 and reported as `scratchEntriesMax`
@@ -335,9 +339,9 @@ texture count, budget / (region width x height x bytes per pixel), capped at 409
 scratch textures: creating an image inside the game's own command recording calls the driver and the game's allocation
 callbacks from a context the game does not expect (it deadlocked DOOM 2016's allocator). A pool of up to 16 is created when
 the watch starts. Each frame end (on the presenting thread) counts the textures that frame asked for, found or not, and
-grows the pool so the next frame starts with that many free, within the budget; a texture still held (D3D12: until its
-lifetime fence passed, at least two frame ends and 100 ms) does not count as free, so on D3D12 the pool settles near
-that many frames' worth.
+grows the pool so the next frame starts with that many free, within the budget; a texture still held (D3D12: until the
+GPU passed the lifetime fence queued at the frame end after its execution) does not count as free, so on D3D12 the pool
+settles near that many frames' worth.
 Closing frames grow it only by what the hooks were short of. The warm-up frame sizes the pool for the first measured
 frame, so a 1-frame watch is usually fully sized but not always: lists already recording when the watch started are
 untracked and reserve nothing in the warm-up frame. A hook that finds no free texture reports that writer as
@@ -402,10 +406,10 @@ as `untracked_command_list` until they are reset.
 **Cross-queue points (D3D12).** A game may render on a direct queue other than the presenting one (Gears of War: E-Day,
 Unreal Engine 5 with Streamline). Those lists' copies run on the game's queue, the reductions on the presenting queue, so
 such a point is reduced only once the GPU finished the copy: each frame end checks on the CPU whether the game queue's
-lifetime fence passed the point's submission (two frame ends and 100 ms after its execute event at the earliest, see
-above). The presenting queue is never made to wait on the GPU, so a fence that never arrives (queue destroyed, device
-lost) cannot freeze present. A point still not ready when the watch ends is reported as `cross_queue_not_ready`; while
-such points are pending, closing goes on past 8 frames until they are ready or 1 s has passed. The scratch texture stays
+lifetime fence passed the point's submission (at the frame end after the one that queued its fence value, at the
+earliest, see above). The presenting queue is never made to wait on the GPU, so a fence that never arrives (queue
+destroyed, device lost) cannot freeze present. A point still not ready when the watch ends is reported as
+`cross_queue_not_ready`; while such points are pending, closing goes on past 8 frames until they are ready or 1 s has passed. The scratch texture stays
 in COPY_DEST from its creation through the copy on the game's queue (only the watched image is transitioned there), and the
 reduction on the presenting queue transitions it COPY_DEST -> COPY_SOURCE and back. It is reused or destroyed only after
 both the game queue's fence and the presenting queue's fence (covering the reduction) passed. These writers are marked
@@ -450,9 +454,9 @@ writers per frame (`truncatedFrames` reports frames that hit it or the scratch b
   measurement.
 - Follow-up: `devkit_analyze_resource` still reads the texture inside the Devkit's own `present` handler, so on a back buffer
   it can miss what add-ons loaded after the Devkit draw at present (the ordering problem fixed here for the watch).
-- Cross-queue points are reduced at least two frame ends and 100 ms after their execution, so they hold scratch
-  textures longer (on busy targets the pool can reach the budget: use a region or `shaderHash`), and a 1-frame watch on
-  such a game takes about a second to close.
+- Cross-queue points are reduced at the second frame end after their execution at the earliest (later when the GPU
+  runs behind), so they hold scratch textures longer (on busy targets the pool can reach the budget: use a region or
+  `shaderHash`), and a 1-frame watch on such a game closes a few frames later.
 - On targets with hundreds of writers per frame (for example an Unreal Engine 5 G-buffer), a 1-frame watch can come up
   empty: Unreal records the next frame while the pool grows. Use `shaderHash` to watch only the writers you care about
   (keeps the per-command trace), or `frames` >= 2 (aggregated writers only, no trace); both only reduce the loss. In
