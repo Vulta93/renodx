@@ -702,6 +702,22 @@ inline void EncodePreviewPixel(
       rgba[3] = DecodeFloat16(packed[3]);
       return true;
     }
+    case reshade::api::format::r16g16b16a16_unorm: {
+      const auto* packed = reinterpret_cast<const uint16_t*>(pixel);
+      rgba[0] = packed[0] / 65535.f;
+      rgba[1] = packed[1] / 65535.f;
+      rgba[2] = packed[2] / 65535.f;
+      rgba[3] = packed[3] / 65535.f;
+      return true;
+    }
+    case reshade::api::format::r32g32b32a32_float: {
+      const auto* packed = reinterpret_cast<const float*>(pixel);
+      rgba[0] = packed[0];
+      rgba[1] = packed[1];
+      rgba[2] = packed[2];
+      rgba[3] = packed[3];
+      return true;
+    }
     default:
       return false;
   }
