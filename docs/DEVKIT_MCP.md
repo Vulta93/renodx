@@ -325,13 +325,15 @@ watched subresource is transitioned from its exactly known state to copy source 
 for textures with more than one subresource, since ReShade's `barrier()` transitions all of them). The lists' records are
 committed at `execute_command_list`, so measurements follow submission order, not recording order; all reductions run at the
 end of the frame on ReShade's immediate command list of the presenting queue, after barriers that order them behind the
-game's copies. The stats readback is guarded by a fence (Vulkan: signalled at `finish_present`). Scratch textures copied into
+game's copies. The stats readback is guarded by a fence (D3D12: signalled after flushing that immediate command list;
+Vulkan: signalled at `finish_present`). Scratch textures copied into
 by a command list stay reserved until that list is reset or destroyed (it may be executed again), also after the watch ends.
 On D3D12 that is not enough: D3D12 lets a game reset a command list while the GPU still runs it (Vulkan does not), so
 every execution of a list that copies into a scratch texture is recorded as a submission on its queue, and the texture is
 reused or destroyed only after the GPU passed a lifetime fence signalled on that queue (a per-queue fence, created only at
-frame ends on the presenting thread, signalled with the native `ID3D12CommandQueue::Signal`: ReShade's
-`command_queue::signal` also flushes that queue's immediate command list without the queue's lock). A list reset without
+frame ends on the presenting thread; on D3D12 `utils::gpu_fence` signals it with the native
+`ID3D12CommandQueue::Signal`, while ReShade's `command_queue::signal` would also flush that queue's immediate command list
+without the queue's lock). A list reset without
 any execution frees its textures at once. A submission is covered by the fence value queued at the first frame end after
 its `execute_command_list` event: at present, before the real `Present`, the watch signals each queue that executed
 region copies since the last frame end, once (a signal is a queue command, so it lands after the lists already submitted
@@ -379,16 +381,32 @@ edit maps, raise no ReShade event and never call back into the Devkit, and the D
 them. **Stated assumption (from the Vulkan spec, not checked in source):** on Vulkan the view lookups call the driver's
 `vkGetPrivateData`, which has no allocator parameter and cannot call back into the game or the Devkit. A new lookup under
 the watcher lock is allowed only if it takes no lock, or only a leaf lock that never raises a ReShade event or calls back
-into the Devkit. Check this before adding one.
+into the Devkit. Check this before adding one. The progress of the watch's fences is also read under the lock: each
+fence's completion counter has its own mutex, which only the fence's completion callback takes besides the watch.
 
 Frame ends of different runtimes can still run at once, and each one fences the D3D12 queues that executed region
 copies (see below). A queue whose fence a frame end is still signalling is skipped by the others, so one thread at a time
 signals a queue's fence and its values are signalled in order; its submissions get the next frame end's value.
 
+**Fences (`utils::gpu_fence`).** The D3D12 lifetime fences (one per game queue) and the D3D12/Vulkan stats readback
+fence are `gpu_fence::Fence`s, and every signal carries a completion callback. gpu_fence numbers the values of a fence 1,
+2, 3, ... (a failed signal uses none) and delivers the callbacks in order on a worker thread, so a callback only counts:
+the n-th callback means value n completed. Frame ends read that count instead of querying the GPU, and every CPU wait for
+a fence is a condition-variable wait on it. Three rules keep the count right, checked in the code: every signal carries
+a callback; a fence is signalled on one queue only (gpu_fence would make the queue wait on the GPU when a fence changes
+queue); at most one thread signals a fence at a time (asserted). gpu_fence picks the value when it signals, so a frame end
+marks the submissions a signal will cover under the lock, signals without it, and attaches the value under the lock
+again; a failed signal leaves them for the next frame end. While a signal's value has not completed, gpu_fence's worker
+checks the fence every millisecond (one worker per fence: the stats fence's ends with the watch, a queue's sleeps when
+nothing is pending). A Vulkan device without timeline semaphores has no fence: the readback then waits for the queue to
+go idle.
+
 Every CPU wait for the GPU in the watch has a timeout (2 s: lifetime fences at the end of a watch, at queue and device
 destruction, the stats readback fence, and the waits of a destroyed queue and of device destruction for a frame end's
 signal in flight), and none holds the lock. The one exception is ReShade's `command_queue::wait_idle` (end of a watch), which has no timeout parameter; a
-GPU hang ends it through the driver's device removal.
+GPU hang ends it through the driver's device removal. **Device removal:** `gpu_fence` treats a failed completion query
+as fatal, so if the GPU is removed (TDR) while one of the watch's fences has a value pending, the game process ends
+instead of the watch reporting an error (maintainer decision: a GPU crash is a bug to be spotted, not survived).
 
 The state of the watched subresource is only taken where it is exactly known; everywhere else the writer is reported as
 unmeasured and its "before" comes from the last measurement point in submission order, if no other writer came in between:
