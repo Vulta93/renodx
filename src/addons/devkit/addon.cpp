@@ -50,6 +50,7 @@
 #include "../../utils/device_proxy.hpp"
 #include "../../utils/device_upgrade.hpp"
 #include "../../utils/format.hpp"
+#include "../../utils/gpu_fence.hpp"
 #include "../../utils/icons.hpp"
 #include "../../utils/mcp/server.hpp"
 #include "../../utils/path.hpp"
@@ -9326,6 +9327,9 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
 
   std::span<const uint8_t> reduce_shader = __watch_region_reduce_dx11;
   switch (device->get_api()) {
+    case reshade::api::device_api::d3d9:
+      reduce_shader = __watch_region_reduce_dx9;
+      break;
     case reshade::api::device_api::d3d12:
       reduce_shader = __watch_region_reduce_dx12;
       break;
@@ -9335,7 +9339,7 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
     default:
       break;
   }
-  devkit_watch_region::ProcessAtFrameEnd(&device_data->watch_region_watcher, device_index, runtime, reduce_shader);
+  devkit_watch_region::ProcessAtFrameEnd(&device_data->watch_region_watcher, device_index, runtime, reduce_shader, __watch_region_quad_dx9);
 }
 
 void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
@@ -9581,6 +9585,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::utils::swapchain::Use(fdw_reason);
       renodx::utils::device_upgrade::Use(fdw_reason);
       renodx::utils::device_proxy::Use(fdw_reason);
+      // devkit_watch_region's D3D9 readback fence: gpu_fence finds a D3D9Ex device's GPU handles when the device starts.
+      renodx::utils::gpu_fence::Use(fdw_reason);
       renodx::utils::resource::replace::Use(fdw_reason);
       renodx::utils::resource::replace::SetEnabled(true);
       renodx::utils::resource::replace::SetProvider(LoadBootTextureReplacement);
@@ -9640,6 +9646,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::utils::swapchain::Use(fdw_reason);
       renodx::utils::device_upgrade::Use(fdw_reason);
       renodx::utils::device_proxy::Use(fdw_reason);
+      renodx::utils::gpu_fence::Use(fdw_reason);
       renodx::utils::resource::replace::Use(fdw_reason);
       renodx::utils::resource::replace::SetProvider({});
       renodx::utils::resource::Use(fdw_reason);

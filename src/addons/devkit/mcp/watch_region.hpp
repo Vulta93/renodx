@@ -9,6 +9,7 @@
 
 #include <d3d11.h>
 #include <d3d12.h>
+#include <d3d9.h>
 
 #include <algorithm>
 #include <array>
@@ -71,6 +72,10 @@
 // the watched texture to copy source and back). The copies are ordered by submission (execute_command_list), and all
 // reductions run at the end of the frame on ReShade's immediate command list of the presenting queue.
 //
+// D3D9 has no compute shaders or UAVs. A measurement point only copies the region (StretchRect) into its slot of one
+// atlas texture, without touching the game's state. At the end of the frame a pixel shader reduces every used slot in a
+// few passes (8x8 pixels per output pixel) into one row of a float stats target. Needs D3D9Ex for the readback fence.
+//
 // The stats texture is copied to a small readback ring at the end of every frame and decoded two frames later, so a
 // long watch does not stall the GPU every frame.
 namespace renodx::addons::devkit::mcp::watch_region {
@@ -122,6 +127,26 @@ constexpr std::uint32_t STATS_ABOVE_1000_COUNT = 10u;
 constexpr std::uint32_t STATS_ABOVE_4000_COUNT = 11u;
 constexpr std::uint32_t STATS_FINITE_COUNT = 12u;
 constexpr std::uint32_t STATS_BLACK_COUNT = 13u;
+// D3D9: float positions of the same statistics in one row of the stats target (4 pixels of 4 floats). Keep in sync with
+// watch_region_reduce_dx9.ps_3_0.hlsl. The row is converted to the word layout above after the readback.
+constexpr std::uint32_t D3D9_STATS_MAX_LUMINANCE = 0u;
+constexpr std::uint32_t D3D9_STATS_MIN_LUMINANCE = 1u;
+constexpr std::uint32_t D3D9_STATS_MAX_CHANNEL = 2u;
+constexpr std::uint32_t D3D9_STATS_LUMINANCE_SUM = 3u;
+constexpr std::uint32_t D3D9_STATS_FINITE_COUNT = 4u;
+constexpr std::uint32_t D3D9_STATS_NON_FINITE_COUNT = 5u;
+constexpr std::uint32_t D3D9_STATS_NEGATIVE_COUNT = 6u;
+constexpr std::uint32_t D3D9_STATS_ABOVE_ONE_COUNT = 7u;
+constexpr std::uint32_t D3D9_STATS_BLACK_COUNT = 8u;
+constexpr std::uint32_t D3D9_STATS_ABOVE_203_COUNT = 9u;
+constexpr std::uint32_t D3D9_STATS_ABOVE_400_COUNT = 10u;
+constexpr std::uint32_t D3D9_STATS_ABOVE_1000_COUNT = 11u;
+constexpr std::uint32_t D3D9_STATS_ABOVE_4000_COUNT = 12u;
+// D3D9: the four float4 groups of a row, written to four render targets by the intermediate reduction passes.
+constexpr std::uint32_t D3D9_STATS_GROUPS = 4u;
+constexpr std::uint32_t D3D9_REDUCTION_BLOCK_SIZE = 8u;
+// D3D9: pixel counts are floats in the reduction, exact up to 2^24.
+constexpr std::uint64_t D3D9_MAX_REGION_PIXELS = 1u << 24u;
 constexpr double LUMINANCE_SUM_SCALE = 1048576.0;
 // Per-pixel luminance cap applied to the sum (float16 maximum), mirrored by the CPU verification.
 constexpr double LUMINANCE_SUM_CLAMP = 65504.0;
@@ -415,7 +440,8 @@ struct VulkanImageMemoryBarrier {
   std::uint64_t image = 0u;
   VulkanImageSubresourceRange subresource_range = {};
 };
-static_assert(sizeof(VulkanImageMemoryBarrier) == 72u);
+// VkImage is a 64-bit handle on both targets; only pNext changes size (x86 builds: 64 bytes).
+static_assert(sizeof(VulkanImageMemoryBarrier) == (sizeof(void*) == 8u ? 72u : 64u));
 using VulkanCmdPipelineBarrier = void(__stdcall*)(
     void* command_buffer,
     std::uint32_t src_stage_mask,
@@ -428,6 +454,34 @@ using VulkanCmdPipelineBarrier = void(__stdcall*)(
     std::uint32_t image_barrier_count,
     const VulkanImageMemoryBarrier* image_barriers);
 using VulkanGetDeviceProcAddr = void*(__stdcall*)(void* device, const char* name);
+
+// D3D9: a native object owned by the watch, released when the watch's objects are destroyed.
+struct D3D9Release {
+  void operator()(IUnknown* object) const { object->Release(); }
+};
+template <typename T>
+using D3D9Pointer = std::unique_ptr<T, D3D9Release>;
+
+// D3D9: one intermediate level of the reduction: the four stats groups of every 8x8 block of the level below.
+struct D3D9ReductionLevel {
+  std::array<reshade::api::resource, D3D9_STATS_GROUPS> targets = {};
+  std::uint32_t width = 0u;
+  std::uint32_t height = 0u;
+};
+
+// D3D9: the objects of the frame-end reduction. The atlas is Session::scratch (a grid of region-sized slots,
+// `atlas_columns` per row) and the stats target is Session::stats_texture (D3D9_STATS_GROUPS x MAX_SLOTS, one row per
+// slot). The state block restores the game's state after the passes.
+struct D3D9Reduction {
+  D3D9Pointer<IDirect3DStateBlock9> state_block;
+  D3D9Pointer<IDirect3DVertexDeclaration9> vertex_declaration;
+  D3D9Pointer<IDirect3DVertexShader9> vertex_shader;
+  D3D9Pointer<IDirect3DPixelShader9> pixel_shader;
+  std::vector<D3D9ReductionLevel> levels;
+  std::uint32_t atlas_columns = 0u;
+  std::uint32_t atlas_width = 0u;
+  std::uint32_t atlas_height = 0u;
+};
 
 struct Session {
   std::shared_ptr<Request> request;
@@ -498,7 +552,8 @@ struct Session {
   std::optional<std::uint64_t> end_point = std::nullopt;
   std::optional<RegionStats> end_stats = std::nullopt;
 
-  // D3D11: the region copy that is reduced. D3D12/Vulkan: a scratch entry is copied here before it is reduced.
+  // D3D11: the region copy that is reduced. D3D12/Vulkan: a scratch entry is copied here before it is reduced. D3D9: the
+  // atlas of measurement slots.
   reshade::api::resource scratch = {0u};
   reshade::api::resource_view scratch_srv = {0u};
   reshade::api::resource stats_texture = {0u};
@@ -507,9 +562,12 @@ struct Session {
   renodx::utils::render::RenderPass pass;
   // width, height, signal, slot as raw bits; the compute pass reads this through push constants.
   std::array<float, 4> constants = {};
+  D3D9Reduction d3d9;
 
   // State of the frame being recorded.
   std::uint32_t slots_used = 0u;
+  // D3D11: MAX_SLOTS. D3D9: the atlas slots that fit the scratch budget and the device's texture size.
+  std::uint32_t slot_capacity = MAX_SLOTS;
   std::uint32_t command_count = 0u;
   bool stats_cleared = false;
   bool truncated = false;
@@ -777,10 +835,39 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
   return "unknown";
 }
 
-[[nodiscard]] inline bool IsImmediateD3D11Context(reshade::api::command_list* cmd_list) {
-  if (cmd_list->get_device()->get_api() != reshade::api::device_api::d3d11) return false;
-  auto* native_context = reinterpret_cast<ID3D11DeviceContext*>(static_cast<std::uintptr_t>(cmd_list->get_native()));
-  return native_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+// The command lists whose recording order is their execution order: the D3D11 immediate context and the D3D9 device.
+[[nodiscard]] inline bool IsImmediateCommandList(reshade::api::command_list* cmd_list) {
+  switch (cmd_list->get_device()->get_api()) {
+    case reshade::api::device_api::d3d9:
+      return true;
+    case reshade::api::device_api::d3d11: {
+      auto* native_context = reinterpret_cast<ID3D11DeviceContext*>(static_cast<std::uintptr_t>(cmd_list->get_native()));
+      return native_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    }
+    default:
+      return false;
+  }
+}
+
+// D3D9: the surface of a ReShade resource handle (a native IDirect3DSurface9 or IDirect3DTexture9; `level` for a
+// texture), or null for another resource type.
+[[nodiscard]] inline D3D9Pointer<IDirect3DSurface9> GetD3D9Surface(reshade::api::resource resource, std::uint32_t level) {
+  auto* native_resource = reinterpret_cast<IDirect3DResource9*>(static_cast<std::uintptr_t>(resource.handle));
+  IDirect3DSurface9* surface = nullptr;
+  switch (native_resource->GetType()) {
+    case D3DRTYPE_SURFACE:
+      surface = static_cast<IDirect3DSurface9*>(native_resource);
+      surface->AddRef();
+      break;
+    case D3DRTYPE_TEXTURE:
+      if (FAILED(static_cast<IDirect3DTexture9*>(native_resource)->GetSurfaceLevel(level, &surface))) {
+        surface = nullptr;
+      }
+      break;
+    default:
+      break;
+  }
+  return D3D9Pointer<IDirect3DSurface9>(surface);
 }
 
 [[nodiscard]] inline bool IsExplicitApi(reshade::api::device_api api) {
@@ -1084,6 +1171,18 @@ inline void DestroySessionObjects(Session* session, reshade::api::device* device
     device->destroy_resource(session->verify_readback);
     session->verify_readback = {0u};
   }
+  for (const auto& level : session->d3d9.levels) {
+    for (const auto target : level.targets) {
+      if (target.handle != 0u) {
+        device->destroy_resource(target);
+      }
+    }
+  }
+  session->d3d9.levels.clear();
+  session->d3d9.state_block.reset();
+  session->d3d9.vertex_declaration.reset();
+  session->d3d9.vertex_shader.reset();
+  session->d3d9.pixel_shader.reset();
   session->stats_timeline.reset();
 }
 
@@ -1146,11 +1245,50 @@ inline void SignalPendingStatsFrame(Session* session, reshade::api::command_queu
   }
 }
 
-// D3D11: reduces the watched region into the next stats slot and returns that slot. Must run with the session locked.
+// D3D11: reduces the watched region into the next stats slot and returns that slot. D3D9: copies the region into that
+// slot of the atlas; the frame end reduces it. Must run with the session locked.
 [[nodiscard]] inline std::optional<std::uint32_t> MeasureRegion(Session* session, reshade::api::command_list* cmd_list) {
-  if (session->slots_used >= MAX_SLOTS) {
+  if (session->slots_used >= session->slot_capacity) {
     session->truncated = true;
     return std::nullopt;
+  }
+
+  if (session->device_api == reshade::api::device_api::d3d9) {
+    // A native StretchRect raises no ReShade event and changes no device state, and its result tells whether this
+    // source can be copied at all.
+    const auto source = internal::GetD3D9Surface(session->watched_resource, session->mip_level);
+    const auto atlas = internal::GetD3D9Surface(session->scratch, 0u);
+    if (source == nullptr || atlas == nullptr) {
+      session->failure = "The watched texture or the measurement atlas has no Direct3D 9 surface.";
+      return std::nullopt;
+    }
+    const auto slot = session->slots_used++;
+    const auto& region = session->region;
+    const RECT source_rect = {
+        .left = static_cast<LONG>(region.left),
+        .top = static_cast<LONG>(region.top),
+        .right = static_cast<LONG>(region.right),
+        .bottom = static_cast<LONG>(region.bottom),
+    };
+    const auto cell_left = static_cast<LONG>((slot % session->d3d9.atlas_columns) * session->width);
+    const auto cell_top = static_cast<LONG>((slot / session->d3d9.atlas_columns) * session->height);
+    const RECT cell_rect = {
+        .left = cell_left,
+        .top = cell_top,
+        .right = cell_left + static_cast<LONG>(session->width),
+        .bottom = cell_top + static_cast<LONG>(session->height),
+    };
+    auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<std::uintptr_t>(cmd_list->get_device()->get_native()));
+    const auto result = native_device->StretchRect(source.get(), &source_rect, atlas.get(), &cell_rect, D3DTEXF_POINT);
+    if (FAILED(result)) {
+      session->failure = std::format(
+          "StretchRect cannot copy the watched {} texture into the measurement atlas (HRESULT 0x{:08X}): this source is"
+          " not supported on Direct3D 9.",
+          session->resource_format_name,
+          static_cast<std::uint32_t>(result));
+      return std::nullopt;
+    }
+    return slot;
   }
 
   if (!session->stats_cleared) {
@@ -1208,14 +1346,14 @@ inline void SignalPendingStatsFrame(Session* session, reshade::api::command_queu
   return slot;
 }
 
-// D3D11 immediate context: recording order is execution order, so the record is committed at once. Writers outside
-// the filter are only measured to close an open event.
+// D3D11 immediate context and D3D9: recording order is execution order, so the record is committed at once. Writers
+// outside the filter are only measured to close an open event.
 inline void RecordImmediateWriter(Session* session, reshade::api::command_list* cmd_list, const WriterInfo& writer, bool matches_filter) {
   if (!matches_filter && !session->open_event.has_value()) return;
 
   auto record = Record{.writer = writer};
   // The last slot stays free for the measurement taken at the end of the frame.
-  if (session->slots_used + 1u >= MAX_SLOTS) {
+  if (session->slots_used + 1u >= session->slot_capacity) {
     session->truncated = true;
     record.reason = UnmeasuredReason::SLOT_LIMIT;
   } else {
@@ -1314,7 +1452,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   const auto device_api = cmd_list->get_device()->get_api();
   const auto explicit_api = internal::IsExplicitApi(device_api);
-  if (!explicit_api && !internal::IsImmediateD3D11Context(cmd_list)) return;
+  if (!explicit_api && !internal::IsImmediateCommandList(cmd_list)) return;
 
   WatcherLock lock(watcher, "OnDrawOrDispatch");
   auto* session = watcher->session.get();
@@ -1495,7 +1633,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
 inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_list, WriterKind kind, const WrittenTarget& target) {
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   const auto explicit_api = (cmd_list != nullptr && internal::IsExplicitApi(cmd_list->get_device()->get_api()));
-  if (cmd_list != nullptr && !explicit_api && !internal::IsImmediateD3D11Context(cmd_list)) return;
+  if (cmd_list != nullptr && !explicit_api && !internal::IsImmediateCommandList(cmd_list)) return;
 
   WatcherLock lock(watcher, "OnResourceWrite");
   auto* session = watcher->session.get();
@@ -2212,13 +2350,15 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
 
 // Called from reshade_present, which ReShade raises after every add-on's present handler and after its own effects
 // and overlay, so the end-of-frame measurement includes whatever any add-on wrote during present, independent of load
-// order. Finishes the frame that just ended (final measurement, D3D12/Vulkan reductions, stats readback), completes
-// the watch when enough frames were recorded, and starts the next queued watch.
+// order. Finishes the frame that just ended (final measurement, D3D9/D3D12/Vulkan reductions, stats readback), completes
+// the watch when enough frames were recorded, and starts the next queued watch. `reduce_shader` is the device API's
+// reduction shader (D3D9: the pixel shader); `d3d9_vertex_shader` is only used on D3D9.
 inline void ProcessAtFrameEnd(
     Watcher* watcher,
     std::uint32_t device_index,
     reshade::api::effect_runtime* runtime,
-    std::span<const std::uint8_t> reduce_shader) {
+    std::span<const std::uint8_t> reduce_shader,
+    std::span<const std::uint8_t> d3d9_vertex_shader) {
   auto* device = runtime->get_device();
   auto* queue = runtime->get_command_queue();
   const auto get_unmeasured_reason_name = [](UnmeasuredReason reason) -> std::string_view {
@@ -2515,12 +2655,12 @@ inline void ProcessAtFrameEnd(
     std::vector<MappedReadback> mapped_readbacks;
     std::string unlocked_failure;
 
-    // Maps the oldest in-flight readback. D3D12/Vulkan mapping does not wait for the GPU, so the frame's fence must
+    // Maps the oldest in-flight readback. D3D9/D3D12/Vulkan mapping does not wait for the GPU, so the frame's fence must
     // have passed; with `wait` the CPU waits for it. Never called under the watcher lock.
     const auto map_oldest = [&](bool wait) -> bool {
       const auto frame = session->in_flight.front();
       const auto has_readback = (frame.fence_value != (std::numeric_limits<std::uint64_t>::max)());
-      if (session->explicit_api && has_readback) {
+      if ((session->explicit_api || session->stats_timeline != nullptr) && has_readback) {
         if (session->stats_timeline != nullptr) {
           if (frame.fence_value == 0u) {
             // Vulkan: finish_present has not signalled this frame yet.
@@ -2565,6 +2705,35 @@ inline void ProcessAtFrameEnd(
               mapped.rows.begin() + (static_cast<std::ptrdiff_t>(slot) * STATS_STRIDE));
         }
         device->unmap_texture_region(session->readbacks[frame.ring_index], 0u);
+        if (session->device_api == reshade::api::device_api::d3d9) {
+          // The D3D9 rows hold floats (D3D9_STATS_*); rewritten in the word layout of the compute path, so decoding and
+          // the before/after comparison of raw rows are shared.
+          for (std::uint32_t slot = 0u; slot < MAX_SLOTS; ++slot) {
+            const auto row = std::span(mapped.rows).subspan(static_cast<std::size_t>(slot) * STATS_STRIDE, STATS_STRIDE);
+            std::array<float, STATS_STRIDE> values = {};
+            std::ranges::transform(row, values.begin(), [](std::uint32_t word) { return std::bit_cast<float>(word); });
+            const auto count = [&values](std::uint32_t index) {
+              return static_cast<std::uint32_t>(std::lround(values[index]));
+            };
+            const auto luminance_sum = static_cast<std::uint64_t>(std::llround(
+                std::max(static_cast<double>(values[D3D9_STATS_LUMINANCE_SUM]), 0.0) * LUMINANCE_SUM_SCALE));
+            std::ranges::fill(row, 0u);
+            row[STATS_NON_FINITE_COUNT] = count(D3D9_STATS_NON_FINITE_COUNT);
+            row[STATS_MAX_LUMINANCE_BITS] = std::bit_cast<std::uint32_t>(values[D3D9_STATS_MAX_LUMINANCE]);
+            row[STATS_MIN_LUMINANCE_INVERTED_BITS] = ~std::bit_cast<std::uint32_t>(values[D3D9_STATS_MIN_LUMINANCE]);
+            row[STATS_MAX_CHANNEL_BITS] = std::bit_cast<std::uint32_t>(values[D3D9_STATS_MAX_CHANNEL]);
+            row[STATS_LUMINANCE_SUM_LOW] = static_cast<std::uint32_t>(luminance_sum);
+            row[STATS_LUMINANCE_SUM_HIGH] = static_cast<std::uint32_t>(luminance_sum >> 32u);
+            row[STATS_NEGATIVE_COUNT] = count(D3D9_STATS_NEGATIVE_COUNT);
+            row[STATS_ABOVE_ONE_COUNT] = count(D3D9_STATS_ABOVE_ONE_COUNT);
+            row[STATS_ABOVE_203_COUNT] = count(D3D9_STATS_ABOVE_203_COUNT);
+            row[STATS_ABOVE_400_COUNT] = count(D3D9_STATS_ABOVE_400_COUNT);
+            row[STATS_ABOVE_1000_COUNT] = count(D3D9_STATS_ABOVE_1000_COUNT);
+            row[STATS_ABOVE_4000_COUNT] = count(D3D9_STATS_ABOVE_4000_COUNT);
+            row[STATS_FINITE_COUNT] = count(D3D9_STATS_FINITE_COUNT);
+            row[STATS_BLACK_COUNT] = count(D3D9_STATS_BLACK_COUNT);
+          }
+        }
       }
       mapped_readbacks.push_back(std::move(mapped));
       return true;
@@ -2643,6 +2812,8 @@ inline void ProcessAtFrameEnd(
     reshade::api::resource back_buffer_texture = {0u};
     std::optional<InFlightFrame> new_frame = std::nullopt;
     bool has_measurements = false;
+    // D3D9: the atlas slots filled this frame, reduced in stage 2.
+    std::uint32_t d3d9_slots_to_reduce = 0u;
     bool frame_planned = false;
     bool request_canceled = false;
     std::uint32_t scratch_growth = 0u;
@@ -2738,7 +2909,7 @@ inline void ProcessAtFrameEnd(
           });
           has_measurements = !planned_reductions.empty();
         } else if (session->open_event.has_value() || is_last_frame) {
-          // D3D11: the region is measured in place on the immediate context.
+          // D3D11: the region is measured in place on the immediate context. D3D9: copied into its atlas slot.
           const auto final_slot = internal::MeasureRegion(session.get(), cmd_list);
           if (session->failure.empty()) {
             internal::Commit(
@@ -2763,6 +2934,9 @@ inline void ProcessAtFrameEnd(
         }
         if (!session->explicit_api) {
           has_measurements = (session->slots_used != 0u);
+        }
+        if (session->device_api == reshade::api::device_api::d3d9 && session->failure.empty()) {
+          d3d9_slots_to_reduce = session->slots_used;
         }
 
         const auto frame_first_point = std::max(session->frame_first_point, session->points_base);
@@ -2874,6 +3048,159 @@ inline void ProcessAtFrameEnd(
         cmd_list->barrier(reduction.texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest);
       }
 
+      // D3D9: reduces every slot filled this frame into its stats row. The passes run inside the scene ReShade opens around
+      // its present work (Direct3DSwapChain9::on_present calls BeginScene before raising present and running the effect
+      // runtime, whose last step is reshade_present, and EndScene after), so they issue no BeginScene/EndScene of their
+      // own: a nested BeginScene fails, and an EndScene here would close ReShade's scene.
+      if (d3d9_slots_to_reduce != 0u) {
+        auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<std::uintptr_t>(device->get_native()));
+        auto& d3d9 = session->d3d9;
+
+        // State blocks do not record render targets or the depth-stencil surface: the four render target slots the passes
+        // use and the depth-stencil surface are saved and restored here.
+        std::array<IDirect3DSurface9*, D3D9_STATS_GROUPS> game_render_targets = {};
+        for (std::uint32_t index = 0u; index < D3D9_STATS_GROUPS; ++index) {
+          if (FAILED(native_device->GetRenderTarget(index, &game_render_targets[index]))) {
+            game_render_targets[index] = nullptr;
+          }
+        }
+        IDirect3DSurface9* game_depth_stencil = nullptr;
+        if (FAILED(native_device->GetDepthStencilSurface(&game_depth_stencil))) {
+          game_depth_stencil = nullptr;
+        }
+        d3d9.state_block->Capture();
+
+        // A full known state: nothing the game left set may change the passes' output.
+        native_device->SetVertexDeclaration(d3d9.vertex_declaration.get());
+        native_device->SetVertexShader(d3d9.vertex_shader.get());
+        native_device->SetPixelShader(d3d9.pixel_shader.get());
+        native_device->SetDepthStencilSurface(nullptr);
+        constexpr DWORD ALL_CHANNELS = D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA;
+        constexpr std::array<std::pair<D3DRENDERSTATETYPE, DWORD>, 17> RENDER_STATES = {{
+            {D3DRS_ZENABLE, D3DZB_FALSE},
+            {D3DRS_ZWRITEENABLE, FALSE},
+            {D3DRS_STENCILENABLE, FALSE},
+            {D3DRS_ALPHABLENDENABLE, FALSE},
+            {D3DRS_SEPARATEALPHABLENDENABLE, FALSE},
+            {D3DRS_ALPHATESTENABLE, FALSE},
+            {D3DRS_SCISSORTESTENABLE, FALSE},
+            {D3DRS_CLIPPLANEENABLE, 0u},
+            {D3DRS_FOGENABLE, FALSE},
+            {D3DRS_SRGBWRITEENABLE, FALSE},
+            {D3DRS_CULLMODE, D3DCULL_NONE},
+            {D3DRS_FILLMODE, D3DFILL_SOLID},
+            {D3DRS_DITHERENABLE, FALSE},
+            {D3DRS_COLORWRITEENABLE, ALL_CHANNELS},
+            {D3DRS_COLORWRITEENABLE1, ALL_CHANNELS},
+            {D3DRS_COLORWRITEENABLE2, ALL_CHANNELS},
+            {D3DRS_COLORWRITEENABLE3, ALL_CHANNELS},
+        }};
+        for (const auto& [render_state, value] : RENDER_STATES) {
+          native_device->SetRenderState(render_state, value);
+        }
+        constexpr std::array<std::pair<D3DSAMPLERSTATETYPE, DWORD>, 8> SAMPLER_STATES = {{
+            {D3DSAMP_SRGBTEXTURE, FALSE},
+            {D3DSAMP_MINFILTER, D3DTEXF_POINT},
+            {D3DSAMP_MAGFILTER, D3DTEXF_POINT},
+            {D3DSAMP_MIPFILTER, D3DTEXF_NONE},
+            {D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP},
+            {D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP},
+            {D3DSAMP_MAXMIPLEVEL, 0u},
+            {D3DSAMP_MIPMAPLODBIAS, 0u},
+        }};
+        for (std::uint32_t sampler = 0u; sampler < D3D9_STATS_GROUPS; ++sampler) {
+          for (const auto& [sampler_state, value] : SAMPLER_STATES) {
+            native_device->SetSamplerState(sampler, sampler_state, value);
+          }
+        }
+
+        constexpr std::array<float, 8> QUAD = {-1.f, 1.f, 1.f, 1.f, -1.f, -1.f, 1.f, -1.f};
+        const auto stats_target = internal::GetD3D9Surface(session->stats_texture, 0u);
+        for (std::uint32_t slot = 0u; slot < d3d9_slots_to_reduce && unlocked_failure.empty(); ++slot) {
+          // Pass inputs: the slot's cell of the atlas first, then each intermediate level in turn.
+          std::array<reshade::api::resource, D3D9_STATS_GROUPS> inputs = {session->scratch};
+          std::array<float, 12> constants = {
+              static_cast<float>((slot % d3d9.atlas_columns) * session->width),
+              static_cast<float>((slot / d3d9.atlas_columns) * session->height),
+              static_cast<float>(d3d9.atlas_width),
+              static_cast<float>(d3d9.atlas_height),
+              static_cast<float>(session->width),
+              static_cast<float>(session->height),
+              1.f,
+              static_cast<float>(static_cast<std::uint32_t>(session->signal)),
+              0.f,
+              0.f,
+              0.f,
+              0.f,
+          };
+          for (std::size_t level_index = 0u; level_index <= d3d9.levels.size(); ++level_index) {
+            const auto last_pass = (level_index == d3d9.levels.size());
+            // Inputs first, so a level is never bound as a texture while it becomes a render target.
+            for (std::uint32_t index = 0u; index < D3D9_STATS_GROUPS; ++index) {
+              native_device->SetTexture(index, reinterpret_cast<IDirect3DTexture9*>(static_cast<std::uintptr_t>(inputs[index].handle)));
+            }
+            D3DVIEWPORT9 viewport = {.X = 0u, .Y = 0u, .Width = 0u, .Height = 0u, .MinZ = 0.f, .MaxZ = 1.f};
+            if (last_pass) {
+              native_device->SetRenderTarget(0u, stats_target.get());
+              for (std::uint32_t index = 1u; index < D3D9_STATS_GROUPS; ++index) {
+                native_device->SetRenderTarget(index, nullptr);
+              }
+              viewport.Y = slot;
+              viewport.Width = D3D9_STATS_GROUPS;
+              viewport.Height = 1u;
+            } else {
+              const auto& level = d3d9.levels[level_index];
+              for (std::uint32_t index = 0u; index < D3D9_STATS_GROUPS; ++index) {
+                const auto target = internal::GetD3D9Surface(level.targets[index], 0u);
+                native_device->SetRenderTarget(index, target.get());
+              }
+              viewport.Width = level.width;
+              viewport.Height = level.height;
+            }
+            // Set after the render targets: SetRenderTarget resets the viewport.
+            native_device->SetViewport(&viewport);
+            constants[8] = (last_pass ? 1.f : 0.f);
+            native_device->SetPixelShaderConstantF(0u, constants.data(), static_cast<UINT>(constants.size() / 4u));
+            if (FAILED(native_device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2u, QUAD.data(), sizeof(float) * 2u))) {
+              unlocked_failure = "The Direct3D 9 region reduction pass failed to draw.";
+              break;
+            }
+            if (!last_pass) {
+              const auto& level = d3d9.levels[level_index];
+              inputs = level.targets;
+              constants = {
+                  0.f,
+                  0.f,
+                  static_cast<float>(level.width),
+                  static_cast<float>(level.height),
+                  static_cast<float>(level.width),
+                  static_cast<float>(level.height),
+                  0.f,
+                  constants[7],
+                  0.f,
+                  0.f,
+                  0.f,
+                  0.f,
+              };
+            }
+          }
+        }
+
+        for (std::uint32_t index = 0u; index < D3D9_STATS_GROUPS; ++index) {
+          native_device->SetRenderTarget(index, game_render_targets[index]);
+          if (game_render_targets[index] != nullptr) {
+            game_render_targets[index]->Release();
+          }
+        }
+        native_device->SetDepthStencilSurface(game_depth_stencil);
+        if (game_depth_stencil != nullptr) {
+          game_depth_stencil->Release();
+        }
+        // After the render targets, which reset the viewport and the scissor rectangle; restores the game's textures,
+        // shaders, constants, vertex declaration, stream 0 (DrawPrimitiveUP clears it) and render/sampler states.
+        d3d9.state_block->Apply();
+      }
+
       if (new_frame.has_value() && has_measurements && unlocked_failure.empty()) {
         // Keep at most two frames in flight so the newest copy never overwrites an unread readback.
         while (session->in_flight.size() >= 2u && unlocked_failure.empty()) {
@@ -2902,13 +3229,22 @@ inline void ProcessAtFrameEnd(
         } else {
           cmd_list->copy_texture_region(session->stats_texture, 0u, nullptr, session->readbacks[frame.ring_index], 0u, nullptr);
           frame.fence_value = 0u;
+          if (session->device_api == reshade::api::device_api::d3d9) {
+            // gpu_fence's D3DKMT signal needs the device's command buffer flushed first, or it can land before the
+            // reductions and the stats copy.
+            queue->flush_immediate_command_list();
+            frame.fence_value = internal::SignalTimeline(session->stats_timeline.get(), queue);
+            if (frame.fence_value == 0u) {
+              unlocked_failure = "The stats readback fence could not be signalled.";
+            }
+          }
         }
       }
       if (new_frame.has_value() && unlocked_failure.empty()) {
         session->in_flight.push_back(new_frame.value());
       }
-      // D3D12/Vulkan: map whatever the GPU has already finished.
-      while (session->explicit_api && !session->in_flight.empty() && unlocked_failure.empty()) {
+      // D3D9/D3D12/Vulkan: map whatever the GPU has already finished.
+      while ((session->explicit_api || session->stats_timeline != nullptr) && !session->in_flight.empty() && unlocked_failure.empty()) {
         if (!map_oldest(false)) break;
       }
     }
@@ -3069,7 +3405,7 @@ inline void ProcessAtFrameEnd(
             summary += std::format(" Followed the swap chain: all {} of its images count as the watched texture.", session->swap_chain_images.size());
           }
           if (session->truncated_frames != 0u) {
-            summary += std::format(" {} frame(s) hit the {}-slot or scratch budget limit.", session->truncated_frames, MAX_SLOTS);
+            summary += std::format(" {} frame(s) hit the {}-slot or scratch budget limit.", session->truncated_frames, session->slot_capacity);
           }
           if (session->explicit_api && session->scratch_entries_needed > session->max_scratch_entries) {
             summary += std::format(
@@ -3187,6 +3523,10 @@ inline void ProcessAtFrameEnd(
             if (!session->swap_chain_images.empty()) {
               result_json["swapChainImages"] = session->swap_chain_images.size();
             }
+          }
+          if (session->device_api == reshade::api::device_api::d3d9) {
+            result_json["scratchBudgetMB"] = session->scratch_budget_mb;
+            result_json["atlasSlots"] = session->slot_capacity;
           }
           if (session->frames == 1u) {
             result_json["trace"] = std::move(session->trace);
@@ -3343,8 +3683,8 @@ inline void ProcessAtFrameEnd(
     }
 
     const auto device_api = device->get_api();
-    if (device_api != reshade::api::device_api::d3d11 && !internal::IsExplicitApi(device_api)) {
-      complete_request(request, make_error("devkit_watch_region supports D3D11, D3D12 and Vulkan devices only."));
+    if (device_api != reshade::api::device_api::d3d9 && device_api != reshade::api::device_api::d3d11 && !internal::IsExplicitApi(device_api)) {
+      complete_request(request, make_error("devkit_watch_region supports D3D9Ex, D3D11, D3D12 and Vulkan devices only."));
       continue;
     }
 
@@ -3398,6 +3738,11 @@ inline void ProcessAtFrameEnd(
       case reshade::api::format::r16g16b16a16_float:
       case reshade::api::format::r32g32b32a32_float:
         break;
+      // D3D9 back buffers (D3DFMT_X8R8G8B8, D3DFMT_A2R10G10B10); not tried on the other APIs.
+      case reshade::api::format::b8g8r8x8_unorm:
+      case reshade::api::format::b10g10r10a2_unorm:
+        if (device_api == reshade::api::device_api::d3d9) break;
+        [[fallthrough]];
       default:
         complete_request(request, make_error(std::format("Watching format {} is not supported.", formatting::StreamToString(scratch_format))));
         continue;
@@ -3456,6 +3801,32 @@ inline void ProcessAtFrameEnd(
       continue;
     }
 
+    // D3D9: the readback fence needs D3D9Ex (gpu_fence's D3DKMT backend), the reduction four render targets, and the
+    // float pixel counts of the reduction stay exact up to D3D9_MAX_REGION_PIXELS.
+    D3DCAPS9 d3d9_caps = {};
+    if (device_api == reshade::api::device_api::d3d9) {
+      auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<std::uintptr_t>(device->get_native()));
+      IDirect3DDevice9Ex* native_device_ex = nullptr;
+      if (FAILED(native_device->QueryInterface(IID_PPV_ARGS(&native_device_ex)))) {
+        complete_request(request, make_error("DX9 watches need D3D9Ex: run the game with a RenoDX proxy mod, or turn on Force DX9Ex (boot) in the Devkit's proxy settings and restart the game (Force DX9Ex only works for games that start windowed or borderless)."));
+        continue;
+      }
+      native_device_ex->Release();
+      const auto native_type = reinterpret_cast<IDirect3DResource9*>(static_cast<std::uintptr_t>(target.resolved_resource.handle))->GetType();
+      if (native_type != D3DRTYPE_SURFACE && native_type != D3DRTYPE_TEXTURE) {
+        complete_request(request, make_error("Only 2D textures and surfaces can be watched on Direct3D 9."));
+        continue;
+      }
+      if (static_cast<std::uint64_t>(region.width()) * region.height() > D3D9_MAX_REGION_PIXELS) {
+        complete_request(request, make_error("On Direct3D 9 a watched region can have at most 16777216 pixels (4096x4096): use a region."));
+        continue;
+      }
+      if (FAILED(native_device->GetDeviceCaps(&d3d9_caps)) || d3d9_caps.NumSimultaneousRTs < D3D9_STATS_GROUPS) {
+        complete_request(request, make_error("The Direct3D 9 device does not support four simultaneous render targets, which the region reduction needs."));
+        continue;
+      }
+    }
+
     auto new_session = std::make_shared<Session>();
     new_session->request = request;
     new_session->runtime = runtime;
@@ -3491,25 +3862,98 @@ inline void ProcessAtFrameEnd(
     new_session->max_scratch_entries = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
         (static_cast<std::uint64_t>(new_session->scratch_budget_mb) * 1024u * 1024u) / scratch_entry_bytes, 1u, MAX_SCRATCH_ENTRIES));
 
-    const auto created = device->create_resource(
-                             reshade::api::resource_desc(new_session->width, new_session->height, 1, 1, scratch_format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest),
-                             nullptr,
-                             reshade::api::resource_usage::copy_dest,
-                             &new_session->scratch)
-                         && device->create_resource_view(new_session->scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(scratch_format), &new_session->scratch_srv)
-                         && device->create_resource(
-                             reshade::api::resource_desc(STATS_STRIDE, MAX_SLOTS, 1, 1, reshade::api::format::r32_uint, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::copy_dest),
-                             nullptr,
-                             reshade::api::resource_usage::unordered_access,
-                             &new_session->stats_texture)
-                         && device->create_resource_view(new_session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_view_desc(reshade::api::format::r32_uint), &new_session->stats_uav)
-                         && std::ranges::all_of(new_session->readbacks, [&](auto& readback) {
-                              return device->create_resource(
-                                  reshade::api::resource_desc(STATS_STRIDE, MAX_SLOTS, 1, 1, reshade::api::format::r32_uint, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
-                                  nullptr,
-                                  reshade::api::resource_usage::copy_dest,
-                                  &readback);
-                            });
+    bool created = false;
+    if (device_api == reshade::api::device_api::d3d9) {
+      // The atlas: as many region-sized slots as the scratch budget and the device's texture size allow (at least the
+      // end-of-frame one), at most MAX_SLOTS, in rows of `atlas_columns`.
+      auto& d3d9 = new_session->d3d9;
+      const auto budget_slots = (static_cast<std::uint64_t>(new_session->scratch_budget_mb) * 1024u * 1024u) / scratch_entry_bytes;
+      const auto fitting_columns = std::min<std::uint64_t>(d3d9_caps.MaxTextureWidth / new_session->width, MAX_SLOTS);
+      const auto fitting_rows = static_cast<std::uint64_t>(d3d9_caps.MaxTextureHeight / new_session->height);
+      new_session->slot_capacity = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
+          std::min({budget_slots, fitting_columns * fitting_rows, static_cast<std::uint64_t>(MAX_SLOTS)}), 1u, MAX_SLOTS));
+      d3d9.atlas_columns = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(fitting_columns, 1u, new_session->slot_capacity));
+      d3d9.atlas_width = d3d9.atlas_columns * new_session->width;
+      d3d9.atlas_height = ((new_session->slot_capacity + d3d9.atlas_columns - 1u) / d3d9.atlas_columns) * new_session->height;
+
+      // Intermediate levels until one 8x8 block is left; the last pass reduces that block into the stats row.
+      auto level_width = (new_session->width + D3D9_REDUCTION_BLOCK_SIZE - 1u) / D3D9_REDUCTION_BLOCK_SIZE;
+      auto level_height = (new_session->height + D3D9_REDUCTION_BLOCK_SIZE - 1u) / D3D9_REDUCTION_BLOCK_SIZE;
+      while (level_width > 1u || level_height > 1u) {
+        d3d9.levels.push_back(D3D9ReductionLevel{.width = level_width, .height = level_height});
+        level_width = (level_width + D3D9_REDUCTION_BLOCK_SIZE - 1u) / D3D9_REDUCTION_BLOCK_SIZE;
+        level_height = (level_height + D3D9_REDUCTION_BLOCK_SIZE - 1u) / D3D9_REDUCTION_BLOCK_SIZE;
+      }
+
+      auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<std::uintptr_t>(device->get_native()));
+      const std::array<D3DVERTEXELEMENT9, 2> vertex_elements = {{
+          {.Stream = 0u, .Offset = 0u, .Type = D3DDECLTYPE_FLOAT2, .Method = D3DDECLMETHOD_DEFAULT, .Usage = D3DDECLUSAGE_POSITION, .UsageIndex = 0u},
+          D3DDECL_END(),
+      }};
+      IDirect3DStateBlock9* state_block = nullptr;
+      IDirect3DVertexDeclaration9* vertex_declaration = nullptr;
+      IDirect3DVertexShader9* vertex_shader = nullptr;
+      IDirect3DPixelShader9* pixel_shader = nullptr;
+      const auto native_created = SUCCEEDED(native_device->CreateStateBlock(D3DSBT_ALL, &state_block))
+                                  && SUCCEEDED(native_device->CreateVertexDeclaration(vertex_elements.data(), &vertex_declaration))
+                                  && SUCCEEDED(native_device->CreateVertexShader(reinterpret_cast<const DWORD*>(d3d9_vertex_shader.data()), &vertex_shader))
+                                  && SUCCEEDED(native_device->CreatePixelShader(reinterpret_cast<const DWORD*>(reduce_shader.data()), &pixel_shader));
+      d3d9.state_block.reset(state_block);
+      d3d9.vertex_declaration.reset(vertex_declaration);
+      d3d9.vertex_shader.reset(vertex_shader);
+      d3d9.pixel_shader.reset(pixel_shader);
+
+      const auto create_target = [&](std::uint32_t width, std::uint32_t height, reshade::api::format format, reshade::api::resource* target) {
+        return device->create_resource(
+            reshade::api::resource_desc(width, height, 1, 1, format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::render_target | reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::copy_dest),
+            nullptr,
+            reshade::api::resource_usage::render_target,
+            target);
+      };
+      created = native_created
+                && create_target(d3d9.atlas_width, d3d9.atlas_height, scratch_format, &new_session->scratch)
+                && create_target(D3D9_STATS_GROUPS, MAX_SLOTS, reshade::api::format::r32g32b32a32_float, &new_session->stats_texture)
+                && std::ranges::all_of(d3d9.levels, [&](D3D9ReductionLevel& level) {
+                     return std::ranges::all_of(level.targets, [&](reshade::api::resource& level_target) {
+                       return create_target(level.width, level.height, reshade::api::format::r32g32b32a32_float, &level_target);
+                     });
+                   })
+                && std::ranges::all_of(new_session->readbacks, [&](auto& readback) {
+                     return device->create_resource(
+                         reshade::api::resource_desc(D3D9_STATS_GROUPS, MAX_SLOTS, 1, 1, reshade::api::format::r32g32b32a32_float, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
+                         nullptr,
+                         reshade::api::resource_usage::copy_dest,
+                         &readback);
+                   });
+      if (created) {
+        new_session->stats_timeline = internal::CreateFenceTimeline(device);
+        if (new_session->stats_timeline == nullptr) {
+          internal::DestroySessionObjects(new_session.get(), device);
+          complete_request(request, make_error("The Direct3D 9 readback fence (gpu_fence, D3DKMT) could not be created; see ReShade.log."));
+          continue;
+        }
+      }
+    } else {
+      created = device->create_resource(
+                    reshade::api::resource_desc(new_session->width, new_session->height, 1, 1, scratch_format, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest),
+                    nullptr,
+                    reshade::api::resource_usage::copy_dest,
+                    &new_session->scratch)
+                && device->create_resource_view(new_session->scratch, reshade::api::resource_usage::shader_resource, reshade::api::resource_view_desc(scratch_format), &new_session->scratch_srv)
+                && device->create_resource(
+                    reshade::api::resource_desc(STATS_STRIDE, MAX_SLOTS, 1, 1, reshade::api::format::r32_uint, 1, reshade::api::memory_heap::gpu_only, reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::copy_source | reshade::api::resource_usage::copy_dest),
+                    nullptr,
+                    reshade::api::resource_usage::unordered_access,
+                    &new_session->stats_texture)
+                && device->create_resource_view(new_session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_view_desc(reshade::api::format::r32_uint), &new_session->stats_uav)
+                && std::ranges::all_of(new_session->readbacks, [&](auto& readback) {
+                     return device->create_resource(
+                         reshade::api::resource_desc(STATS_STRIDE, MAX_SLOTS, 1, 1, reshade::api::format::r32_uint, 1, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
+                         nullptr,
+                         reshade::api::resource_usage::copy_dest,
+                         &readback);
+                   });
+    }
     if (!created) {
       internal::DestroySessionObjects(new_session.get(), device);
       complete_request(request, make_error("Failed to create the GPU resources for the region reduction."));
@@ -3528,17 +3972,19 @@ inline void ProcessAtFrameEnd(
       }
     }
 
-    new_session->pass.pipeline_subobjects.compute_shader = reduce_shader;
-    new_session->pass.shader_resource_slots.views = {new_session->scratch_srv};
-    new_session->pass.unordered_access_slots.views = {new_session->stats_uav};
-    new_session->pass.push_constants[renodx::utils::render::ConstantBuffersSlots{.slot = 0, .space = 0}] =
-        std::span<const float>(new_session->constants.data(), new_session->constants.size());
-    // D3D11 saves and restores the compute slots itself; D3D12/Vulkan render on ReShade's own immediate command list.
-    new_session->pass.revert_state_after_render = false;
-    new_session->pass.dispatch_group_counts = std::make_tuple(
-        (new_session->width + GROUP_SIZE - 1u) / GROUP_SIZE,
-        (new_session->height + GROUP_SIZE - 1u) / GROUP_SIZE,
-        1u);
+    if (device_api != reshade::api::device_api::d3d9) {
+      new_session->pass.pipeline_subobjects.compute_shader = reduce_shader;
+      new_session->pass.shader_resource_slots.views = {new_session->scratch_srv};
+      new_session->pass.unordered_access_slots.views = {new_session->stats_uav};
+      new_session->pass.push_constants[renodx::utils::render::ConstantBuffersSlots{.slot = 0, .space = 0}] =
+          std::span<const float>(new_session->constants.data(), new_session->constants.size());
+      // D3D11 saves and restores the compute slots itself; D3D12/Vulkan render on ReShade's own immediate command list.
+      new_session->pass.revert_state_after_render = false;
+      new_session->pass.dispatch_group_counts = std::make_tuple(
+          (new_session->width + GROUP_SIZE - 1u) / GROUP_SIZE,
+          (new_session->height + GROUP_SIZE - 1u) / GROUP_SIZE,
+          1u);
+    }
 
     const auto start_message = std::format(
         "devkit::watch_region(device #{}, resource {}, {}x{} at ({}, {}), {} frame(s))",
@@ -3669,6 +4115,17 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
   }
 
   if (session != nullptr) {
+    // The stats fence may still have signals pending (in-flight readbacks); gpu_fence wants its GPU uses retired before
+    // it is destroyed.
+    std::uint64_t pending_stats_value = 0u;
+    for (const auto& frame : session->in_flight) {
+      if (frame.fence_value != (std::numeric_limits<std::uint64_t>::max)()) {
+        pending_stats_value = std::max(pending_stats_value, frame.fence_value);
+      }
+    }
+    if (session->stats_timeline != nullptr && pending_stats_value != 0u && !internal::WaitTimeline(*session->stats_timeline, pending_stats_value)) {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(stats fence wait timed out at device destruction)");
+    }
     for (const auto& entry : session->scratch_entries) {
       if (entry.texture.handle != 0u) {
         device->destroy_resource(entry.texture);
