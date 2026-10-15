@@ -253,7 +253,7 @@ The PNG is for quick visual inspection, not for HDR truth.
   and the share of pixels above 203/400/1000/4000 nits. Only use it on a resource that actually holds that encoding, such as
   the swap chain or an HDR10/scRGB output target.
 
-### Watching a region over time (`devkit_watch_region`, D3D11, D3D12, Vulkan)
+### Watching a region over time (`devkit_watch_region`, D3D9Ex, D3D11, D3D12, Vulkan)
 
 `devkit_watch_region` answers "which draw changes this region of this buffer, and how?" without a snapshot or screenshots.
 The state of a texture after command N equals its state before the next command that writes it, so the devkit measures the
@@ -293,7 +293,7 @@ watched), the optional region (`regionX`/`regionY`/`regionWidth`/`regionHeight`,
 `includeUnchanged` (also list writers that did not change the region, `frames: 1` only), `verify` (read the region back to
 the CPU at one measurement point at the end of the watch and compare it with the GPU statistics of that same point:
 `verify.status` is `match`, `mismatch` with the differing fields, or `skipped` when no such point was measured; on D3D11 and on a D3D12/Vulkan back buffer the point is the end of the last frame) and
-`scratchBudgetMB` (D3D12/Vulkan, default 512, see below). The call blocks until done.
+`scratchBudgetMB` (D3D9/D3D12/Vulkan, default 512, see below). The call blocks until done.
 
 - `frames: 1` returns `trace`: every writer that changed the region, in command order, with `commandIndex` (ordinal among the
   frame's draws, dispatches and copies, in submission order on D3D12/Vulkan; offset from `devkit_list_draws` indexes, so match
@@ -307,17 +307,44 @@ the CPU at one measurement point at the end of the watch and compare it with the
 - Writers whose state before or after could not be measured are never dropped: each one is in `trace` with `measured: false`,
   `unmeasuredSide` and `unmeasuredReason`, counted in `writers[].unmeasuredExecutions`/`unmeasuredReasons`, in
   `unmeasured.reasons`, and its frame is listed in `unmeasured.frames`. Reasons: `slot_limit` (more than 1023 measurements in a
-  frame), `scratch_budget`, `scratch_pool_empty`, `state_unknown`, `inside_render_pass`, `other_queue`, `resubmitted`,
+  frame; on D3D9 more than the atlas holds, see below), `scratch_budget`, `scratch_pool_empty`, `state_unknown`, `inside_render_pass`, `other_queue`, `resubmitted`,
   `untracked_command_list`, `bundle`, `no_later_measurement`, `descriptor_table` (a D3D12/Vulkan dispatch that can reach
   the texture only through a bound descriptor table: bindless engines keep most textures in one table, so this does not
   prove a write and gives no known state; no barrier or copy is issued for it), `cross_queue_not_ready` (D3D12: see
   cross-queue points below).
-- `endOfWatch` holds the region stats measured at the end of the last frame (D3D11: always; D3D12/Vulkan: only for the
+- `endOfWatch` holds the region stats measured at the end of the last frame (D3D9/D3D11: always; D3D12/Vulkan: only for the
   presented back buffer). It includes every write made during present, including passes other add-ons draw there.
 - Statistics are luminance (BT.709 weights on raw values, or nits for `pq`/`scrgb`); the GPU path computes no percentiles.
 
 **D3D11** measures in place on the immediate context: the region is copied into a scratch texture and reduced right away. The
 compute slots the pass uses (CS shader, b0, t0, u0) are saved and restored with native D3D11 calls. Deferred contexts are skipped.
+
+**D3D9** has no compute shaders or UAVs, and the readback fence needs **D3D9Ex** (`utils::gpu_fence`'s D3DKMT backend; the
+Devkit calls `gpu_fence::Use`, which finds a D3D9Ex device's GPU handles when the device starts). A RenoDX mod that runs the
+display proxy already creates the device as D3D9Ex; the Devkit alone does not, so a watch on a plain D3D9 device is refused
+with "DX9 watches need D3D9Ex: run the game with a RenoDX proxy mod, or turn on Force DX9Ex (boot) [...]". Force DX9Ex
+only works for games that start windowed or borderless: ReShade upgrades the device with `CreateDeviceEx` and no fullscreen
+display mode (`external/reshade/source/d3d9/d3d9.cpp`), which D3D9Ex rejects for exclusive fullscreen (`D3DERR_INVALIDCALL`,
+the game closes at boot; seen in Prince of Persia: The Sands of Time). A proxy mod also turns exclusive fullscreen into
+borderless, so it does not hit this. At a
+measurement point the region is only copied (native `StretchRect`, point filter, same format) into its slot of one atlas
+texture: a grid of region-sized slots, as many as `scratchBudgetMB` and the device's maximum texture size allow, at most
+1023 per frame plus the end-of-frame one (`atlasSlots` in the output; writers past the last slot are `slot_limit`). No game
+state is touched during the frame. A source `StretchRect` cannot copy from fails the watch with that message. Only 2D textures
+and surfaces are watched, and a region has at most 4096x4096 pixels (the reduction counts pixels in float, exact up to 2^24).
+At the end of the frame (inside the scene ReShade opens for its present work, so the passes issue no `BeginScene`/`EndScene`
+of their own) a pixel shader (`watch_region_reduce_dx9.ps_3_0.hlsl`) reduces every used slot: each output pixel reduces an
+8x8 block, the intermediate levels hold the 16 statistics in four float render targets (MRT), and the last pass writes one
+row of the stats target (a whole 4K region takes 4 passes). The game's state is captured once in a `D3DSBT_ALL` state block
+and applied after the passes; render targets and the depth-stencil surface, which state blocks do not record, are saved and
+restored separately. The passes set a full known state first (no depth/stencil, blending, alpha test, scissor, clip planes,
+fog or sRGB write; colour writes on for all four targets; point sampling with clamp and no sRGB read). The stats target is
+copied to the readback ring (`GetRenderTargetData`), the device is flushed and the watch's fence is signalled; a later frame
+end reads the readback once the fence passed. The luminance mean is a float sum (the compute path uses 64-bit fixed point);
+its error stays far below `verify`'s tolerance. Non-finite pixels are detected with range comparisons (SM3 has no bit casts);
+`verify` checks the count. A device `Reset` (resize, fullscreen switch) fails the running watch, as on every API. gpu_fence
+binds the device's GPU handles only when the device is created; whether a D3D9Ex `Reset` replaces them is not known, so a
+watch started after a `Reset` that times out on its fence points there.
 
 **D3D12 and Vulkan** never change the game's pipeline, root signature, descriptor heap, descriptor set or push constant
 bindings. At a measurement point inside a game command list, the region is only copied into a pooled scratch texture: the
@@ -474,7 +501,7 @@ Refused or limited cases on D3D12/Vulkan, all stated in the output:
 - The measurement copies and barriers cost GPU time and VRAM; use a region or `shaderHash` for long watches.
 
 Limits on every API: 2D, non-MSAA textures in 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats; up to 1023 measured
-writers per frame (`truncatedFrames` reports frames that hit it or the scratch budget).
+writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that hit it or the scratch budget).
 
 - Only commands the game issues are hooked. Passes that add-ons draw through the ReShade API (for example a mod's swap chain
   proxy pass at present) are not reported as writers; their effect lands in the end-of-frame measurement. When a mod
