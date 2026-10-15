@@ -402,6 +402,9 @@ using VulkanGetDeviceProcAddr = void*(__stdcall*)(void* device, const char* name
 struct Session {
   std::shared_ptr<Request> request;
   std::string failure;
+  // The effect runtime that started the watch: only its frame ends measure (ProcessAtFrameEnd). Null once ReShade
+  // reset or destroyed it (OnEffectRuntimeDestroyed), which fails the watch.
+  reshade::api::effect_runtime* runtime = nullptr;
 
   reshade::api::resource watched_resource = {0u};
   // With preferClone, copies/clears/resolves/updates may name the original texture while the game's draws write the
@@ -430,6 +433,8 @@ struct Session {
   // D3D12/Vulkan: measurements are copies in the game's command lists, reduced at the end of the frame.
   bool explicit_api = false;
   reshade::api::device_api device_api = reshade::api::device_api::d3d11;
+  // The command queue of `runtime`. Every frame-end operation of the watch (reductions, stats fence, readback maps,
+  // the final waits) runs on it, inside a present on it, where ReShade holds this queue's lock.
   reshade::api::command_queue* queue = nullptr;
   VulkanCmdPipelineBarrier vulkan_cmd_pipeline_barrier = nullptr;
   std::vector<ScratchEntry> scratch_entries;
@@ -1031,6 +1036,48 @@ inline void DestroySessionObjects(Session* session, reshade::api::device* device
     device->destroy_fence(session->fence);
     session->fence = {0u};
   }
+}
+
+// Under the watcher lock: removes the running session from the watcher, so no hook reaches it any more. D3D12/Vulkan
+// scratch textures still owned by a command list may be copied into again if the game executes that list later, and
+// D3D12 ones with submissions may still be written by the GPU: they move to the watcher's retired list and are
+// destroyed when both are over. The other scratch textures go to `released_textures`, to be destroyed after releasing
+// the lock.
+[[nodiscard]] inline std::shared_ptr<Session> DetachSession(
+    Watcher* watcher,
+    std::vector<reshade::api::resource>* released_textures) {
+  auto session = std::move(watcher->session);
+  watcher->watched_resource_handle.store(0u, std::memory_order_release);
+  watcher->has_session.store(false, std::memory_order_release);
+  for (auto& entry : session->scratch_entries) {
+    if (entry.texture.handle == 0u) continue;
+    if (entry.in_use && (entry.owner_list != 0u || !entry.submissions.empty())) {
+      watcher->retired_scratch.push_back(RetiredScratch{
+          .texture = entry.texture,
+          .owner_list = entry.owner_list,
+          .submissions = std::move(entry.submissions),
+      });
+    } else {
+      released_textures->push_back(entry.texture);
+    }
+    entry.texture = {0u};
+  }
+  watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
+  return session;
+}
+
+// Completes a request that cannot finish (its queue or device went away) and wakes the waiting tool call.
+inline void FailRequest(const std::shared_ptr<Request>& request, const std::string& message) {
+  {
+    std::scoped_lock request_lock(request->mutex);
+    request->result = ToolResult{
+        .text = message,
+        .structured_content = json{{"error", message}},
+        .is_error = true,
+    };
+    request->completed = true;
+  }
+  request->cv.notify_all();
 }
 
 // D3D11: reduces the watched region into the next stats slot and returns that slot. Must run with the session locked.
@@ -1762,6 +1809,31 @@ inline void OnFinishPresent(Watcher* watcher, reshade::api::command_queue* queue
   session->unsignaled_fence_value.reset();
 }
 
+// destroy_effect_runtime hook. ReShade raises it when a runtime is reset (resize, fullscreen switch) or destroyed,
+// possibly outside present. The watch that runtime measures fails: its back buffers may be gone, and frames of
+// different sizes would be mixed. Only bookkeeping here; the next frame end on the watch's queue finishes it.
+inline void OnEffectRuntimeDestroyed(Watcher* watcher, reshade::api::effect_runtime* runtime) {
+  if (!watcher->has_session.load(std::memory_order_acquire)) return;
+  WatcherLock lock(watcher, "OnEffectRuntimeDestroyed");
+  auto* session = watcher->session.get();
+  if (session == nullptr || session->runtime != runtime) return;
+  session->runtime = nullptr;
+  if (session->failure.empty()) {
+    session->failure = "The swap chain the watch measured on was reset or destroyed (resize, fullscreen switch or window closed).";
+  }
+}
+
+// The tool gave up waiting (it set request->canceled first). A queued request is dropped; a running watch stops
+// reserving measurements at once, since the hooks check `failure`, and the next frame end on its queue finishes it.
+inline void CancelRequest(Watcher* watcher, const std::shared_ptr<Request>& request) {
+  WatcherLock lock(watcher, "CancelRequest");
+  std::erase(watcher->pending_requests, request);
+  auto* session = watcher->session.get();
+  if (session != nullptr && session->request == request && session->failure.empty()) {
+    session->failure = "The watch was canceled.";
+  }
+}
+
 // D3D12, on the presenting thread, with or without a running watch: frees the scratch textures the GPU is done with
 // (the running watch may reuse them, retired ones are destroyed). At a frame end (`frame_end`) it also counts the frame
 // end, creates the lifetime fences of queues that executed region copies, and covers every submission recorded before
@@ -1845,6 +1917,9 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
 
     if (frame_end) {
       for (auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
+        // Frame ends of several runtimes can run at once: a queue with a signal still in flight is left to the next
+        // frame end, so at most one thread signals a queue's fence at a time and its values are signalled in order.
+        if (queue_fence.signals_in_flight != 0u) continue;
         const auto queue_handle = fence_queue_handle;
         const auto is_submitted_before_frame_end = [&](const GpuSubmission& submission) {
           return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle
@@ -1955,7 +2030,8 @@ inline void WaitForAttachedFenceValues(Watcher* watcher, reshade::api::device* d
 // here, and a game that destroys a queue no longer submits to it: every list it executed was really submitted. The
 // queue's submissions are fenced with one more signal and waited for (without the lock); textures the GPU is then done
 // with are freed by the next frame end. If the queue never got a fence (created only at frame ends, never in hooks) or
-// the wait fails, its textures are kept until the device is destroyed, which waits for the device.
+// the wait fails, its textures are kept until the device is destroyed, which waits for the device. A watch measuring on
+// this queue fails here: no frame end can finish it any more, since they run inside presents on its queue.
 inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queue* queue) {
   auto* device = queue->get_device();
   if (device->get_api() != reshade::api::device_api::d3d12) return;
@@ -1966,6 +2042,8 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
   std::uint64_t fence_value = 0u;
   bool has_submissions = false;
   bool signal_in_flight_timed_out = false;
+  std::shared_ptr<Session> orphaned_session;
+  std::vector<reshade::api::resource> orphaned_textures;
   const auto wait_start = std::chrono::steady_clock::now();
   while (true) {
     WatcherLock lock(watcher, "OnCommandQueueDestroyed");
@@ -1997,7 +2075,34 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
       watcher->orphan_fences.push_back(fence);
       watcher->queue_fences.erase(pair);
     }
+    // After the submissions above were marked, so the session's textures this queue may still use are retired with
+    // those marks.
+    if (watcher->session != nullptr && watcher->session->queue == queue) {
+      orphaned_session = internal::DetachSession(watcher, &orphaned_textures);
+    }
     break;
+  }
+  if (orphaned_session != nullptr) {
+    // Its reductions and stats copies were submitted at the presents on this queue, so one more signal on its stats
+    // fence covers them before its objects are destroyed.
+    bool gpu_finished = false;
+    if (orphaned_session->fence.handle != 0u) {
+      const auto value = ++orphaned_session->fence_value;
+      const std::array<std::pair<reshade::api::fence, std::uint64_t>, 1> session_fences = {
+          std::pair{orphaned_session->fence, value},
+      };
+      gpu_finished = internal::SignalQueueNative(queue, orphaned_session->fence, value)
+                     && internal::WaitForFences(device, session_fences);
+    }
+    if (gpu_finished) {
+      for (const auto texture : orphaned_textures) {
+        device->destroy_resource(texture);
+      }
+      internal::DestroySessionObjects(orphaned_session.get(), device);
+    } else {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(the GPU did not finish a watch on a destroyed queue within the wait timeout; its textures are not destroyed)");
+    }
+    internal::FailRequest(orphaned_session->request, "The command queue the watch measured on was destroyed.");
   }
   if (!has_submissions) return;
   if (signal_in_flight_timed_out) {
@@ -2097,10 +2202,18 @@ inline void ProcessAtFrameEnd(
   // queue's lock for the whole present (Vulkan vkQueuePresentKHR; DXGI Present for D3D12, whose ExecuteCommandLists
   // takes the same lock), so the game cannot submit to that queue meanwhile. D3D11 keeps measuring in stage 1: its hooks
   // only run on the immediate context, on this same thread, so nothing else waits for the lock there.
+  // Only the runtime that started the watch measures it, so its frame-end work never runs on two threads at once (two
+  // swap chains of one device may present on different threads). A watch that failed or was canceled (also when its
+  // runtime was reset or destroyed) is finished by the next frame end of any runtime on its queue: such frame ends are
+  // serialized with the starting runtime's by that queue's lock, and every queue operation below stays on that queue.
+  // A watch whose queue nobody presents on any more is finished by OnCommandQueueDestroyed or Shutdown.
   std::shared_ptr<Session> session;
   {
     WatcherLock lock(watcher, "ProcessAtFrameEnd: taking the session");
     session = watcher->session;
+    if (session != nullptr && session->runtime != runtime && (session->queue != queue || session->failure.empty())) {
+      session = nullptr;
+    }
   }
   if (session != nullptr) {
     auto* cmd_list = queue->get_immediate_command_list();
@@ -2727,7 +2840,7 @@ inline void ProcessAtFrameEnd(
     {
       WatcherLock lock(watcher, "ProcessAtFrameEnd: merging the frame end");
       if (watcher->session != session) {
-        // Only Shutdown removes a running session outside the frame end; it destroyed the session's entries.
+        // Removed meanwhile by OnCommandQueueDestroyed or Shutdown, which took care of the session's entries.
         if (back_buffer_texture.handle != 0u && back_buffer_entry.has_value()) {
           released_textures.push_back(back_buffer_texture);
         }
@@ -2789,26 +2902,7 @@ inline void ProcessAtFrameEnd(
             }
           }
           session->deferred_points.clear();
-          // Detached here, so no hook reaches it any more. D3D12/Vulkan scratch entries still owned by a command list
-          // may be copied into again if the game executes that list later, and D3D12 entries with submissions may
-          // still be written by the GPU, so they move to the watcher and are destroyed when both are over.
-          finished_session = std::move(watcher->session);
-          watcher->watched_resource_handle.store(0u, std::memory_order_release);
-          watcher->has_session.store(false, std::memory_order_release);
-          for (auto& entry : session->scratch_entries) {
-            if (entry.texture.handle == 0u) continue;
-            if (entry.in_use && (entry.owner_list != 0u || !entry.submissions.empty())) {
-              watcher->retired_scratch.push_back(RetiredScratch{
-                  .texture = entry.texture,
-                  .owner_list = entry.owner_list,
-                  .submissions = std::move(entry.submissions),
-              });
-            } else {
-              released_textures.push_back(entry.texture);
-            }
-            entry.texture = {0u};
-          }
-          watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
+          finished_session = internal::DetachSession(watcher, &released_textures);
         }
       }
     }
@@ -3145,8 +3239,8 @@ inline void ProcessAtFrameEnd(
     }
   }
 
-  // Starts the next queued watch. Validation and GPU object creation run outside the lock; only this function installs
-  // a session, and it runs on the presenting thread, so no other watch can be installed meanwhile.
+  // Starts the next queued watch. Validation and GPU object creation run outside the lock. Frame ends of several
+  // runtimes may get here at once: the session is installed only if none was installed meanwhile.
   while (true) {
     std::shared_ptr<Request> request;
     {
@@ -3158,9 +3252,7 @@ inline void ProcessAtFrameEnd(
     {
       std::scoped_lock request_lock(request->mutex);
       if (request->completed || request->canceled) continue;
-      request->started = true;
     }
-    request->cv.notify_all();
 
     const auto device_api = device->get_api();
     if (device_api != reshade::api::device_api::d3d11 && !internal::IsExplicitApi(device_api)) {
@@ -3175,6 +3267,26 @@ inline void ProcessAtFrameEnd(
       complete_request(request, make_error(exception.what()));
       continue;
     }
+
+    // A back buffer is watched by the runtime that presents it, whose frame ends take its final measurement; any other
+    // texture by the first runtime that gets here. A back buffer of another swap chain waits for that one's frame end.
+    std::vector<std::uint64_t> back_buffer_handles;
+    for (std::uint32_t index = 0u; index < runtime->get_back_buffer_count(); ++index) {
+      back_buffer_handles.push_back(runtime->get_back_buffer(index).handle);
+    }
+    const auto watches_own_back_buffer =
+        (std::ranges::find(back_buffer_handles, target.resolved_resource.handle) != back_buffer_handles.end());
+    if (!watches_own_back_buffer && renodx::utils::swapchain::IsBackBuffer(target.resolved_resource)) {
+      WatcherLock lock(watcher, "ProcessAtFrameEnd: requeueing another swap chain's request");
+      watcher->pending_requests.push_front(request);
+      break;
+    }
+    {
+      std::scoped_lock request_lock(request->mutex);
+      if (request->completed || request->canceled) continue;
+      request->started = true;
+    }
+    request->cv.notify_all();
 
     const auto& resource_desc = target.resolved_resource_desc;
     if (resource_desc.type != reshade::api::resource_type::texture_2d && resource_desc.type != reshade::api::resource_type::surface) {
@@ -3258,6 +3370,7 @@ inline void ProcessAtFrameEnd(
 
     auto new_session = std::make_shared<Session>();
     new_session->request = request;
+    new_session->runtime = runtime;
     new_session->watched_resource = target.resolved_resource;
     new_session->original_resource = device->get_resource_from_view(request->resource_view);
     new_session->immediate_cmd_list = queue->get_immediate_command_list();
@@ -3282,14 +3395,8 @@ inline void ProcessAtFrameEnd(
     new_session->queue = queue;
     new_session->vulkan_cmd_pipeline_barrier = vulkan_cmd_pipeline_barrier;
     new_session->scratch_budget_mb = request->scratch_budget_mb;
-    if (new_session->explicit_api) {
-      std::vector<std::uint64_t> images;
-      for (std::uint32_t index = 0u; index < runtime->get_back_buffer_count(); ++index) {
-        images.push_back(runtime->get_back_buffer(index).handle);
-      }
-      if (std::ranges::find(images, new_session->watched_resource.handle) != images.end()) {
-        new_session->swap_chain_images = std::move(images);
-      }
+    if (new_session->explicit_api && watches_own_back_buffer) {
+      new_session->swap_chain_images = std::move(back_buffer_handles);
     }
     const auto scratch_entry_bytes = std::max<std::uint64_t>(
         static_cast<std::uint64_t>(reshade::api::format_row_pitch(scratch_format, new_session->width)) * new_session->height, 1u);
@@ -3345,32 +3452,54 @@ inline void ProcessAtFrameEnd(
         (new_session->height + GROUP_SIZE - 1u) / GROUP_SIZE,
         1u);
 
-    reshade::log::message(
-        reshade::log::level::info,
-        std::format(
-            "devkit::watch_region(device #{}, resource {}, {}x{} at ({}, {}), {} frame(s))",
-            device_index,
-            formatting::FormatHandle(new_session->watched_resource.handle),
-            new_session->width,
-            new_session->height,
-            region.left,
-            region.top,
-            new_session->frames)
-            .c_str());
-
+    const auto start_message = std::format(
+        "devkit::watch_region(device #{}, resource {}, {}x{} at ({}, {}), {} frame(s))",
+        device_index,
+        formatting::FormatHandle(new_session->watched_resource.handle),
+        new_session->width,
+        new_session->height,
+        region.left,
+        region.top,
+        new_session->frames);
     const auto watched_resource_handle = new_session->watched_resource.handle;
     WatcherLock lock(watcher, "ProcessAtFrameEnd: starting a watch");
+    if (watcher->session != nullptr) {
+      // Another runtime's frame end started a watch meanwhile: this request waits for it.
+      watcher->pending_requests.push_front(request);
+      lock.Unlock();
+      for (const auto& entry : new_session->scratch_entries) {
+        device->destroy_resource(entry.texture);
+      }
+      internal::DestroySessionObjects(new_session.get(), device);
+      break;
+    }
     watcher->session = std::move(new_session);
     watcher->has_session.store(true, std::memory_order_release);
     watcher->watched_resource_handle.store(watched_resource_handle, std::memory_order_release);
+    lock.Unlock();
+    reshade::log::message(reshade::log::level::info, start_message.c_str());
   }
 }
 
 // Fails whatever is still queued or running when the device goes away, and destroys every scratch texture (no command
 // list of the device can run any more). On D3D12 the GPU may still be running region copies of the game's queues: those
 // are waited for first (LIFETIME_FENCE_WAIT_TIMEOUT per queue, device-removed check), with one more signal on each queue
-// that has submissions without a fence value; the game no longer submits while its device is destroyed.
+// that has submissions without a fence value; the game no longer submits while its device is destroyed. A frame end
+// still signalling a queue is waited for first (bounded, like OnCommandQueueDestroyed): at process exit its thread may
+// already be terminated, and that queue's fence is then neither signalled again nor destroyed.
 inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
+  const auto signals_wait_start = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() - signals_wait_start < LIFETIME_FENCE_WAIT_TIMEOUT) {
+    WatcherLock lock(watcher, "Shutdown: waiting for signals in flight");
+    const auto has_signals_in_flight = std::ranges::any_of(watcher->queue_fences, [](const auto& queue_fence_pair) {
+      const auto& [queue_handle, queue_fence] = queue_fence_pair;
+      return queue_fence.signals_in_flight != 0u;
+    });
+    if (!has_signals_in_flight) break;
+    lock.Unlock();
+    std::this_thread::yield();
+  }
+
   struct FinalSignal {
     reshade::api::command_queue* queue = nullptr;
     reshade::api::fence fence = {0u};
@@ -3379,6 +3508,7 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
   };
   std::vector<FinalSignal> final_signals;
   std::vector<reshade::api::fence> fences_to_destroy;
+  std::uint32_t queues_still_signalling = 0u;
 
   // Everything is taken out under the lock and destroyed after releasing it.
   std::shared_ptr<Session> session;
@@ -3388,6 +3518,10 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
     WatcherLock lock(watcher, "Shutdown");
     watcher->watched_resource_handle.store(0u, std::memory_order_release);
     for (auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
+      if (queue_fence.signals_in_flight != 0u) {
+        ++queues_still_signalling;
+        continue;
+      }
       const auto queue_handle = fence_queue_handle;
       std::uint64_t highest_value = 0u;
       bool has_unfenced = false;
@@ -3426,18 +3560,9 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
     watcher->pending_requests.clear();
   }
 
-  const auto fail_request = [](const std::shared_ptr<Request>& request) {
-    {
-      std::scoped_lock request_lock(request->mutex);
-      request->result = ToolResult{
-          .text = "The device was destroyed before the watch finished.",
-          .structured_content = json{{"error", "The device was destroyed before the watch finished."}},
-          .is_error = true,
-      };
-      request->completed = true;
-    }
-    request->cv.notify_all();
-  };
+  if (queues_still_signalling != 0u) {
+    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a frame end's lifetime fence signal did not finish before the device was destroyed; that queue's fence is left alive)");
+  }
   if (!final_signals.empty()) {
     std::vector<std::pair<reshade::api::fence, std::uint64_t>> fences;
     for (const auto& final_signal : final_signals) {
@@ -3458,7 +3583,7 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
       }
     }
     internal::DestroySessionObjects(session.get(), device);
-    fail_request(session->request);
+    internal::FailRequest(session->request, "The device was destroyed before the watch finished.");
   }
   for (const auto& retired : retired_scratch) {
     device->destroy_resource(retired.texture);
@@ -3467,7 +3592,7 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
     device->destroy_fence(fence);
   }
   for (const auto& request : pending_requests) {
-    fail_request(request);
+    internal::FailRequest(request, "The device was destroyed before the watch finished.");
   }
 }
 
@@ -3528,9 +3653,10 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
     request->canceled = true;
     request_lock.unlock();
     context.cancel_request(device_index, request);
+    const auto error = std::string("Timed out while measuring the region: the swap chain the watch measures on stopped presenting frames.");
     return ToolResult{
-        .text = "Timed out while measuring the region; the game may not be presenting frames.",
-        .structured_content = json{{"error", "Timed out while measuring the region; the game may not be presenting frames."}},
+        .text = error,
+        .structured_content = json{{"error", error}},
         .is_error = true,
     };
   }
