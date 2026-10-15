@@ -2836,9 +2836,7 @@ void CancelPendingWatchRegionRequest(
     return;
   }
   auto* device_data = device_data_list[device_index];
-
-  const devkit_watch_region::WatcherLock watcher_lock(&device_data->watch_region_watcher, "CancelPendingWatchRegionRequest");
-  std::erase(device_data->watch_region_watcher.pending_requests, request);
+  devkit_watch_region::CancelRequest(&device_data->watch_region_watcher, request);
 }
 
 [[nodiscard]] bool EnqueuePendingLiveShaderRequest(
@@ -9352,6 +9350,12 @@ void OnDestroyCommandQueue(reshade::api::command_queue* queue) {
   devkit_watch_region::OnCommandQueueDestroyed(&device_data->watch_region_watcher, queue);
 }
 
+void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
+  auto* device_data = renodx::utils::data::Get<DeviceData>(runtime->get_device());
+  if (device_data == nullptr) return;
+  devkit_watch_region::OnEffectRuntimeDestroyed(&device_data->watch_region_watcher, runtime);
+}
+
 // Vulkan images can only be copied with VK_IMAGE_USAGE_TRANSFER_SRC_BIT, and devkit_watch_region measures by copying.
 // With the opt-in setting the flag is added to every image the game creates from then on. Same rules as the Vulkan
 // clone targets in utils/resource_upgrade.hpp OnCreateResource: shared and sparse images, and formats without copy
@@ -9614,6 +9618,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::reshade_present>(OnReShadePresent);
       reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
       reshade::register_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
       reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
       reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
@@ -9666,6 +9671,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::reshade_present>(OnReShadePresent);
       reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
       reshade::unregister_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+      reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
       reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);

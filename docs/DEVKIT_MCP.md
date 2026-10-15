@@ -267,6 +267,16 @@ effect runtime, which ends with `reshade_present`, so the end-of-frame measureme
 their present handlers (for example a mod's swap chain proxy pass), whatever the add-on load order. A swap chain without a
 ReShade effect runtime never reaches `reshade_present`, so a watch on it times out.
 
+A watch belongs to one effect runtime (one swap chain): a back buffer is watched by the runtime that presents it, any
+other texture by the first runtime to reach the end of a frame. Only that runtime's frame ends measure, so a game with
+two swap chains presenting on different threads never runs a watch's frame-end work twice at once. If that runtime is
+reset or destroyed (a resize, a fullscreen switch or the window closing; ReShade raises `destroy_effect_runtime`), the
+watch fails ("The swap chain the watch measured on was reset or destroyed"), so a resize always ends a running watch,
+whatever texture it watches. A failed or canceled watch is finished by the next frame end of any runtime presenting on
+the same command queue (those frame ends hold that queue's lock, like the starting runtime's), or, on D3D12, when that
+queue is destroyed, or when the device is destroyed. When the tool call times out (the swap chain stopped presenting),
+the watch is canceled at once: the hooks stop measuring, and the next frame end finishes it.
+
 On the back buffer the end-of-frame measurement (`endOfWatch`, the final step of a trace and `verify` at that point) also
 includes everything ReShade draws there before `reshade_present`: in `runtime::on_present` (`external/reshade/source/runtime.cpp`)
 the enabled effects run first (`render_effects`), then `draw_gui` draws the overlay (`runtime_gui.cpp`: the ReShade menu, the
@@ -371,9 +381,13 @@ them. **Stated assumption (from the Vulkan spec, not checked in source):** on Vu
 the watcher lock is allowed only if it takes no lock, or only a leaf lock that never raises a ReShade event or calls back
 into the Devkit. Check this before adding one.
 
+Frame ends of different runtimes can still run at once, and each one fences the D3D12 queues that executed region
+copies (see below). A queue whose fence a frame end is still signalling is skipped by the others, so one thread at a time
+signals a queue's fence and its values are signalled in order; its submissions get the next frame end's value.
+
 Every CPU wait for the GPU in the watch has a timeout (2 s: lifetime fences at the end of a watch, at queue and device
-destruction, the stats readback fence, and a destroyed queue's wait for a frame end's signal in flight), and none holds
-the lock. The one exception is ReShade's `command_queue::wait_idle` (end of a watch), which has no timeout parameter; a
+destruction, the stats readback fence, and the waits of a destroyed queue and of device destruction for a frame end's
+signal in flight), and none holds the lock. The one exception is ReShade's `command_queue::wait_idle` (end of a watch), which has no timeout parameter; a
 GPU hang ends it through the driver's device removal.
 
 The state of the watched subresource is only taken where it is exactly known; everywhere else the writer is reported as
@@ -448,7 +462,8 @@ writers per frame (`truncatedFrames` reports frames that hit it or the scratch b
   proxy pass at present) are not reported as writers; their effect lands in the end-of-frame measurement. When a mod
   redirects the game's rendering into clones, watch the clone (`preferClone: true`).
 - Draws that write the texture through a pixel-shader UAV are not detected.
-- If the watched texture is destroyed during the watch (for example on resize), the watch stops and returns an error.
+- If the watched texture is destroyed during the watch, or the swap chain the watch measures on is resized, switched to
+  or from fullscreen or closed, the watch stops and returns an error.
 - When another add-on performs a write itself inside the same ReShade event as a game writer (for example a mod redirecting a
   clear onto its clone), its handler may run before or after the Devkit's, so that write lands on either side of the
   measurement.
