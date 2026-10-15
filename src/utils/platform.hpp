@@ -85,19 +85,28 @@ inline bool operator!=(const ProcessAllocator<T>& left, const ProcessAllocator<U
 
 template <typename T, typename... Args>
 inline T* CreateSharedObject(Args&&... args) {
-  auto* storage = static_cast<T*>(::HeapAlloc(::GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(T)));
-  assert(storage != nullptr);
-  if (storage == nullptr) return nullptr;
+  // HeapAlloc only guarantees 8-byte alignment on x86, but T may need more (a cache-line aligned hash map member makes
+  // optimized builds emit aligned SSE stores, which fault on a misaligned object). Over-allocate and align by hand; the
+  // pointer HeapAlloc returned is kept just before the object for DeleteSharedObject.
+  constexpr std::size_t ALIGNMENT = (alignof(T) > alignof(void*) ? alignof(T) : alignof(void*));
+  auto* raw = static_cast<std::byte*>(::HeapAlloc(::GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(T) + ALIGNMENT + sizeof(void*)));
+  assert(raw != nullptr);
+  if (raw == nullptr) return nullptr;
 
-  return std::construct_at(storage, std::forward<Args>(args)...);
+  const auto first_free_address = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
+  const auto aligned_address = (first_free_address + ALIGNMENT - 1u) & ~(static_cast<std::uintptr_t>(ALIGNMENT) - 1u);
+  reinterpret_cast<void**>(aligned_address)[-1] = raw;
+
+  return std::construct_at(reinterpret_cast<T*>(aligned_address), std::forward<Args>(args)...);
 }
 
 template <typename T>
 inline void DeleteSharedObject(T* object) {
   if (object == nullptr) return;
 
+  void* raw = reinterpret_cast<void**>(object)[-1];
   object->~T();
-  ::HeapFree(::GetProcessHeap(), 0, object);
+  ::HeapFree(::GetProcessHeap(), 0, raw);
 }
 
 template <typename T>
