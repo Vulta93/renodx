@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -43,6 +44,7 @@
 #include "../../../utils/bitwise.hpp"
 #include "../../../utils/data.hpp"
 #include "../../../utils/descriptor.hpp"
+#include "../../../utils/gpu_fence.hpp"
 #include "../../../utils/mcp/arguments.hpp"
 #include "../../../utils/mcp/types.hpp"
 #include "../../../utils/pipeline_layout.hpp"
@@ -280,6 +282,8 @@ struct InFlightFrame {
   // False for the D3D12/Vulkan warm-up and closing frames, which are not part of the requested frames.
   bool counted = true;
   bool truncated = false;
+  // Value of the session's stats fence covering this frame's readback. Max: no readback. 0 on D3D12/Vulkan: not
+  // signalled yet (Vulkan, see Session::stats_signal_pending) or no stats fence; unused on D3D11.
   std::uint64_t fence_value = 0u;
   // Cross-queue points of earlier frames (or this one) reduced at this frame end.
   std::vector<std::uint64_t> late_points;
@@ -321,6 +325,29 @@ struct WriterAggregate {
   std::map<std::int64_t, std::uint64_t> after_peak_buckets;
 };
 
+// The CPU view of a gpu_fence::Fence's progress. The fence's completion callbacks only count here (see FenceTimeline);
+// they take nothing but this mutex, so it is a leaf lock and may be read under the watcher lock.
+struct FenceCompletion {
+  std::shared_mutex mutex;
+  std::condition_variable_any condition;
+  std::uint64_t completed = 0u;
+};
+
+// D3D12 queue lifetime fences and the D3D12/Vulkan stats readback fence, on utils::gpu_fence. gpu_fence numbers the
+// values of one fence 1, 2, 3, ... (a failed signal uses none) and delivers completion callbacks in order, so with a
+// callback on every signal the n-th callback means value n completed. That holds only under three rules, kept by
+// SignalTimeline: every signal carries a callback (never the callback-less QueueSignal); a timeline is signalled on
+// one queue only (gpu_fence makes a queue wait on the GPU when a fence changes queue); at most one thread signals it at a
+// time (`signalling`, asserted). Frame ends read `completion` instead of querying the GPU, and every CPU wait for a
+// timeline is a bounded wait on its condition variable. The fence is destroyed only outside the watcher lock and outside
+// `completion->mutex` (its destructor joins the callback worker), never from a callback. gpu_fence treats a failed
+// completion query, for example after a device removal, as fatal and ends the process (maintainer decision).
+struct FenceTimeline {
+  std::unique_ptr<renodx::utils::gpu_fence::Fence> fence;
+  std::shared_ptr<FenceCompletion> completion = std::make_shared<FenceCompletion>();
+  std::atomic<bool> signalling = false;
+};
+
 // D3D12: one execution of a game command list that copies into a scratch texture. D3D12 lets the game reset a command
 // list while the GPU still runs it, so the reset does not end the texture's use: it ends when the GPU passes
 // `fence_value` on the lifetime fence of `queue`. ReShade raises execute_command_list under the queue's lock, releases
@@ -334,6 +361,9 @@ struct GpuSubmission {
   // Watcher::frame_end_index when the event was recorded: below the current index once a frame end has passed it.
   std::uint64_t frame_end_index = 0u;
   std::optional<std::uint64_t> fence_value = std::nullopt;
+  // Set by a frame end that is signalling the queue's lifetime fence for this submission (the value is only known once
+  // the signal returns); 0 otherwise. See ProcessLifetimes.
+  std::uint64_t pending_signal = 0u;
   std::uint64_t destroyed_queue_wait = 0u;
 };
 
@@ -448,11 +478,14 @@ struct Session {
   std::uint32_t scratch_entries_needed = 0u;
   std::uint32_t scratch_budget_mb = DEFAULT_SCRATCH_BUDGET_MB;
   std::unordered_map<std::uint64_t, ListState> lists;
-  reshade::api::fence fence = {0u};
-  std::uint64_t fence_value = 0u;
-  // Vulkan: the fence is signalled at finish_present, after ReShade submitted the frame's immediate command list with
-  // the present's wait semaphores; signalling inside reshade_present would submit it early, without them.
-  std::optional<std::uint64_t> unsignaled_fence_value = std::nullopt;
+  // D3D12/Vulkan stats readback fence, signalled only on `queue` by the presenting thread. Null without one (Vulkan
+  // without timeline semaphores): a readback is then read after waiting for the queue to go idle.
+  std::shared_ptr<FenceTimeline> stats_timeline;
+  // Vulkan: the newest in-flight frame's signal waits for finish_present, after ReShade submitted the frame's immediate
+  // command list with the present's wait semaphores; signalling inside reshade_present would submit it early, without
+  // them. Its fence_value stays 0 until then.
+  bool stats_signal_pending = false;
+  bool stats_signal_failed = false;
 
   // verify: CPU readback of the region at one measurement point, compared with the GPU stats of the same point.
   bool verify = false;
@@ -527,14 +560,13 @@ struct RetiredScratch {
   std::vector<GpuSubmission> submissions;
 };
 
-// D3D12: the lifetime fence of one game queue. It is signalled with the native ID3D12CommandQueue::Signal, not ReShade's
-// command_queue::signal, which also flushes that queue's immediate command list without the queue's lock and would race
-// with the game thread submitting to it. Fences are created only at frame ends, on the presenting thread.
+// D3D12: the lifetime fence of one game queue. gpu_fence signals it with the native ID3D12CommandQueue::Signal, not
+// ReShade's command_queue::signal, which also flushes that queue's immediate command list without the queue's lock and
+// would race with the game thread submitting to it. Fences are created only at frame ends, on the presenting thread.
 struct QueueLifetimeFence {
-  reshade::api::fence fence = {0u};
-  std::uint64_t last_value = 0u;
-  // Native signals issued after releasing the watcher lock and not finished yet; the queue's destroy event waits for
-  // them before the queue goes away.
+  std::shared_ptr<FenceTimeline> timeline;
+  // Signals issued after releasing the watcher lock and not attached yet; other frame ends skip the queue meanwhile, and
+  // its destroy event and the device's wait for them before the queue goes away.
   std::uint32_t signals_in_flight = 0u;
 };
 
@@ -569,8 +601,10 @@ struct Watcher {
   std::unordered_map<std::uint64_t, std::uint64_t> completed_fence_values;
   std::uint64_t frame_end_index = 0u;
   std::uint64_t destroyed_queue_waits = 0u;
-  // Fences of destroyed queues, destroyed with the device: one whose wait timed out may still be signalled by the GPU.
-  std::vector<reshade::api::fence> orphan_fences;
+  std::uint64_t planned_signal_ids = 0u;
+  // Fences of destroyed queues (and of a watch on one) whose final wait failed, destroyed with the device: the GPU may
+  // still signal them.
+  std::vector<std::shared_ptr<FenceTimeline>> orphan_timelines;
   // Lock diagnostics: the thread holding `mutex` and what it is doing (see WatcherLock).
   std::atomic<std::uint32_t> owner_thread_id = 0u;
   std::atomic<const char*> owner_step = nullptr;
@@ -672,35 +706,53 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
   });
 }
 
-[[nodiscard]] inline bool IsD3D12DeviceRemoved(reshade::api::device* device) {
-  auto* native_device = reinterpret_cast<ID3D12Device*>(static_cast<std::uintptr_t>(device->get_native()));
-  return FAILED(native_device->GetDeviceRemovedReason());
-}
-
-// D3D12: the native signal (see QueueLifetimeFence for why not ReShade's). Safe from any thread: D3D12 queues are
-// free-threaded.
-[[nodiscard]] inline bool SignalQueueNative(
-    reshade::api::command_queue* queue,
-    reshade::api::fence fence,
-    std::uint64_t value) {
-  auto* native_queue = reinterpret_cast<ID3D12CommandQueue*>(static_cast<std::uintptr_t>(queue->get_native()));
-  auto* native_fence = reinterpret_cast<ID3D12Fence*>(static_cast<std::uintptr_t>(fence.handle));
-  return SUCCEEDED(native_queue->Signal(native_fence, value));
-}
-
-// D3D12, without the lock: waits up to LIFETIME_FENCE_WAIT_TIMEOUT for each fence; false if any wait failed and the
-// device was not removed (after a removal the GPU writes nothing any more).
-[[nodiscard]] inline bool WaitForFences(
-    reshade::api::device* device,
-    std::span<const std::pair<reshade::api::fence, std::uint64_t>> fences) {
-  const auto timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(LIFETIME_FENCE_WAIT_TIMEOUT).count();
-  bool all_reached = true;
-  for (const auto& [fence, value] : fences) {
-    if (!device->wait(fence, value, timeout_ns)) {
-      all_reached = false;
-    }
+// Creates a fence timeline, or returns null (logged) when the device cannot create one, for example a Vulkan device
+// without timeline semaphores.
+[[nodiscard]] inline std::shared_ptr<FenceTimeline> CreateFenceTimeline(reshade::api::device* device) {
+  try {
+    auto timeline = std::make_shared<FenceTimeline>();
+    timeline->fence = std::make_unique<renodx::utils::gpu_fence::Fence>(device);
+    return timeline;
+  } catch (const std::exception& exception) {
+    reshade::log::message(
+        reshade::log::level::warning,
+        std::format("devkit::watch_region(fence creation failed: {})", exception.what()).c_str());
+    return nullptr;
   }
-  return all_reached || IsD3D12DeviceRemoved(device);
+}
+
+// Signals the next value of `timeline` on `queue` and returns it; 0 means the signal failed and queued nothing. On D3D12
+// the native signal does not flush ReShade's immediate command list; on Vulkan ReShade's signal does. Never under the
+// watcher lock (it calls the driver).
+[[nodiscard]] inline std::uint64_t SignalTimeline(FenceTimeline* timeline, reshade::api::command_queue* queue) {
+  [[maybe_unused]] const bool already_signalling = timeline->signalling.exchange(true, std::memory_order_acq_rel);
+  assert(!already_signalling);
+  const auto value = renodx::utils::gpu_fence::QueueSignal(
+      queue,
+      timeline->fence.get(),
+      [completion = timeline->completion]() {
+        {
+          std::unique_lock completion_lock(completion->mutex);
+          ++completion->completed;
+        }
+        completion->condition.notify_all();
+      });
+  timeline->signalling.store(false, std::memory_order_release);
+  return value;
+}
+
+[[nodiscard]] inline std::uint64_t GetCompletedValue(const FenceTimeline& timeline) {
+  std::shared_lock completion_lock(timeline.completion->mutex);
+  return timeline.completion->completed;
+}
+
+// Waits up to LIFETIME_FENCE_WAIT_TIMEOUT until the GPU passed `value` on `timeline`. Never under the watcher lock.
+[[nodiscard]] inline bool WaitTimeline(const FenceTimeline& timeline, std::uint64_t value) {
+  auto& completion = *timeline.completion;
+  std::unique_lock completion_lock(completion.mutex);
+  return completion.condition.wait_for(completion_lock, LIFETIME_FENCE_WAIT_TIMEOUT, [&completion, value]() {
+    return completion.completed >= value;
+  });
 }
 
 [[nodiscard]] inline std::string_view GetWriterKindName(WriterKind kind) {
@@ -1032,10 +1084,7 @@ inline void DestroySessionObjects(Session* session, reshade::api::device* device
     device->destroy_resource(session->verify_readback);
     session->verify_readback = {0u};
   }
-  if (session->fence.handle != 0u) {
-    device->destroy_fence(session->fence);
-    session->fence = {0u};
-  }
+  session->stats_timeline.reset();
 }
 
 // Under the watcher lock: removes the running session from the watcher, so no hook reaches it any more. D3D12/Vulkan
@@ -1078,6 +1127,23 @@ inline void FailRequest(const std::shared_ptr<Request>& request, const std::stri
     request->completed = true;
   }
   request->cv.notify_all();
+}
+
+// Vulkan: signals the stats fence for the in-flight frame that waits for it (Session::stats_signal_pending). On the
+// presenting thread, inside a present on the session's queue.
+inline void SignalPendingStatsFrame(Session* session, reshade::api::command_queue* queue) {
+  if (!session->stats_signal_pending) return;
+  session->stats_signal_pending = false;
+  const auto value = SignalTimeline(session->stats_timeline.get(), queue);
+  if (value == 0u) {
+    session->stats_signal_failed = true;
+    return;
+  }
+  for (auto& frame : session->in_flight) {
+    if (frame.fence_value == 0u) {
+      frame.fence_value = value;
+    }
+  }
 }
 
 // D3D11: reduces the watched region into the next stats slot and returns that slot. Must run with the session locked.
@@ -1804,9 +1870,8 @@ inline void OnFinishPresent(Watcher* watcher, reshade::api::command_queue* queue
   }
   // The fence state belongs to the presenting thread (ProcessAtFrameEnd and this hook, both inside present), and the
   // signal runs inside present, where ReShade holds the queue's lock, so the game cannot submit to it concurrently.
-  if (session == nullptr || session->queue != queue || !session->unsignaled_fence_value.has_value()) return;
-  queue->signal(session->fence, session->unsignaled_fence_value.value());
-  session->unsignaled_fence_value.reset();
+  if (session == nullptr || session->queue != queue) return;
+  internal::SignalPendingStatsFrame(session.get(), queue);
 }
 
 // destroy_effect_runtime hook. ReShade raises it when a runtime is reset (resize, fullscreen switch) or destroyed,
@@ -1847,55 +1912,53 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
   const auto has_session = watcher->has_session.load(std::memory_order_acquire);
   if (!has_session && !watcher->has_retired_scratch.load(std::memory_order_acquire)) return;
 
-  // Stage 1 (locked): count the frame end, list the queues that need a fence and the fences to read. Submissions
-  // recorded from here on carry the new index and wait for the next frame end.
+  // Stage 1 (locked): count the frame end and list the queues that need a fence. Submissions recorded from here on
+  // carry the new index and wait for the next frame end.
   std::vector<std::uint64_t> queues_without_fence;
-  std::vector<std::pair<std::uint64_t, reshade::api::fence>> fences_to_read;
-  {
-    WatcherLock lock(watcher, "ProcessLifetimes: planning");
-    if (frame_end) {
-      ++watcher->frame_end_index;
-      internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
-        for (const auto& submission : submissions) {
-          if (submission.queue == nullptr) continue;
-          const auto queue_handle = reinterpret_cast<std::uint64_t>(submission.queue);
-          if (watcher->queue_fences.contains(queue_handle)) continue;
-          if (std::ranges::find(queues_without_fence, queue_handle) != queues_without_fence.end()) continue;
-          queues_without_fence.push_back(queue_handle);
-        }
-      });
-    }
-    for (const auto& [queue_handle, queue_fence] : watcher->queue_fences) {
-      fences_to_read.emplace_back(queue_handle, queue_fence.fence);
-    }
+  if (frame_end) {
+    WatcherLock lock(watcher, "ProcessLifetimes: counting the frame end");
+    ++watcher->frame_end_index;
+    internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
+      for (const auto& submission : submissions) {
+        if (submission.queue == nullptr) continue;
+        const auto queue_handle = reinterpret_cast<std::uint64_t>(submission.queue);
+        if (watcher->queue_fences.contains(queue_handle)) continue;
+        if (std::ranges::find(queues_without_fence, queue_handle) != queues_without_fence.end()) continue;
+        queues_without_fence.push_back(queue_handle);
+      }
+    });
   }
 
-  // Stage 2 (unlocked): create the missing fences and read how far the GPU got.
-  std::vector<std::pair<std::uint64_t, reshade::api::fence>> created_fences;
+  // Stage 2 (unlocked): create the missing fences.
+  std::vector<std::pair<std::uint64_t, std::shared_ptr<FenceTimeline>>> created_timelines;
   for (const auto queue_handle : queues_without_fence) {
-    reshade::api::fence fence = {0u};
-    if (device->create_fence(0u, reshade::api::fence_flags::none, &fence)) {
-      created_fences.emplace_back(queue_handle, fence);
+    auto timeline = internal::CreateFenceTimeline(device);
+    if (timeline != nullptr) {
+      created_timelines.emplace_back(queue_handle, std::move(timeline));
     }
   }
-  std::unordered_map<std::uint64_t, std::uint64_t> completed_values;
-  for (const auto& [queue_handle, fence] : fences_to_read) {
-    completed_values[queue_handle] = device->get_completed_fence_value(fence);
-  }
 
-  // Stage 3 (locked): install the fences, attach fence values, free what the GPU is done with.
+  // Stage 3 (locked): install the fences, mark what each new signal will cover, free what the GPU is done with.
   struct PlannedSignal {
     reshade::api::command_queue* queue = nullptr;
-    reshade::api::fence fence = {0u};
-    std::uint64_t value = 0u;
+    std::shared_ptr<FenceTimeline> timeline;
+    std::uint64_t signal_id = 0u;
   };
   std::vector<PlannedSignal> planned_signals;
-  std::vector<reshade::api::fence> unused_fences;
+  // Destroyed after the lock is released, like every fence (see FenceTimeline).
+  std::vector<std::shared_ptr<FenceTimeline>> unused_timelines;
   std::vector<reshade::api::resource> released_textures;
   {
-    WatcherLock lock(watcher, "ProcessLifetimes: attaching fence values");
+    WatcherLock lock(watcher, "ProcessLifetimes: planning the signals");
+    // Read before this stage plans new signals, so a texture is only freed for values the GPU had already passed.
+    // Each timeline's progress is behind its leaf mutex (FenceCompletion): no driver call under the watcher lock.
+    std::unordered_map<std::uint64_t, std::uint64_t> completed_values;
+    for (const auto& [queue_handle, queue_fence] : watcher->queue_fences) {
+      completed_values[queue_handle] = internal::GetCompletedValue(*queue_fence.timeline);
+    }
     watcher->completed_fence_values = completed_values;
-    for (const auto& [queue_handle, fence] : created_fences) {
+
+    for (auto& [queue_handle, timeline] : created_timelines) {
       // The queue may have been destroyed meanwhile: its destroy event cleared every submission that named it.
       bool queue_has_submissions = false;
       internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
@@ -1905,59 +1968,41 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
           }
         }
       });
-      if (!queue_has_submissions) {
-        unused_fences.push_back(fence);
+      if (!queue_has_submissions || watcher->queue_fences.contains(queue_handle)) {
+        unused_timelines.push_back(std::move(timeline));
         continue;
       }
-      const auto inserted = watcher->queue_fences.try_emplace(queue_handle, QueueLifetimeFence{.fence = fence}).second;
-      if (!inserted) {
-        unused_fences.push_back(fence);
-      }
+      watcher->queue_fences.emplace(queue_handle, QueueLifetimeFence{.timeline = std::move(timeline)});
     }
 
     if (frame_end) {
       for (auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
         // Frame ends of several runtimes can run at once: a queue with a signal still in flight is left to the next
-        // frame end, so at most one thread signals a queue's fence at a time and its values are signalled in order.
+        // frame end, so at most one thread signals a queue's fence at a time.
         if (queue_fence.signals_in_flight != 0u) continue;
         const auto queue_handle = fence_queue_handle;
-        const auto is_submitted_before_frame_end = [&](const GpuSubmission& submission) {
-          return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle
-                 && !submission.fence_value.has_value()
-                 && submission.frame_end_index < watcher->frame_end_index;
-        };
-        bool has_submitted_before_frame_end = false;
-        internal::ForEachSubmissionList(watcher, [&](const std::vector<GpuSubmission>& submissions) {
-          if (std::ranges::any_of(submissions, is_submitted_before_frame_end)) {
-            has_submitted_before_frame_end = true;
-          }
-        });
-        if (!has_submitted_before_frame_end) continue;
-
-        const auto value = ++queue_fence.last_value;
+        const auto signal_id = ++watcher->planned_signal_ids;
+        bool covers_submissions = false;
         internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
-          if (!std::ranges::any_of(submissions, is_submitted_before_frame_end)) return;
-          // The new value also covers this queue's earlier fenced submission (signals on one queue complete in order).
-          std::erase_if(submissions, [&](const GpuSubmission& submission) {
-            return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle && submission.fence_value.has_value();
-          });
           for (auto& submission : submissions) {
-            if (is_submitted_before_frame_end(submission)) {
-              submission.fence_value = value;
+            if (reinterpret_cast<std::uint64_t>(submission.queue) != queue_handle || submission.fence_value.has_value()
+                || submission.pending_signal != 0u || submission.frame_end_index >= watcher->frame_end_index) {
+              continue;
             }
+            submission.pending_signal = signal_id;
+            covers_submissions = true;
           }
         });
+        if (!covers_submissions) continue;
         ++queue_fence.signals_in_flight;
         planned_signals.push_back(PlannedSignal{
             .queue = reinterpret_cast<reshade::api::command_queue*>(queue_handle),
-            .fence = queue_fence.fence,
-            .value = value,
+            .timeline = queue_fence.timeline,
+            .signal_id = signal_id,
         });
       }
     }
 
-    // `completed_values` was read before this stage attached new values, so a texture is only freed for fence values
-    // the GPU had already passed.
     if (watcher->session != nullptr) {
       for (auto& entry : watcher->session->scratch_entries) {
         // An in-use entry no list owns and no reduction waits for is only held by its submissions (empty once a
@@ -1976,25 +2021,50 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
     watcher->has_retired_scratch.store(!watcher->retired_scratch.empty(), std::memory_order_release);
   }
 
-  // Stage 4 (unlocked): signal, then destroy what is no longer needed.
+  // Stage 4 (unlocked): signal. gpu_fence picks the value, so it is attached afterwards.
+  std::vector<std::uint64_t> signalled_values;
   for (const auto& planned : planned_signals) {
-    if (!internal::SignalQueueNative(planned.queue, planned.fence, planned.value)) {
-      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence signal failed; the scratch textures of that queue are kept until the device is destroyed)");
+    const auto value = internal::SignalTimeline(planned.timeline.get(), planned.queue);
+    if (value == 0u) {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence signal failed; those submissions wait for the next frame end's signal)");
     }
+    signalled_values.push_back(value);
   }
+
+  // Stage 5 (locked): attach the values. The queue cannot have been destroyed meanwhile: its destroy event waits until
+  // `signals_in_flight` drops to 0, which happens here, under the same lock.
   if (!planned_signals.empty()) {
-    WatcherLock lock(watcher, "ProcessLifetimes: signals done");
-    for (const auto& planned : planned_signals) {
-      if (auto pair = watcher->queue_fences.find(reinterpret_cast<std::uint64_t>(planned.queue)); pair != watcher->queue_fences.end()) {
+    WatcherLock lock(watcher, "ProcessLifetimes: attaching fence values");
+    for (std::size_t index = 0u; index < planned_signals.size(); ++index) {
+      const auto& planned = planned_signals[index];
+      const auto value = signalled_values[index];
+      const auto queue_handle = reinterpret_cast<std::uint64_t>(planned.queue);
+      if (auto pair = watcher->queue_fences.find(queue_handle); pair != watcher->queue_fences.end()) {
         --pair->second.signals_in_flight;
       }
+      const auto is_covered = [&](const GpuSubmission& submission) {
+        return submission.pending_signal == planned.signal_id;
+      };
+      internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
+        if (!std::ranges::any_of(submissions, is_covered)) return;
+        if (value != 0u) {
+          // The new value also covers this queue's earlier fenced submission (signals on one queue complete in order).
+          std::erase_if(submissions, [&](const GpuSubmission& submission) {
+            return reinterpret_cast<std::uint64_t>(submission.queue) == queue_handle && submission.fence_value.has_value();
+          });
+        }
+        for (auto& submission : submissions) {
+          if (!is_covered(submission)) continue;
+          submission.pending_signal = 0u;
+          if (value != 0u) {
+            submission.fence_value = value;
+          }
+        }
+      });
     }
   }
   for (const auto texture : released_textures) {
     device->destroy_resource(texture);
-  }
-  for (const auto fence : unused_fences) {
-    device->destroy_fence(fence);
   }
 }
 
@@ -2003,7 +2073,7 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
 // waited for; those textures are freed by a later frame end.
 inline void WaitForAttachedFenceValues(Watcher* watcher, reshade::api::device* device) {
   if (device->get_api() != reshade::api::device_api::d3d12) return;
-  std::vector<std::pair<reshade::api::fence, std::uint64_t>> fences;
+  std::vector<std::pair<std::shared_ptr<FenceTimeline>, std::uint64_t>> waits;
   {
     WatcherLock lock(watcher, "WaitForAttachedFenceValues");
     for (const auto& [fence_queue_handle, queue_fence] : watcher->queue_fences) {
@@ -2017,29 +2087,36 @@ inline void WaitForAttachedFenceValues(Watcher* watcher, reshade::api::device* d
         }
       });
       if (highest_value != 0u) {
-        fences.emplace_back(queue_fence.fence, highest_value);
+        waits.emplace_back(queue_fence.timeline, highest_value);
       }
     }
   }
-  if (!internal::WaitForFences(device, fences)) {
+  bool all_reached = true;
+  for (const auto& [timeline, value] : waits) {
+    if (!internal::WaitTimeline(*timeline, value)) {
+      all_reached = false;
+    }
+  }
+  if (!all_reached) {
     reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait timed out at the end of a watch; those scratch textures are freed by a later frame end)");
   }
 }
 
 // D3D12 destroy_command_queue hook. ReShade raises it before releasing the native queue, so the queue is still valid
 // here, and a game that destroys a queue no longer submits to it: every list it executed was really submitted. The
-// queue's submissions are fenced with one more signal and waited for (without the lock); textures the GPU is then done
-// with are freed by the next frame end. If the queue never got a fence (created only at frame ends, never in hooks) or
-// the wait fails, its textures are kept until the device is destroyed, which waits for the device. A watch measuring on
-// this queue fails here: no frame end can finish it any more, since they run inside presents on its queue.
+// queue's fence gets one more signal, waited for without the lock; the textures of its submissions are then freed by the
+// next frame end, and the fence is destroyed (which also releases gpu_fence's reference to the native queue). If the
+// queue never got a fence (created only at frame ends, never in hooks) or the wait fails, its textures are kept until
+// the device is destroyed, which waits for the device. A watch measuring on this queue fails here: no frame end can
+// finish it any more, since they run inside presents on its queue.
 inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queue* queue) {
   auto* device = queue->get_device();
   if (device->get_api() != reshade::api::device_api::d3d12) return;
   const auto queue_handle = reinterpret_cast<std::uint64_t>(queue);
 
   std::uint64_t wait_id = 0u;
-  reshade::api::fence fence = {0u};
-  std::uint64_t fence_value = 0u;
+  // Destroyed at the end of this function, after every lock below is released.
+  std::shared_ptr<FenceTimeline> timeline;
   bool has_submissions = false;
   bool signal_in_flight_timed_out = false;
   std::shared_ptr<Session> orphaned_session;
@@ -2065,14 +2142,13 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
         if (submission.queue != queue) continue;
         submission.queue = nullptr;
         submission.fence_value.reset();
+        submission.pending_signal = 0u;
         submission.destroyed_queue_wait = wait_id;
         has_submissions = true;
       }
     });
     if (pair != watcher->queue_fences.end()) {
-      fence = pair->second.fence;
-      fence_value = ++pair->second.last_value;
-      watcher->orphan_fences.push_back(fence);
+      timeline = pair->second.timeline;
       watcher->queue_fences.erase(pair);
     }
     // After the submissions above were marked, so the session's textures this queue may still use are retired with
@@ -2084,15 +2160,11 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
   }
   if (orphaned_session != nullptr) {
     // Its reductions and stats copies were submitted at the presents on this queue, so one more signal on its stats
-    // fence covers them before its objects are destroyed.
+    // fence covers them before its objects are destroyed. No frame end signals that fence any more.
     bool gpu_finished = false;
-    if (orphaned_session->fence.handle != 0u) {
-      const auto value = ++orphaned_session->fence_value;
-      const std::array<std::pair<reshade::api::fence, std::uint64_t>, 1> session_fences = {
-          std::pair{orphaned_session->fence, value},
-      };
-      gpu_finished = internal::SignalQueueNative(queue, orphaned_session->fence, value)
-                     && internal::WaitForFences(device, session_fences);
+    if (orphaned_session->stats_timeline != nullptr) {
+      const auto value = internal::SignalTimeline(orphaned_session->stats_timeline.get(), queue);
+      gpu_finished = (value != 0u && internal::WaitTimeline(*orphaned_session->stats_timeline, value));
     }
     if (gpu_finished) {
       for (const auto texture : orphaned_textures) {
@@ -2101,31 +2173,41 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
       internal::DestroySessionObjects(orphaned_session.get(), device);
     } else {
       reshade::log::message(reshade::log::level::warning, "devkit::watch_region(the GPU did not finish a watch on a destroyed queue within the wait timeout; its textures are not destroyed)");
+      if (orphaned_session->stats_timeline != nullptr) {
+        WatcherLock lock(watcher, "OnCommandQueueDestroyed: orphaning the stats fence");
+        watcher->orphan_timelines.push_back(std::move(orphaned_session->stats_timeline));
+      }
     }
     internal::FailRequest(orphaned_session->request, "The command queue the watch measured on was destroyed.");
   }
-  if (!has_submissions) return;
-  if (signal_in_flight_timed_out) {
-    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a frame end's signal on a destroyed queue did not finish; its scratch textures are kept until the device is destroyed)");
-    return;
-  }
-  if (fence.handle == 0u) {
-    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a queue was destroyed before its lifetime fence existed; its scratch textures are kept until the device is destroyed)");
+  if (timeline == nullptr) {
+    if (has_submissions) {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a queue was destroyed before its lifetime fence existed; its scratch textures are kept until the device is destroyed)");
+    }
     return;
   }
 
-  const std::array<std::pair<reshade::api::fence, std::uint64_t>, 1> fences = {std::pair{fence, fence_value}};
-  if (!internal::SignalQueueNative(queue, fence, fence_value) || !internal::WaitForFences(device, fences)) {
-    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait failed for a destroyed queue; its scratch textures are kept until the device is destroyed)");
+  bool waited = false;
+  if (!signal_in_flight_timed_out) {
+    const auto value = internal::SignalTimeline(timeline.get(), queue);
+    waited = (value != 0u && internal::WaitTimeline(*timeline, value));
+  }
+  if (!waited) {
+    if (has_submissions) {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait failed for a destroyed queue; its scratch textures are kept until the device is destroyed)");
+    }
+    WatcherLock lock(watcher, "OnCommandQueueDestroyed: orphaning the fence");
+    watcher->orphan_timelines.push_back(std::move(timeline));
     return;
   }
-
-  WatcherLock lock(watcher, "OnCommandQueueDestroyed: waited");
-  internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
-    std::erase_if(submissions, [&](const GpuSubmission& submission) {
-      return submission.destroyed_queue_wait == wait_id;
+  if (has_submissions) {
+    WatcherLock lock(watcher, "OnCommandQueueDestroyed: waited");
+    internal::ForEachSubmissionList(watcher, [&](std::vector<GpuSubmission>& submissions) {
+      std::erase_if(submissions, [&](const GpuSubmission& submission) {
+        return submission.destroyed_queue_wait == wait_id;
+      });
     });
-  });
+  }
 }
 
 // Called from reshade_present, which ReShade raises after every add-on's present handler and after its own effects
@@ -2439,17 +2521,22 @@ inline void ProcessAtFrameEnd(
       const auto frame = session->in_flight.front();
       const auto has_readback = (frame.fence_value != (std::numeric_limits<std::uint64_t>::max)());
       if (session->explicit_api && has_readback) {
-        if (session->fence.handle != 0u) {
-          if (device->get_completed_fence_value(session->fence) < frame.fence_value) {
+        if (session->stats_timeline != nullptr) {
+          if (frame.fence_value == 0u) {
+            // Vulkan: finish_present has not signalled this frame yet.
             if (!wait) return false;
-            if (session->unsignaled_fence_value.has_value()) {
-              queue->signal(session->fence, session->unsignaled_fence_value.value());
-              session->unsignaled_fence_value.reset();
-            }
+            internal::SignalPendingStatsFrame(session.get(), queue);
+          }
+          if (session->stats_signal_failed) {
+            unlocked_failure = "The stats readback fence could not be signalled.";
+            return false;
+          }
+          const auto fence_value = session->in_flight.front().fence_value;
+          if (internal::GetCompletedValue(*session->stats_timeline) < fence_value) {
+            if (!wait) return false;
             // Bounded, so a GPU that never reaches the value (hang without a device removal) fails the watch instead of
             // blocking present forever.
-            const auto timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(LIFETIME_FENCE_WAIT_TIMEOUT).count();
-            if (!device->wait(session->fence, frame.fence_value, timeout_ns)) {
+            if (!internal::WaitTimeline(*session->stats_timeline, fence_value)) {
               unlocked_failure = "The GPU did not finish the region statistics within the wait timeout.";
               return false;
             }
@@ -2798,15 +2885,19 @@ inline void ProcessAtFrameEnd(
           cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::unordered_access, reshade::api::resource_usage::copy_source);
           cmd_list->copy_texture_region(session->stats_texture, 0u, nullptr, session->readbacks[frame.ring_index], 0u, nullptr);
           cmd_list->barrier(session->stats_texture, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::unordered_access);
-          frame.fence_value = ++session->fence_value;
-          if (session->fence.handle != 0u && session->device_api == reshade::api::device_api::d3d12) {
-            queue->signal(session->fence, frame.fence_value);
-          } else if (session->fence.handle != 0u) {
-            // A value left unsignalled because finish_present did not follow (failed present) is signalled now.
-            if (session->unsignaled_fence_value.has_value()) {
-              queue->signal(session->fence, session->unsignaled_fence_value.value());
+          frame.fence_value = 0u;
+          if (session->stats_timeline != nullptr && session->device_api == reshade::api::device_api::d3d12) {
+            // gpu_fence's D3D12 signal does not flush ReShade's immediate command list, which holds this frame's
+            // reductions and stats copy.
+            queue->flush_immediate_command_list();
+            frame.fence_value = internal::SignalTimeline(session->stats_timeline.get(), queue);
+            if (frame.fence_value == 0u) {
+              unlocked_failure = "The stats readback fence could not be signalled.";
             }
-            session->unsignaled_fence_value = frame.fence_value;
+          } else if (session->stats_timeline != nullptr) {
+            // A frame left unsignalled because finish_present did not follow (failed present) is signalled now.
+            internal::SignalPendingStatsFrame(session.get(), queue);
+            session->stats_signal_pending = true;
           }
         } else {
           cmd_list->copy_texture_region(session->stats_texture, 0u, nullptr, session->readbacks[frame.ring_index], 0u, nullptr);
@@ -2909,10 +3000,7 @@ inline void ProcessAtFrameEnd(
 
     // Stage 4 (unlocked): complete a finished watch on its detached session.
     if (finished_session != nullptr) {
-      if (session->unsignaled_fence_value.has_value()) {
-        queue->signal(session->fence, session->unsignaled_fence_value.value());
-        session->unsignaled_fence_value.reset();
-      }
+      internal::SignalPendingStatsFrame(session.get(), queue);
       queue->wait_idle();
       while (!session->in_flight.empty() && unlocked_failure.empty()) {
         map_oldest(true);
@@ -3428,8 +3516,8 @@ inline void ProcessAtFrameEnd(
       continue;
     }
     // Without a fence (Vulkan without timeline semaphores), a readback is only read after waiting for the queue.
-    if (new_session->explicit_api && !device->create_fence(0u, reshade::api::fence_flags::none, &new_session->fence)) {
-      new_session->fence = {0u};
+    if (new_session->explicit_api) {
+      new_session->stats_timeline = internal::CreateFenceTimeline(device);
     }
     // D3D12/Vulkan hooks never create scratch textures (see ReserveScratchEntry), so the pool starts here.
     if (new_session->explicit_api) {
@@ -3483,10 +3571,10 @@ inline void ProcessAtFrameEnd(
 
 // Fails whatever is still queued or running when the device goes away, and destroys every scratch texture (no command
 // list of the device can run any more). On D3D12 the GPU may still be running region copies of the game's queues: those
-// are waited for first (LIFETIME_FENCE_WAIT_TIMEOUT per queue, device-removed check), with one more signal on each queue
-// that has submissions without a fence value; the game no longer submits while its device is destroyed. A frame end
-// still signalling a queue is waited for first (bounded, like OnCommandQueueDestroyed): at process exit its thread may
-// already be terminated, and that queue's fence is then neither signalled again nor destroyed.
+// are waited for first (LIFETIME_FENCE_WAIT_TIMEOUT per queue), with one more signal on each queue that has submissions
+// without a fence value; the game no longer submits while its device is destroyed. A frame end still signalling a queue
+// is waited for first (bounded, like OnCommandQueueDestroyed): at process exit its thread may already be terminated;
+// that queue is then neither signalled nor waited for, and its fence lives as long as that signal call.
 inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
   const auto signals_wait_start = std::chrono::steady_clock::now();
   while (std::chrono::steady_clock::now() - signals_wait_start < LIFETIME_FENCE_WAIT_TIMEOUT) {
@@ -3502,15 +3590,17 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
 
   struct FinalSignal {
     reshade::api::command_queue* queue = nullptr;
-    reshade::api::fence fence = {0u};
+    std::shared_ptr<FenceTimeline> timeline;
+    // The highest value already attached; replaced by the final signal's value when one is needed.
     std::uint64_t value = 0u;
     bool needs_signal = false;
   };
   std::vector<FinalSignal> final_signals;
-  std::vector<reshade::api::fence> fences_to_destroy;
   std::uint32_t queues_still_signalling = 0u;
 
-  // Everything is taken out under the lock and destroyed after releasing it.
+  // Everything is taken out under the lock and destroyed after releasing it, fences last (see FenceTimeline).
+  std::unordered_map<std::uint64_t, QueueLifetimeFence> queue_fences;
+  std::vector<std::shared_ptr<FenceTimeline>> orphan_timelines;
   std::shared_ptr<Session> session;
   std::vector<RetiredScratch> retired_scratch;
   std::deque<std::shared_ptr<Request>> pending_requests;
@@ -3535,22 +3625,19 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
           }
         }
       });
-      if (has_unfenced) {
-        highest_value = ++queue_fence.last_value;
-      }
-      if (highest_value != 0u) {
+      if (highest_value != 0u || has_unfenced) {
         final_signals.push_back(FinalSignal{
             .queue = reinterpret_cast<reshade::api::command_queue*>(queue_handle),
-            .fence = queue_fence.fence,
+            .timeline = queue_fence.timeline,
             .value = highest_value,
             .needs_signal = has_unfenced,
         });
       }
-      fences_to_destroy.push_back(queue_fence.fence);
     }
+    queue_fences = std::move(watcher->queue_fences);
     watcher->queue_fences.clear();
-    fences_to_destroy.insert(fences_to_destroy.end(), watcher->orphan_fences.begin(), watcher->orphan_fences.end());
-    watcher->orphan_fences.clear();
+    orphan_timelines = std::move(watcher->orphan_timelines);
+    watcher->orphan_timelines.clear();
     session = std::move(watcher->session);
     watcher->has_session.store(false, std::memory_order_release);
     retired_scratch = std::move(watcher->retired_scratch);
@@ -3561,19 +3648,24 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
   }
 
   if (queues_still_signalling != 0u) {
-    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a frame end's lifetime fence signal did not finish before the device was destroyed; that queue's fence is left alive)");
+    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(a frame end's lifetime fence signal did not finish before the device was destroyed; that queue is not waited for)");
   }
-  if (!final_signals.empty()) {
-    std::vector<std::pair<reshade::api::fence, std::uint64_t>> fences;
-    for (const auto& final_signal : final_signals) {
-      if (final_signal.needs_signal && !internal::SignalQueueNative(final_signal.queue, final_signal.fence, final_signal.value)) {
+  bool all_reached = true;
+  for (auto& final_signal : final_signals) {
+    if (final_signal.needs_signal) {
+      const auto value = internal::SignalTimeline(final_signal.timeline.get(), final_signal.queue);
+      if (value == 0u) {
         reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence signal failed at device destruction)");
+      } else {
+        final_signal.value = value;
       }
-      fences.emplace_back(final_signal.fence, final_signal.value);
     }
-    if (!internal::WaitForFences(device, fences)) {
-      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait timed out at device destruction; the scratch textures are destroyed with the device)");
+    if (final_signal.value != 0u && !internal::WaitTimeline(*final_signal.timeline, final_signal.value)) {
+      all_reached = false;
     }
+  }
+  if (!all_reached) {
+    reshade::log::message(reshade::log::level::warning, "devkit::watch_region(lifetime fence wait timed out at device destruction; the scratch textures are destroyed with the device)");
   }
 
   if (session != nullptr) {
@@ -3588,9 +3680,9 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
   for (const auto& retired : retired_scratch) {
     device->destroy_resource(retired.texture);
   }
-  for (const auto fence : fences_to_destroy) {
-    device->destroy_fence(fence);
-  }
+  final_signals.clear();
+  queue_fences.clear();
+  orphan_timelines.clear();
   for (const auto& request : pending_requests) {
     internal::FailRequest(request, "The device was destroyed before the watch finished.");
   }
