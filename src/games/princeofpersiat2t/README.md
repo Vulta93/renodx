@@ -77,12 +77,12 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
   90th percentile 1.8x, 99th 5.6x, maximum 6.0x; no steady frame had a pixel above 7.5x. In 11 samples that match three stealth
   kills by time (the dagger flashes bright white; the attribution is inferred from time stamps and the author's remark) the maximum reached 134x (8.4x encoded), with up to 68,000 pixels above white and thousands
   above 64x. Those are clamped at Peak.
-- Open issue, measured but not attributed: on pixels with real range that the game darkened afterwards (luminance below 85% of
-  the SDR bridge), the rebuild leaves them on average 1.2x to 1.26x (up to 2.1x) brighter than a multiplicative model
-  (darkening ratio x HDR luminance) would. The darkening may come from the character shadow receivers (ZERO/SRCCOLOR), the
-  negative offset in some scenes (c0 0.4408, offset -0.118), or the glow B composite (SRCALPHA/INVSRCALPHA); the samples were
-  not labelled, and the author reports the shadow label was pressed in the same sunlit scene as another label, so which
-  dominates is not known. Whether the multiplicative model is the right look is undecided, so nothing was changed.
+- Darkened highlights: on pixels with real range that the game darkened afterwards (luminance below 85% of the SDR bridge),
+  the rebuild leaves them on average 1.2x to 1.26x (up to 2.1x) brighter than a multiplicative model would (darkening ratio x
+  HDR luminance). This covers about 5,000 pixels per frame at most (0.07%). An experimental setting that scaled the range with
+  the darkening was tried in game (sunlit scene with shadows, bright effects) and made no visible difference, so it was not
+  kept. Which darkening dominates (shadow receivers ZERO/SRCCOLOR, the negative offset in some scenes with c0 0.4408, or the
+  glow B composite SRCALPHA/INVSRCALPHA) was not determined.
 - Offset constant: the game's `c0` for the offset blit was read successfully in every frame and varies between 0.4408 and
   0.5250, i.e. the offset is between -0.118 and +0.05 in encoded units (negative darkens).
 - Blend states, from a draw-time log of Direct3D 9 render states (about 1.8 million draws into the 3840 px targets): opaque
