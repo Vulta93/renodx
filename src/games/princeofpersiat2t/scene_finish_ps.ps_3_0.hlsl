@@ -46,9 +46,9 @@ float4 main(float2 vpos : VPOS) : COLOR {
 
   // Tone Mapper Roll-off: exponential roll-off (renodx::tonemap::ExponentialRollOff, clip version) on the max channel,
   // colour scaled so hue is kept: identity up to 0.6x Peak, Peak at the white clip (or Peak when higher). White clip:
-  // 7.5x Game Brightness (~1520 nits at 203). That value was measured in Warrior Within (same ps_1_1 glow chain, fire
-  // cores up to ~1350 nits max channel at 203 nits Game Brightness); it is NOT measured in The Two Thrones yet
-  // (measure with Tone Mapper None, Peak 10000 and adjust).
+  // 7.5x Game Brightness (~1520 nits at 203). Taken from Warrior Within (same ps_1_1 glow chain, fire cores up to ~1350
+  // nits max channel at 203 nits Game Brightness) and kept because the steady scenes measured in The Two Thrones peak at
+  // 6.0x white on the BT.2020 max channel; the stealth-kill dagger flash goes far beyond (up to 134x) and is clamped at Peak.
   // Applied to the final linear values (after gamma correction, relative to UI Brightness) with the max channel taken
   // in the swap chain encoding colour space (BT.2020 for HDR10), exactly where SwapChainPass clamps at Peak. On the
   // BT.709 max channel an orange flame's red at Peak is only ~0.73x Peak in BT.2020 (measured in the SoT mod: fire

@@ -53,9 +53,9 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
      A frame without the glow B composite is shown as the SDR bridge at UI Brightness.
 4. **Tone Mapper**: Vanilla (original clip), None, **Roll-off** (default): `ExponentialRollOff` on the max channel taken in the
    swap chain encoding colour space (BT.2020 for HDR10), colour scaled so hue is kept; identity up to 0.6 × Peak, white clip
-   7.5 × Game Brightness. **The 7.5 clip is copied from Warrior Within, where fire reached ~1350 nits; it is not measured in
-   this game**, and it matters here: the scene readback reached 8.7x encoded (about 160x linear) in some frames, far above
-   the 7.5x clip. It still has to be measured (Tone Mapper None, Peak 10000, Game = UI Brightness).
+   7.5 × Game Brightness. The 7.5 clip was taken from Warrior Within; in this game the steady scenes measured peak at 6.0x white (BT.2020
+   max channel, see Measurements), so 7.5x leaves headroom. The stealth-kill dagger flash goes far beyond it (up to 134x) and is
+   clamped at Peak.
 5. **PsychoV**: not used. The game has no tone curve to match (hard clip at 8-bit targets), so PsychoV's anchors have nothing to
    match. RenoDRT and Neutwo were rejected in the sister mods Warrior Within and Sands of Time on the same glow chain
    (they compressed the fire well below Peak); not re-measured here.
@@ -72,6 +72,17 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
   system memory and scanned on the CPU in every 20th frame: 172 samples, 68 with a maximum above 1.0, 30 above 1.25, 17
   above 1.5, 16 above 2, 3 above 4, largest 8.66; most pixels above 1.0 in one frame: 56,791 (0.7%). The first samples
   (menus and loading) never exceeded 0.65.
+- Per-frame data (second diagnostic build, 255 samples, one in 20 frames, not labelled by scene): in 244 steady samples 73 had pixels above
+  white (about 6,000 pixels, 0.07% of the frame, per frame); their BT.2020 max channel (linear, 1.0 = game white) had median 1.25x,
+  90th percentile 1.8x, 99th 5.6x, maximum 6.0x; no steady frame had a pixel above 7.5x. In 11 samples that match three stealth
+  kills by time (the dagger flashes bright white; the attribution is inferred from time stamps and the author's remark) the maximum reached 134x (8.4x encoded), with up to 68,000 pixels above white and thousands
+  above 64x. Those are clamped at Peak.
+- Open issue, measured but not attributed: on pixels with real range that the game darkened afterwards (luminance below 85% of
+  the SDR bridge), the rebuild leaves them on average 1.2x to 1.26x (up to 2.1x) brighter than a multiplicative model
+  (darkening ratio x HDR luminance) would. The darkening may come from the character shadow receivers (ZERO/SRCCOLOR), the
+  negative offset in some scenes (c0 0.4408, offset -0.118), or the glow B composite (SRCALPHA/INVSRCALPHA); the samples were
+  not labelled, and the author reports the shadow label was pressed in the same sunlit scene as another label, so which
+  dominates is not known. Whether the multiplicative model is the right look is undecided, so nothing was changed.
 - Offset constant: the game's `c0` for the offset blit was read successfully in every frame and varies between 0.4408 and
   0.5250, i.e. the offset is between -0.118 and +0.05 in encoded units (negative darkens).
 - Blend states, from a draw-time log of Direct3D 9 render states (about 1.8 million draws into the 3840 px targets): opaque
@@ -94,7 +105,8 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
   draws, which clamps range there), pause menu, videos and loading screens (frames without the offset
   blit stay at UI Brightness), Alt-Tab / Reset, other resolutions, `BlurFX=0` or `ShadowsEnabled=0` in `Hardware.ini`
   (without the glow B composite pass 2 never runs), fades and flashes (the offset c0 is applied as part of the SDR grade),
-  shadows on surfaces brighter than white.
+  shadows on surfaces brighter than white, the main-menu colour lookup feeding the bridge result, fades that are not done
+  through c0, the stealth-kill flash (clamped at Peak) as seen on screen.
 - The game's own Gamma / Brightness / Contrast options were not checked.
 - The "mouse guard" setting works around two ImGui contexts reading one mouse with the Display Proxy (inherited from the
   sister mods; it ignores the mouse when the settings window is narrower than 600 px).
