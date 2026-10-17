@@ -362,11 +362,14 @@ struct FenceCompletion {
 // values of one fence 1, 2, 3, ... (a failed signal uses none) and delivers completion callbacks in order, so with a
 // callback on every signal the n-th callback means value n completed. That holds only under three rules, kept by
 // SignalTimeline: every signal carries a callback (never the callback-less QueueSignal); a timeline is signalled on
-// one queue only (gpu_fence makes a queue wait on the GPU when a fence changes queue); at most one thread signals it at a
-// time (`signalling`, asserted). Frame ends read `completion` instead of querying the GPU, and every CPU wait for a
-// timeline is a bounded wait on its condition variable. The fence is destroyed only outside the watcher lock and outside
-// `completion->mutex` (its destructor joins the callback worker), never from a callback. gpu_fence treats a failed
-// completion query, for example after a device removal, as fatal and ends the process (maintainer decision).
+// one queue only (gpu_fence orders every signal after the previous one with a GPU wait, so a second queue would be made
+// to wait on the first); at most one thread signals it at a time (`signalling`, asserted). Frame ends read `completion`
+// instead of querying the GPU, and every CPU wait for a timeline is a bounded wait on its condition variable. The fence
+// is destroyed only outside the watcher lock and outside `completion->mutex` (its destructor joins the callback worker),
+// never from a callback. gpu_fence passes the backend's completion value through, including UINT64_MAX after a device
+// removal: pending callbacks then run as if completed, so the count advances and bounded waits return. A callback is a
+// threshold, not proof that the GPU work succeeded; after a removal the watch is expected to fail at its next signal or
+// readback map.
 struct FenceTimeline {
   std::unique_ptr<renodx::utils::gpu_fence::Fence> fence;
   std::shared_ptr<FenceCompletion> completion = std::make_shared<FenceCompletion>();
@@ -2243,7 +2246,7 @@ inline void WaitForAttachedFenceValues(Watcher* watcher, reshade::api::device* d
 // D3D12 destroy_command_queue hook. ReShade raises it before releasing the native queue, so the queue is still valid
 // here, and a game that destroys a queue no longer submits to it: every list it executed was really submitted. The
 // queue's fence gets one more signal, waited for without the lock; the textures of its submissions are then freed by the
-// next frame end, and the fence is destroyed (which also releases gpu_fence's reference to the native queue). If the
+// next frame end, and the fence is destroyed (gpu_fence keeps no reference to the queue). If the
 // queue never got a fence (created only at frame ends, never in hooks) or the wait fails, its textures are kept until
 // the device is destroyed, which waits for the device. A watch measuring on this queue fails here: no frame end can
 // finish it any more, since they run inside presents on its queue.
