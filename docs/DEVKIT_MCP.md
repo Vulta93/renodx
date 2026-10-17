@@ -420,8 +420,8 @@ fence are `gpu_fence::Fence`s, and every signal carries a completion callback. g
 2, 3, ... (a failed signal uses none) and delivers the callbacks in order on a worker thread, so a callback only counts:
 the n-th callback means value n completed. Frame ends read that count instead of querying the GPU, and every CPU wait for
 a fence is a condition-variable wait on it. Three rules keep the count right, checked in the code: every signal carries
-a callback; a fence is signalled on one queue only (gpu_fence would make the queue wait on the GPU when a fence changes
-queue); at most one thread signals a fence at a time (asserted). gpu_fence picks the value when it signals, so a frame end
+a callback; a fence is signalled on one queue only (gpu_fence orders every signal after the previous one with a GPU wait, so a
+second queue would be made to wait on the first); at most one thread signals a fence at a time (asserted). gpu_fence picks the value when it signals, so a frame end
 marks the submissions a signal will cover under the lock, signals without it, and attaches the value under the lock
 again; a failed signal leaves them for the next frame end. While a signal's value has not completed, gpu_fence's worker
 checks the fence every millisecond (one worker per fence: the stats fence's ends with the watch, a queue's sleeps when
@@ -431,9 +431,11 @@ go idle.
 Every CPU wait for the GPU in the watch has a timeout (2 s: lifetime fences at the end of a watch, at queue and device
 destruction, the stats readback fence, and the waits of a destroyed queue and of device destruction for a frame end's
 signal in flight), and none holds the lock. The one exception is ReShade's `command_queue::wait_idle` (end of a watch), which has no timeout parameter; a
-GPU hang ends it through the driver's device removal. **Device removal:** `gpu_fence` treats a failed completion query
-as fatal, so if the GPU is removed (TDR) while one of the watch's fences has a value pending, the game process ends
-instead of the watch reporting an error (maintainer decision: a GPU crash is a bug to be spotted, not survived).
+GPU hang ends it through the driver's device removal. **Device removal:** `gpu_fence` passes the backend's completion
+value through, including `UINT64_MAX` after a device removal (TDR), and no longer ends the process (upstream `6d563066`
+changed this). Pending callbacks then run as if completed, so the watch's bounded waits return at once and the game
+keeps running. Expected, not yet tested: the watch then fails with "The stats readback fence could not be signalled."
+or "Failed to map the stats readback texture."
 
 The state of the watched subresource is only taken where it is exactly known; everywhere else the writer is reported as
 unmeasured and its "before" comes from the last measurement point in submission order, if no other writer came in between:
