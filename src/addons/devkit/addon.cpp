@@ -4767,6 +4767,23 @@ bool OnCopyTextureRegion(
   return false;
 }
 
+// OpenGL texture uploads from a bound pixel unpack buffer (glTexSubImage* with a buffer bound). Other APIs do not report
+// buffer-to-texture copies the watch could order, so only OpenGL is forwarded.
+bool OnCopyBufferToTexture(
+    reshade::api::command_list* cmd_list,
+    reshade::api::resource source,
+    uint64_t source_offset,
+    uint32_t row_length,
+    uint32_t slice_height,
+    reshade::api::resource dest,
+    uint32_t dest_subresource,
+    const reshade::api::subresource_box* dest_box) {
+  if (cmd_list->get_device()->get_api() == reshade::api::device_api::opengl) {
+    NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::COPY, {.resource = dest, .subresource = dest_subresource});
+  }
+  return false;
+}
+
 bool OnResolveTextureRegion(
     reshade::api::command_list* cmd_list,
     reshade::api::resource source,
@@ -9336,6 +9353,9 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
     case reshade::api::device_api::vulkan:
       reduce_shader = __watch_region_reduce;
       break;
+    case reshade::api::device_api::opengl:
+      reduce_shader = __watch_region_reduce_gl;
+      break;
     default:
       break;
   }
@@ -9603,6 +9623,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::register_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::register_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
       reshade::register_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
       reshade::register_event<reshade::addon_event::update_texture_region>(OnUpdateTextureRegion);
       reshade::register_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUint);
@@ -9662,6 +9683,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::destroy_pipeline>(OnDestroyPipeline);
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
       reshade::unregister_event<reshade::addon_event::copy_texture_region>(OnCopyTextureRegion);
+      reshade::unregister_event<reshade::addon_event::copy_buffer_to_texture>(OnCopyBufferToTexture);
       reshade::unregister_event<reshade::addon_event::resolve_texture_region>(OnResolveTextureRegion);
       reshade::unregister_event<reshade::addon_event::update_texture_region>(OnUpdateTextureRegion);
       reshade::unregister_event<reshade::addon_event::clear_unordered_access_view_uint>(OnClearUnorderedAccessViewUint);
