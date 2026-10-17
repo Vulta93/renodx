@@ -94,19 +94,25 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
 ## Verification performed
 
 - Build: `renodx-princeofpersiat2t` (x86 RelWithDebInfo; new or removed shader files need CMake Configure).
-- Runtime: the add-on loads next to the Devkit, HDR10 proxy runs, HUD and menus show, the RenoDX menu has all settings,
-  Game Brightness changes the scene but not the HUD, glow/blur and character shadows look like the original.
+- Runtime (author, in game): the add-on loads next to the Devkit, HDR10 proxy runs, HUD and menus show, the RenoDX menu has all
+  settings, Game Brightness changes the scene but not the HUD, glow/blur and character shadows look like the original.
+- Main menu: normal picture; Game Brightness changes the 3D backdrop but not the menu text. Devkit snapshot of the frame: copy,
+  offset blit (pass 1), glow A, colour lookup, glow B composite, the next backbuffer to T copy (pass 2), menu UI, final copy.
+  The distortion draw did not run in that frame.
+- Pause menu: normal; Game Brightness changes the scene behind it but not the pause UI.
+- Videos and loading screens follow UI Brightness only (no offset blit, so no scene pass), no flicker, no jump.
+- Death fade to black and back: smooth, no leftover highlights or flash.
+- Alt-Tab: the game freezes while away and resumes unchanged, as in the original. The log shows no device Reset or swapchain
+  destruction from it, so the Reset path was not exercised.
 
 ## Known limitations / not tested
 
 - Which effects produce the range above white (sand powers, specific particles, lava) was not attributed per scene; the readback
   samples were not labelled. The large fire plume that was measured in detail has none.
-- Not tested: main menu (distortion and colour lookup run before/inside the bridge; the distortion clamps HDR where it
-  draws, which clamps range there), pause menu, videos and loading screens (frames without the offset
-  blit stay at UI Brightness), Alt-Tab / Reset, other resolutions, `BlurFX=0` or `ShadowsEnabled=0` in `Hardware.ini`
-  (without the glow B composite pass 2 never runs), fades and flashes (the offset c0 is applied as part of the SDR grade),
-  shadows on surfaces brighter than white, the main-menu colour lookup feeding the bridge result, fades that are not done
-  through c0, the stealth-kill flash (clamped at Peak) as seen on screen.
+- Not tested: the main-menu distortion draw (it clamps range where it draws), the device Reset path (resolution or window mode
+  change), other resolutions, `BlurFX=0` or `ShadowsEnabled=0` in `Hardware.ini` (without the glow B composite pass 2 never
+  runs), fades that are not done through c0, the stealth-kill flash (clamped at Peak) as seen on screen, sand powers (not
+  unlocked by the author).
 - The game's own Gamma / Brightness / Contrast options were not checked.
 - The "mouse guard" setting works around two ImGui contexts reading one mouse with the Display Proxy (inherited from the
   sister mods; it ignores the mouse when the settings window is narrower than 600 px).
