@@ -3822,7 +3822,7 @@ inline void ProcessAtFrameEnd(
       auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<std::uintptr_t>(device->get_native()));
       IDirect3DDevice9Ex* native_device_ex = nullptr;
       if (FAILED(native_device->QueryInterface(IID_PPV_ARGS(&native_device_ex)))) {
-        complete_request(request, make_error("DX9 watches need D3D9Ex: run the game with a RenoDX proxy mod, or turn on Force DX9Ex (boot) in the Devkit's proxy settings and restart the game (Force DX9Ex only works for games that start windowed or borderless)."));
+        complete_request(request, make_error("DX9 watches need D3D9Ex: run the game with a RenoDX proxy mod or a wrapper that creates the device with CreateDeviceEx (for example dxwrapper's D3d9to9Ex), or turn on Force DX9Ex (boot) in the Devkit's proxy settings and restart the game (Force DX9Ex only works for games that start windowed or borderless)."));
         continue;
       }
       native_device_ex->Release();

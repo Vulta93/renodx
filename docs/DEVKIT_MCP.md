@@ -321,8 +321,10 @@ compute slots the pass uses (CS shader, b0, t0, u0) are saved and restored with 
 
 **D3D9** has no compute shaders or UAVs, and the readback fence needs **D3D9Ex** (`utils::gpu_fence`'s D3DKMT backend; the
 Devkit calls `gpu_fence::Use`, which finds a D3D9Ex device's GPU handles when the device starts). A RenoDX mod that runs the
-display proxy already creates the device as D3D9Ex; the Devkit alone does not, so a watch on a plain D3D9 device is refused
-with "DX9 watches need D3D9Ex: run the game with a RenoDX proxy mod, or turn on Force DX9Ex (boot) [...]". Force DX9Ex
+display proxy already creates the device as D3D9Ex, and so does any wrapper that creates it with `CreateDeviceEx` (for
+example dxwrapper's `D3d9to9Ex = 1`, used for Prince of Persia: The Two Thrones); the Devkit alone does not, so a watch on a
+plain D3D9 device is refused with "DX9 watches need D3D9Ex: run the game with a RenoDX proxy mod or a wrapper that creates
+the device with CreateDeviceEx [...]". Force DX9Ex
 only works for games that start windowed or borderless: ReShade upgrades the device with `CreateDeviceEx` and no fullscreen
 display mode (`external/reshade/source/d3d9/d3d9.cpp`), which D3D9Ex rejects for exclusive fullscreen (`D3DERR_INVALIDCALL`,
 the game closes at boot; seen in Prince of Persia: The Sands of Time). A proxy mod also turns exclusive fullscreen into
