@@ -8,12 +8,16 @@ ASI Loader, 4K/widescreen fix, dxwrapper with `D3d9to9Ex = 1`, Xidi, dsoal). The
 ## What this mod is, and what it is not
 
 It gives the game a correct HDR10 output path: Game Brightness / UI Brightness, a Peak Brightness limit, user color grading,
-and highlight handling that keeps whatever range above white the game really produces. **The game does not produce much.**
-In the scenes measured (a large fire, and 15 s of play through scenes the author chose as bright: sand powers, torches, lava,
-sun, Dark Prince; which scenes were visited was not recorded) the
-scene never exceeded about 1.0 of white; only a few frames reached about 1.28 (about 260 nits at Game Brightness 203). With
-Tone Mapper None the image therefore looks like the original at Game Brightness, not like an HDR remaster. Brighter
-highlights would have to be invented (see "Possible later work"), and this mod does not do that.
+and highlight handling that keeps the range above white that the game really produces. **How much range there is depends on
+the content.** A CPU readback of the saved scene (one frame in 20, about 2 minutes of play through fire, torches, sand
+powers, lava and sun; which scene each sample came from was not recorded) found pixels above the game's white in 68 of 172
+sampled frames (1.25x encoded in 30, 2x in 16, 4x in 3; maximum 8.7x), but only in a small part of the picture (at most about
+0.7% of the pixels). Most likely they come from additive effects that stack in the float16 targets (about 6% of the draws are additive; the
+source of each peak was not attributed). The large fire plume that was measured in detail stays just below white (peak 0.985), so with Tone Mapper None that scene looks like the
+original at Game Brightness. Nothing is invented: where the game produced no range, there is none. Brighter fire would have
+to be synthesised (see "Possible later work"), and this mod does not do that.
+(Values are in the game's own sRGB-like encoding with 1.0 = game white; 2.0 encoded is about 5x linear, about 1000 nits at
+Game Brightness 203.)
 
 ## How the game renders (Devkit snapshots, gameplay)
 
@@ -50,22 +54,31 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
 4. **Tone Mapper**: Vanilla (original clip), None, **Roll-off** (default): `ExponentialRollOff` on the max channel taken in the
    swap chain encoding colour space (BT.2020 for HDR10), colour scaled so hue is kept; identity up to 0.6 × Peak, white clip
    7.5 × Game Brightness. **The 7.5 clip is copied from Warrior Within, where fire reached ~1350 nits; it is not measured in
-   this game** (and, since this game's content stays near white, it is irrelevant until something brighter is shown).
-5. **PsychoV**: not used. The game has no tone curve to match (hard clip at 8-bit targets), and its content has no range to
-   compress. RenoDRT and Neutwo were rejected in the sister mods Warrior Within and Sands of Time on the same glow chain
+   this game**, and it matters here: the scene readback reached 8.7x encoded (about 160x linear) in some frames, far above
+   the 7.5x clip. It still has to be measured (Tone Mapper None, Peak 10000, Game = UI Brightness).
+5. **PsychoV**: not used. The game has no tone curve to match (hard clip at 8-bit targets), so PsychoV's anchors have nothing to
+   match. RenoDRT and Neutwo were rejected in the sister mods Warrior Within and Sands of Time on the same glow chain
    (they compressed the fire well below Peak); not re-measured here.
 6. Settings: Tone Mapper, Peak / Game / UI Brightness, Color Grading (Exposure, Highlights, Shadows, Contrast, Saturation,
    Highlight Saturation, Blowout, Flare), Gamma Correction, Display Output options.
 
 ## Measurements
 
-- Back buffer, fire region (480x270), `devkit_watch_region`, 164 writers measured, CPU cross-check matched: no scene writer
-  ever took the region above 1.0. The fire particle draws (vs 0x4A1DBD26) peak at 0.985. Pass 1 raises the maximum to exactly
-  1.000 (the game's offset, then saturate). Pass 2 scales by the Game/UI ratio (1.184 for Game 203 / UI 140) and adds no range.
-- Texture T, whole frame, 900 frames (Game 203 = UI 203): peak before the glow B composite 0.52..1.02, after 0.37..1.28.
-- Full frame in the fire scene: 20 pixels above 1.0 (maximum channel 1.17), none above 2.
-- The blend states of the fire draws are not readable in the Devkit (DX9), so **why** the fire stays at or below white is an
-  inference: it fits ordinary alpha blending, not additive stacking as in Warrior Within and Sands of Time.
+- Fire frame, back buffer region (480x270), `devkit_watch_region`, 164 writers measured, CPU cross-check matched: no scene
+  writer took the region above 1.0. The fire particle draws (vs 0x4A1DBD26) peak at 0.985. Pass 1 raises the maximum to
+  exactly 1.000 (the game's offset, then saturate). Pass 2 scales by the Game/UI ratio and adds no range. Full frame in that
+  scene: 20 pixels above 1.0, maximum channel 1.17, none above 2.
+- Scene readback (temporary diagnostic build, not in the repository): the saved HDR scene (T just before pass 1) was copied to
+  system memory and scanned on the CPU in every 20th frame: 172 samples, 68 with a maximum above 1.0, 30 above 1.25, 17
+  above 1.5, 16 above 2, 3 above 4, largest 8.66; most pixels above 1.0 in one frame: 56,791 (0.7%). The first samples
+  (menus and loading) never exceeded 0.65.
+- Offset constant: the game's `c0` for the offset blit was read successfully in every frame and varies between 0.4408 and
+  0.5250, i.e. the offset is between -0.118 and +0.05 in encoded units (negative darkens).
+- Blend states, from a draw-time log of Direct3D 9 render states (about 1.8 million draws into the 3840 px targets): opaque
+  69%, SRCALPHA/INVSRCALPHA 23%, additive 6% (SRCALPHA/ONE 62k, ONE/ONE 41k, DESTALPHA/ONE 3k), multiplicative ZERO/SRCCOLOR
+  2% (the shadow receivers, 0xEAA1F8EA). Glow A combine 0x8B23F50B is ONE/ONE, glow B composite 0x3D277874 is
+  SRCALPHA/INVSRCALPHA. The additive draws are mainly particle vertex shaders 0x4A1DBD26, 0xBC49B90B, 0xC25ABE42, 0x670FCC7E
+  and 0x17B5C7B0. Every one of these draws targets float16 (format 113) with the mod.
 
 ## Verification performed
 
@@ -75,9 +88,10 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
 
 ## Known limitations / not tested
 
-- No real HDR range in the scenes measured (see above). Not measured: other levels, sand-power frames individually.
+- Which effects produce the range above white (sand powers, specific particles, lava) was not attributed per scene; the readback
+  samples were not labelled. The large fire plume that was measured in detail has none.
 - Not tested: main menu (distortion and colour lookup run before/inside the bridge; the distortion clamps HDR where it
-  draws, which is irrelevant while the scene has none), pause menu, videos and loading screens (frames without the offset
+  draws, which clamps range there), pause menu, videos and loading screens (frames without the offset
   blit stay at UI Brightness), Alt-Tab / Reset, other resolutions, `BlurFX=0` or `ShadowsEnabled=0` in `Hardware.ini`
   (without the glow B composite pass 2 never runs), fades and flashes (the offset c0 is applied as part of the SDR grade),
   shadows on surfaces brighter than white.
@@ -87,6 +101,6 @@ clips at the 8-bit targets. ps_1_x shaders clamp their output to [0, 1].
 
 ## Possible later work (not implemented)
 
-An optional, default-off "Fire enhancement" that makes bright, saturated effect pixels brighter than the game's white. That is
-invented luminance, not recovered HDR, and would be labelled as such in the add-on. It would need its own design and a
+An optional, default-off "Fire enhancement" for effects that stay at or below the game's white (for example the large fire plume
+measured in detail). That is invented luminance, not recovered HDR, and would be labelled as such in the add-on. It would need its own design and a
 mask so the character's white clothes, sky and UI are not lifted.
