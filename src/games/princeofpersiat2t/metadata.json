@@ -1,0 +1,17 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "princeofpersiat2t",
+  "title": "Prince of Persia: The Two Thrones",
+  "status": "experimental",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "deploy": {
+    "game_exe": "POP3TT.EXE",
+    "api": "d3d9",
+    "gog_product_id": 1207659091,
+    "architecture": [
+      "x86"
+    ]
+  }
+}
