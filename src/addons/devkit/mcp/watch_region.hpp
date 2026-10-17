@@ -784,22 +784,33 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
 
 // Signals the next value of `timeline` on `queue` and returns it; 0 means the signal failed and queued nothing. On D3D12
 // the native signal does not flush ReShade's immediate command list; on Vulkan ReShade's signal does. Never under the
-// watcher lock (it calls the driver).
+// watcher lock (it calls the driver). gpu_fence returns 0 for a failed backend signal but throws for a failed setup step
+// (native query, callback worker start); that is logged and also returns 0. gpu_fence withdraws the callback before it
+// throws, so the callback count stays right.
 [[nodiscard]] inline std::uint64_t SignalTimeline(FenceTimeline* timeline, reshade::api::command_queue* queue) {
   [[maybe_unused]] const bool already_signalling = timeline->signalling.exchange(true, std::memory_order_acq_rel);
   assert(!already_signalling);
-  const auto value = renodx::utils::gpu_fence::QueueSignal(
-      queue,
-      timeline->fence.get(),
-      [completion = timeline->completion]() {
-        {
-          std::unique_lock completion_lock(completion->mutex);
-          ++completion->completed;
-        }
-        completion->condition.notify_all();
-      });
-  timeline->signalling.store(false, std::memory_order_release);
-  return value;
+  struct SignallingReset {
+    std::atomic<bool>* signalling;
+    ~SignallingReset() { signalling->store(false, std::memory_order_release); }
+  } signalling_reset{.signalling = &timeline->signalling};
+  try {
+    return renodx::utils::gpu_fence::QueueSignal(
+        queue,
+        timeline->fence.get(),
+        [completion = timeline->completion]() {
+          {
+            std::unique_lock completion_lock(completion->mutex);
+            ++completion->completed;
+          }
+          completion->condition.notify_all();
+        });
+  } catch (const std::exception& exception) {
+    reshade::log::message(
+        reshade::log::level::error,
+        std::format("devkit::watch_region(fence signal threw: {})", exception.what()).c_str());
+    return 0u;
+  }
 }
 
 [[nodiscard]] inline std::uint64_t GetCompletedValue(const FenceTimeline& timeline) {
