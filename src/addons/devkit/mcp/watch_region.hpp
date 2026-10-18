@@ -4115,6 +4115,15 @@ inline void ProcessAtFrameEnd(
       // GL_RGB8 texture is reported as x8 too, but cannot be copied into an RGBA8 atlas and stays refused.
       scratch_format = reshade::api::format::r8g8b8a8_unorm;
     }
+    // OpenGL keeps every colour as logical RGBA whatever the window's pixel format says: a BGRA label (the default
+    // framebuffer's, from the pixel format descriptor) makes the CPU readback of `verify` decode red and blue swapped.
+    if (device_api == reshade::api::device_api::opengl) {
+      if (scratch_format == reshade::api::format::b8g8r8a8_unorm) {
+        scratch_format = reshade::api::format::r8g8b8a8_unorm;
+      } else if (scratch_format == reshade::api::format::b8g8r8a8_unorm_srgb) {
+        scratch_format = reshade::api::format::r8g8b8a8_unorm_srgb;
+      }
+    }
     switch (scratch_format) {
       case reshade::api::format::r8g8b8a8_unorm:
       case reshade::api::format::r8g8b8a8_unorm_srgb:
