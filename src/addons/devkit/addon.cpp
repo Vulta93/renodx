@@ -9628,6 +9628,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
+      renodx::utils::cross_addon::low_priority_handler = true;
 
       // while (IsDebuggerPresent() == 0) Sleep(100);
 
