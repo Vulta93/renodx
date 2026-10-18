@@ -391,7 +391,12 @@ into its cell of a grid atlas, and one compute dispatch at the end of the frame 
   `map_texture_region` on OpenGL is a synchronous `glGetTexImage`, so it is only called once the sync object passed.
 - The watch's GL objects are deleted only while the session's own context is current; otherwise (some games delete the context
   before ReShade destroys the runtime, or a helper context is current) they are leaked and left to the context teardown.
-- A change of the presenting context during the watch fails it.
+- A change of the presenting context during the watch fails it. A resize or window-mode switch that makes the game recreate its
+  GL device (Wolfenstein does on a window change) fails a running watch with "The swap chain the watch measured on was reset or
+  destroyed"; a new watch on the recreated back buffer works.
+- With the Devkit's Device Proxy active the game renders into RenoDX's RGBA16F clone, not into the real back buffer: watch the
+  back buffer with `preferClone: true`. Without it the real back buffer reports no writers (its end-of-frame numbers are still
+  right). While the proxy's New Window has focus the game pauses, so its scene passes do not run.
 
 **D3D12 and Vulkan** never change the game's pipeline, root signature, descriptor heap, descriptor set or push constant
 bindings. At a measurement point inside a game command list, the region is only copied into a pooled scratch texture: the
