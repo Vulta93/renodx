@@ -7,11 +7,12 @@
 
 #include <Windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <type_traits>
 
 #include <include/reshade.hpp>
@@ -68,6 +69,8 @@ constexpr unsigned int READ_ONLY = 0x88B8u;
 constexpr unsigned int NUM_EXTENSIONS = 0x821Du;
 constexpr unsigned int EXTENSIONS = 0x1F03u;
 constexpr unsigned int ALPHA_TEST = 0x0BC0u;
+constexpr unsigned int CONTEXT_PROFILE_MASK = 0x9126u;
+constexpr unsigned int CONTEXT_CORE_PROFILE_BIT = 0x00000001u;
 constexpr unsigned int ALL_BARRIER_BITS = 0xFFFFFFFFu;
 constexpr unsigned int SYNC_GPU_COMMANDS_COMPLETE = 0x9117u;
 constexpr unsigned int SYNC_FLUSH_COMMANDS_BIT = 0x00000001u;
@@ -100,12 +103,12 @@ struct OpenGLFunctions {
 // The entry points, or null when the process has no complete OpenGL 4.3 set. Loading needs a current context, so a
 // failure is not cached; the pointers themselves are valid on any context of the process.
 [[nodiscard]] inline const OpenGLFunctions* GetOpenGLFunctions() {
-  static std::shared_mutex mutex;
+  // The hooks call this on every draw while a watch runs, so the loaded table is published through an atomic pointer.
+  static std::atomic<const OpenGLFunctions*> published = nullptr;
+  if (const auto* ready = published.load(std::memory_order_acquire); ready != nullptr) return ready;
+
+  static std::mutex mutex;
   static std::optional<OpenGLFunctions> functions;
-  {
-    std::shared_lock lock(mutex);
-    if (functions.has_value()) return &functions.value();
-  }
   std::unique_lock lock(mutex);
   if (functions.has_value()) return &functions.value();
 
@@ -116,9 +119,11 @@ struct OpenGLFunctions {
 
   // OpenGL 1.1 entry points are opengl32 exports; the rest come from the driver through wglGetProcAddress.
   const auto load = [&](auto* function, const char* name, bool exported) {
-    std::uintptr_t address = reinterpret_cast<std::uintptr_t>(get_proc_address(name));
+    std::uintptr_t address = 0u;
     if (exported) {
       address = reinterpret_cast<std::uintptr_t>(GetProcAddress(module, name));
+    } else {
+      address = reinterpret_cast<std::uintptr_t>(get_proc_address(name));
     }
     const auto is_valid = (address > 3u && address != (std::numeric_limits<std::uintptr_t>::max)());
     *function = (is_valid ? reinterpret_cast<std::remove_reference_t<decltype(*function)>>(address) : nullptr);
@@ -145,6 +150,7 @@ struct OpenGLFunctions {
   if (!complete) return nullptr;
 
   functions = loaded;
+  published.store(&functions.value(), std::memory_order_release);
   return &functions.value();
 }
 

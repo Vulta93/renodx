@@ -663,8 +663,8 @@ struct Watcher {
   // Set while a session is installed, also after the watched texture was destroyed (the gate above is 0 then): its
   // D3D12 scratch textures still need their submissions recorded.
   std::atomic<bool> has_session = false;
-  // OpenGL: the context of the running watch (null for other APIs), so that hooks on other contexts return before taking
-  // the lock. Stored before `watched_resource_handle`.
+  // OpenGL: the context of the latest watch started (null for other APIs), so that hooks on other contexts return before
+  // taking the lock. Stored before `watched_resource_handle` and only read behind a non-zero one, so it is not cleared.
   std::atomic<void*> opengl_context = nullptr;
   // Shared with hooks that record a region copy after releasing the lock, so the session outlives them.
   std::shared_ptr<Session> session;
@@ -1885,6 +1885,7 @@ inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_li
   if (watcher->watched_resource_handle.load(std::memory_order_acquire) == 0u) return;
   const auto explicit_api = (cmd_list != nullptr && internal::IsExplicitApi(cmd_list->get_device()->get_api()));
   if (cmd_list != nullptr && !explicit_api && !internal::IsImmediateCommandList(cmd_list)) return;
+  if (internal::IsOtherOpenGLContext(*watcher)) return;
 
   WatcherLock lock(watcher, "OnResourceWrite");
   auto* session = watcher->session.get();
@@ -3504,7 +3505,7 @@ inline void ProcessAtFrameEnd(
         }
 
         // The UAV clear is an assert stub on ReShade's OpenGL backend: the rows of the used slots are zeroed with an upload.
-        static thread_local std::vector<std::uint32_t> zero_stats(static_cast<std::size_t>(STATS_STRIDE) * MAX_SLOTS, 0u);
+        static std::vector<std::uint32_t> zero_stats(static_cast<std::size_t>(STATS_STRIDE) * MAX_SLOTS, 0u);
         const auto used_rows = reshade::api::subresource_box{
             .left = 0u,
             .top = 0u,
@@ -3608,8 +3609,10 @@ inline void ProcessAtFrameEnd(
           frame.fence_value = 0u;
           if (session->device_api == reshade::api::device_api::d3d9 || session->device_api == reshade::api::device_api::opengl) {
             // gpu_fence's D3DKMT signal needs the device's command buffer flushed first, or it can land before the
-            // reductions and the stats copy. The OpenGL sync object is created after the same flush.
-            queue->flush_immediate_command_list();
+            // reductions and the stats copy. The OpenGL sync object flushes after it is created (SignalTimeline).
+            if (session->device_api == reshade::api::device_api::d3d9) {
+              queue->flush_immediate_command_list();
+            }
             frame.fence_value = internal::SignalTimeline(session->stats_timeline.get(), queue);
             if (frame.fence_value == 0u) {
               unlocked_failure = "The stats readback fence could not be signalled.";
@@ -4248,8 +4251,12 @@ inline void ProcessAtFrameEnd(
       for (std::uint32_t axis = 0u; axis < max_group_counts.size(); ++axis) {
         functions->get_integeri_v(gl_enum::MAX_COMPUTE_WORK_GROUP_COUNT, axis, &max_group_counts[axis]);
       }
-      // ReShade calls a context a compatibility context when it lists GL_ARB_compatibility, and only then does its
-      // bind_pipeline disable the alpha test: the same test decides whether the watch restores it.
+      // ReShade's bind_pipeline disables the alpha test on what it calls a compatibility context: one that lists
+      // GL_ARB_compatibility, or that the game created with wglCreateContext (the extension is not always listed for those).
+      // Both are covered by "not a core profile", and the same test decides whether the watch restores the alpha test.
+      int profile_mask = 0;
+      functions->get_integerv(gl_enum::CONTEXT_PROFILE_MASK, &profile_mask);
+      opengl_setup.compatibility_context = (static_cast<unsigned int>(profile_mask) & gl_enum::CONTEXT_CORE_PROFILE_BIT) == 0u;
       int extension_count = 0;
       functions->get_integerv(gl_enum::NUM_EXTENSIONS, &extension_count);
       for (int index = 0; index < extension_count && !opengl_setup.compatibility_context; ++index) {

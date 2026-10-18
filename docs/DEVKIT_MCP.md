@@ -375,7 +375,7 @@ into its cell of a grid atlas, and one compute dispatch at the end of the frame 
   depth/stencil and three-channel formats (`GL_RGB8`, `GL_RGB16F`, `GL_RGB32F` have no image format), and draws into
   `glTextureView` views of the watched texture are not seen.
 - The frame-end pass changes four things in the game's GL state and restores them: the current program, `GL_ALPHA_TEST`
-  (contexts that list `GL_ARB_compatibility`, ReShade's own test; its `bind_pipeline` disables it), and the two highest image
+  (contexts that are not core profile, which covers ReShade's own test: `GL_ARB_compatibility` listed, or created with `wglCreateContext`; its `bind_pipeline` disables it), and the two highest image
   units (read and written by the pass; a unit that was empty is not rebound, because ReShade's hook of `glBindImageTexture`
   would raise a GL error for texture 0 on 4.5 contexts, and our textures unbind themselves when they are deleted at the
   end of the watch). The stats clear is an upload of the used rows (ReShade's OpenGL UAV clear is a stub; its texture binding is restored by ReShade). The
