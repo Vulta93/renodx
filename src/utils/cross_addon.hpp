@@ -25,6 +25,10 @@
 
 namespace renodx::utils::cross_addon {
 
+// Set before any utils::*::Use in this binary (it is per binary, not process-wide): this module then never wins the handler
+// election against a normal module (e.g. the Devkit next to a game mod), whatever the registration order or load addresses.
+inline bool low_priority_handler = false;
+
 template <typename T>
 using allocator = platform::ProcessAllocator<T>;
 
@@ -83,6 +87,8 @@ template <typename T>
 inline constexpr bool ALWAYS_FALSE = false;
 
 using ModuleToken = const void*;
+
+inline constexpr uint64_t LOW_PRIORITY_SEQUENCE_BIT = 1ull << 62;
 
 inline ModuleToken GetModuleToken() {
   static const uint8_t TOKEN = 0u;
@@ -211,6 +217,9 @@ inline ModuleRecord* CreateModule(ControlBlock<Data>& control, ModuleToken token
 
   module->token = token;
   module->sequence = control.next_sequence++;
+  if (low_priority_handler) {
+    module->sequence |= LOW_PRIORITY_SEQUENCE_BIT;
+  }
   module->next = control.modules;
   control.modules = module;
   return module;
