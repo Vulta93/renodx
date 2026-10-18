@@ -10,6 +10,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cctype>
@@ -46,6 +47,7 @@
 #include "../../utils/data.hpp"
 #include "../../utils/date.hpp"
 #include "../../utils/descriptor.hpp"
+#include "../../utils/detour.hpp"
 #include "../../utils/device.hpp"
 #include "../../utils/device_proxy.hpp"
 #include "../../utils/device_upgrade.hpp"
@@ -2327,6 +2329,26 @@ void PumpDeviceProxyOutputWindowMessages() {
   return ResolveRequiredDeviceProxyHwndRoute(data);
 }
 
+// With the Device Proxy presenting into the game's own window, ReShade still calls the system wglSwapBuffers after its
+// present event, and that GL present would cover the proxy output. Dropping only the call that targets the proxy's window
+// leaves the proxy's present intact. Installed lazily, and only when ReShade is loaded as opengl32.dll: other ReShade hook
+// styles patch the same export, and the detour would then sit above ReShade's present event.
+using WglSwapBuffersFunction = BOOL(WINAPI*)(HDC);
+WglSwapBuffersFunction original_wgl_swap_buffers = nullptr;
+std::atomic_bool wgl_swap_buffers_detour_attempted = false;
+
+BOOL WINAPI OnWglSwapBuffers(HDC hdc) {
+  if (renodx::utils::device_proxy::proxy_swap_chain != nullptr
+      && reinterpret_cast<uintptr_t>(WindowFromDC(hdc)) == renodx::utils::device_proxy::proxy_swapchain_last_hwnd.load()) {
+    return TRUE;
+  }
+  return original_wgl_swap_buffers(hdc);
+}
+
+std::vector<renodx::utils::detour::Export> wgl_swap_buffers_detours = {
+    {"wglSwapBuffers", &original_wgl_swap_buffers, &OnWglSwapBuffers},
+};
+
 [[nodiscard]] bool PrepareDeviceProxyActivation(DeviceData* data) {
   const auto route = ResolveRequiredDeviceProxyHwndRoute(data);
   renodx::utils::device_proxy::SetSameHwndNonFlipBootstrap(route == DeviceProxyHwndRoute::SAME_HWND);
@@ -2344,6 +2366,21 @@ void PumpDeviceProxyOutputWindowMessages() {
   } else {
     DestroyDeviceProxyOutputWindow();
     renodx::utils::device_proxy::local_proxy_swapchain_hwnd_override = 0u;
+
+    if (data != nullptr && data->device != nullptr && data->device->get_api() == reshade::api::device_api::opengl
+        && !wgl_swap_buffers_detour_attempted.exchange(true)) {
+      std::array<wchar_t, MAX_PATH> reshade_path = {};
+      GetModuleFileNameW(reshade::internal::get_reshade_module_handle(), reshade_path.data(), static_cast<DWORD>(reshade_path.size()));
+      std::array<wchar_t, MAX_PATH> system_directory = {};
+      GetSystemDirectoryW(system_directory.data(), static_cast<UINT>(system_directory.size()));
+      HMODULE system_opengl = GetModuleHandleW((std::wstring(system_directory.data()) + L"\\opengl32.dll").c_str());
+      if (_wcsicmp(std::filesystem::path(reshade_path.data()).filename().c_str(), L"opengl32.dll") != 0 || system_opengl == nullptr
+          || !renodx::utils::detour::Install(system_opengl, wgl_swap_buffers_detours).Complete()) {
+        reshade::log::message(
+            reshade::log::level::warning,
+            "devkit: wglSwapBuffers detour not installed (ReShade is not opengl32.dll or the hook failed), the game keeps presenting its GL frame");
+      }
+    }
   }
 
   g_device_proxy_active_hwnd_route = route;
@@ -9664,6 +9701,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
     case DLL_PROCESS_DETACH:
       devkit_mcp_server_session::Stop(devkit_mcp_session);
+      if (original_wgl_swap_buffers != nullptr) {
+        // Never let an exception leave DllMain.
+        try {
+          renodx::utils::detour::Uninstall(wgl_swap_buffers_detours);
+        } catch (const std::exception&) {
+          reshade::log::message(reshade::log::level::warning, "devkit: wglSwapBuffers detour removal failed");
+        }
+      }
 
       renodx::utils::trace::Use(fdw_reason);
       renodx::utils::constants::Use(fdw_reason);
