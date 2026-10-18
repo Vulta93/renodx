@@ -4767,8 +4767,9 @@ bool OnCopyTextureRegion(
   return false;
 }
 
-// OpenGL texture uploads from a bound pixel unpack buffer (glTexSubImage* with a buffer bound). Other APIs do not report
-// buffer-to-texture copies the watch could order, so only OpenGL is forwarded.
+// OpenGL texture uploads from a bound pixel unpack buffer (glTexSubImage* with a buffer bound), reported as updates like the
+// same upload without a buffer. Only OpenGL is forwarded: D3D12 and Vulkan buffer-to-texture copies are not measured by the
+// watch (the snapshot draw list does not record them either).
 bool OnCopyBufferToTexture(
     reshade::api::command_list* cmd_list,
     reshade::api::resource source,
@@ -4779,7 +4780,7 @@ bool OnCopyBufferToTexture(
     uint32_t dest_subresource,
     const reshade::api::subresource_box* dest_box) {
   if (cmd_list->get_device()->get_api() == reshade::api::device_api::opengl) {
-    NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::COPY, {.resource = dest, .subresource = dest_subresource});
+    NotifyWatchRegionWrite(cmd_list, devkit_watch_region::WriterKind::UPDATE, {.resource = dest, .subresource = dest_subresource});
   }
   return false;
 }

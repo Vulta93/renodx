@@ -355,29 +355,36 @@ into its cell of a grid atlas, and one compute dispatch at the end of the frame 
 `r32ui` stats words, so decoding, comparison and `verify` are shared). Details that matter:
 
 - Only the context that presents the swap chain is measured; events on other contexts (loader threads, helper windows) are
-  ignored, device-level updates included.
+  ignored before the watcher lock is taken, device-level updates included.
 - Writers are found by asking GL, not from ReShade's events (it raises none for `glDrawBuffers` or DSA attachment changes):
-  at every draw the draw framebuffer and its enabled draw buffers (for framebuffer 0 only `GL_BACK*`/`GL_LEFT`/`GL_RIGHT`/
-  `GL_FRONT_AND_BACK` count), at every dispatch the image units written. That is about 10-25 GL queries per draw while a
-  watch runs (none otherwise); with a threaded driver they can cost real frame time, and draws outside `shaderHash` with no
-  event open are skipped before the queries. Copies, blits, clears, resolves, `glTexSubImage*` (also from a pixel unpack
-  buffer) and `glCopyTexSubImage*` arrive as ReShade events. `glGenerateMipmap` (levels above 0) is not seen.
+  at every draw the draw framebuffer and its enabled draw buffers (for framebuffer 0 only `GL_DRAW_BUFFER0` is read, and only
+  `GL_BACK*`/`GL_LEFT`/`GL_RIGHT`/`GL_FRONT_AND_BACK` count), at every dispatch the image units written. That is about 10-25
+  GL queries per draw while a watch runs (none otherwise); with a threaded driver they can cost real frame time, and draws
+  outside `shaderHash` with no event open are skipped before the queries. Copies, blits, clears, resolves, `glTexSubImage*`
+  (also from a pixel unpack buffer, reported as `update`) and `glCopyTexSubImage*` arrive as ReShade events; those to another
+  mip level or array layer than the watched one are ignored. Not seen: `glGenerateMipmap` (levels above 0), image stores from
+  fragment shaders, draws into `glTextureView` views of the watched texture, and a cube map face other than face 0 (the
+  attachment query returns no face). A `glClear` of framebuffer 0 counts whatever its draw buffer is.
 - The region rectangle is passed unchanged to ReShade's `copy_texture_region`, exactly like `devkit_analyze_resource`, so both
   tools read the same pixels. ReShade's copy from the default framebuffer flips rows, so on the back buffer the rectangle may
   count rows from the bottom (OpenGL's origin); check with a known pixel before trusting a corner region.
 - The atlas is the non-sRGB twin of an sRGB source (`glCopyImageSubData` copies the bits and the shader applies the sRGB
   decode, like D3D11's sRGB view); the default framebuffer is measured as stored. Supported: RGBA8 (also sRGB), RGB10A2,
-  R11G11B10F, RGBA16, RGBA16F, RGBA32F colour textures, renderbuffers and the default framebuffer. Refused: multisampled,
+  R11G11B10F, RGBA16, RGBA16F, RGBA32F colour textures, renderbuffers and the default framebuffer (a back buffer without
+  alpha bits, reported as an x8 format, is watched as RGBA8). Refused: multisampled,
   depth/stencil and three-channel formats (`GL_RGB8`, `GL_RGB16F`, `GL_RGB32F` have no image format), and draws into
   `glTextureView` views of the watched texture are not seen.
 - The frame-end pass changes four things in the game's GL state and restores them: the current program, `GL_ALPHA_TEST`
-  (compatibility contexts; ReShade's `bind_pipeline` disables it), and the two highest image units (read and written by the
-  pass). The stats clear is an upload (ReShade's OpenGL UAV clear is a stub; its texture binding is restored by ReShade). The
+  (contexts that list `GL_ARB_compatibility`, ReShade's own test; its `bind_pipeline` disables it), and the two highest image
+  units (read and written by the pass; a unit that was empty is not rebound, because ReShade's hook of `glBindImageTexture`
+  would raise a GL error for texture 0 on 4.5 contexts, and our textures unbind themselves when they are deleted at the
+  end of the watch). The stats clear is an upload of the used rows (ReShade's OpenGL UAV clear is a stub; its texture binding is restored by ReShade). The
   default framebuffer's read buffer, which ReShade's blit sets to `GL_BACK`, is put back when the game's differed. Pending GL
   errors are drained once at the start of the watch, before the first copy and before the first reduction, so that errors
   after them are the watch's own; the game's `glGetError` does not see those. A mid-frame default-framebuffer copy goes through
   `glBlitFramebuffer`, which an active conditional render can skip (stale slot).
-- The readback fence is a GL sync object per frame, created after `glFlush` on the presenting context and polled there (no
+- The readback fence is a GL sync object per frame, created on the presenting context and followed by ReShade's own flush (the
+  exported `glFlush` would raise `execute_command_list` to every add-on), polled there (no
   worker thread or second context; `gpu_fence::OpenGLFence` joins a thread that must be retired outside ReShade's WGL locks).
   `map_texture_region` on OpenGL is a synchronous `glGetTexImage`, so it is only called once the sync object passed.
 - The watch's GL objects are deleted only while the session's own context is current; otherwise (some games delete the context

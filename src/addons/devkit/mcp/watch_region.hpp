@@ -663,6 +663,9 @@ struct Watcher {
   // Set while a session is installed, also after the watched texture was destroyed (the gate above is 0 then): its
   // D3D12 scratch textures still need their submissions recorded.
   std::atomic<bool> has_session = false;
+  // OpenGL: the context of the running watch (null for other APIs), so that hooks on other contexts return before taking
+  // the lock. Stored before `watched_resource_handle`.
+  std::atomic<void*> opengl_context = nullptr;
   // Shared with hooks that record a region copy after releasing the lock, so the session outlives them.
   std::shared_ptr<Session> session;
   std::deque<std::shared_ptr<Request>> pending_requests;
@@ -818,16 +821,17 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
     ~SignallingReset() { signalling->store(false, std::memory_order_release); }
   } signalling_reset{.signalling = &timeline->signalling};
   if (timeline->opengl != nullptr) {
-    // The flush starts the GPU on the frame's commands; the sync object then completes behind all of them.
+    // The sync object completes behind every command of the frame; the flush after it starts the GPU on them. It is
+    // ReShade's own (unhooked) glFlush: the exported one raises execute_command_list to every add-on.
     auto& opengl_timeline = *timeline->opengl;
     if (opengl_timeline.functions->get_current_context() != opengl_timeline.context) {
       reshade::log::message(reshade::log::level::error, "devkit::watch_region(fence signal failed: the OpenGL context is not the one the fence belongs to)");
       return 0u;
     }
-    opengl_timeline.functions->flush();
     auto* const sync = opengl_timeline.functions->fence_sync(gl_enum::SYNC_GPU_COMMANDS_COMPLETE, 0u);
     if (sync == nullptr) return 0u;
     opengl_timeline.pending.push_back(OpenGLSyncTimeline::PendingSync{.value = ++opengl_timeline.last_signalled, .sync = sync});
+    queue->flush_immediate_command_list();
     return opengl_timeline.last_signalled;
   }
   try {
@@ -850,9 +854,9 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
 }
 
 // OpenGL: polls the sync objects in order on the current context and publishes the ones that completed.
-[[nodiscard]] inline std::uint64_t GetCompletedValue(const FenceTimeline& timeline) {
-  if (timeline.opengl != nullptr) {
-    auto& opengl_timeline = *timeline.opengl;
+[[nodiscard]] inline std::uint64_t GetCompletedValue(FenceTimeline* timeline) {
+  if (timeline->opengl != nullptr) {
+    auto& opengl_timeline = *timeline->opengl;
     if (opengl_timeline.functions->get_current_context() == opengl_timeline.context) {
       while (!opengl_timeline.pending.empty()) {
         const auto [value, sync] = opengl_timeline.pending.front();
@@ -860,21 +864,21 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
         if (status != gl_enum::ALREADY_SIGNALED && status != gl_enum::CONDITION_SATISFIED) break;
         opengl_timeline.functions->delete_sync(sync);
         opengl_timeline.pending.pop_front();
-        std::unique_lock completion_lock(timeline.completion->mutex);
-        timeline.completion->completed = value;
+        std::unique_lock completion_lock(timeline->completion->mutex);
+        timeline->completion->completed = value;
       }
     }
   }
-  std::shared_lock completion_lock(timeline.completion->mutex);
-  return timeline.completion->completed;
+  std::shared_lock completion_lock(timeline->completion->mutex);
+  return timeline->completion->completed;
 }
 
 // Waits up to LIFETIME_FENCE_WAIT_TIMEOUT until the GPU passed `value` on `timeline`. Never under the watcher lock.
 // OpenGL: waits on the oldest sync object (flushing the context's commands) until `value` completed; false at once when the
 // current context is not the fence's.
-[[nodiscard]] inline bool WaitTimeline(const FenceTimeline& timeline, std::uint64_t value) {
-  if (timeline.opengl != nullptr) {
-    auto& opengl_timeline = *timeline.opengl;
+[[nodiscard]] inline bool WaitTimeline(FenceTimeline* timeline, std::uint64_t value) {
+  if (timeline->opengl != nullptr) {
+    auto& opengl_timeline = *timeline->opengl;
     if (opengl_timeline.functions->get_current_context() != opengl_timeline.context) return false;
     const auto deadline = std::chrono::steady_clock::now() + LIFETIME_FENCE_WAIT_TIMEOUT;
     while (GetCompletedValue(timeline) < value) {
@@ -888,7 +892,7 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
     }
     return true;
   }
-  auto& completion = *timeline.completion;
+  auto& completion = *timeline->completion;
   std::unique_lock completion_lock(completion.mutex);
   return completion.condition.wait_for(completion_lock, LIFETIME_FENCE_WAIT_TIMEOUT, [&completion, value]() {
     return completion.completed >= value;
@@ -952,6 +956,15 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
       break;
   }
   return D3D9Pointer<IDirect3DSurface9>(surface);
+}
+
+// OpenGL: whether the calling thread's context is not the one the running watch belongs to (always false for other APIs).
+// Lock-free: loader threads and helper contexts must not take the watcher lock on every draw and upload.
+[[nodiscard]] inline bool IsOtherOpenGLContext(const Watcher& watcher) {
+  const auto context = watcher.opengl_context.load(std::memory_order_acquire);
+  if (context == nullptr) return false;
+  const auto* functions = GetOpenGLFunctions();
+  return functions == nullptr || functions->get_current_context() != context;
 }
 
 [[nodiscard]] inline bool IsExplicitApi(reshade::api::device_api api) {
@@ -1414,8 +1427,7 @@ inline void SignalPendingStatsFrame(Session* session, reshade::api::command_queu
     const auto& functions = *opengl.functions;
     if (!opengl.first_copy_checked) {
       // Errors the game left pending are drained once, so that an error after the first copy is the copy's own.
-      for (std::uint32_t drained = 0u; drained < 16u && functions.get_error() != 0u; ++drained) {
-      }
+      DrainOpenGLErrors(functions);
     }
     const auto slot = session->slots_used++;
     const auto cell_left = (slot % opengl.atlas_columns) * session->width;
@@ -1429,24 +1441,19 @@ inline void SignalPendingStatsFrame(Session* session, reshade::api::command_queu
         .back = 1u,
     };
     cmd_list->copy_texture_region(session->watched_resource, session->subresource, &session->region, session->scratch, 0u, &cell);
+    unsigned int copy_error = 0u;
     if (!opengl.first_copy_checked) {
       opengl.first_copy_checked = true;
-      const auto error = functions.get_error();
-      if (error != 0u) {
-        session->failure = std::format(
-            "ReShade cannot copy the watched {} texture into the measurement atlas (OpenGL error 0x{:04X}): this source is"
-            " not supported on OpenGL.",
-            session->resource_format_name,
-            error);
-        return std::nullopt;
-      }
+      copy_error = functions.get_error();
     }
-    if (opengl.watches_default_framebuffer && opengl.default_read_buffer != static_cast<int>(gl_enum::BACK)) {
-      int read_framebuffer = 0;
-      functions.get_integerv(gl_enum::READ_FRAMEBUFFER_BINDING, &read_framebuffer);
-      functions.bind_framebuffer(gl_enum::READ_FRAMEBUFFER, 0u);
-      functions.read_buffer(static_cast<unsigned int>(opengl.default_read_buffer));
-      functions.bind_framebuffer(gl_enum::READ_FRAMEBUFFER, static_cast<unsigned int>(read_framebuffer));
+    RestoreDefaultReadBuffer(opengl);
+    if (copy_error != 0u) {
+      session->failure = std::format(
+          "ReShade cannot copy the watched {} texture into the measurement atlas (OpenGL error 0x{:04X}): this source is"
+          " not supported on OpenGL.",
+          session->resource_format_name,
+          copy_error);
+      return std::nullopt;
     }
     return slot;
   }
@@ -1613,6 +1620,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
   const auto device_api = cmd_list->get_device()->get_api();
   const auto explicit_api = internal::IsExplicitApi(device_api);
   if (!explicit_api && !internal::IsImmediateCommandList(cmd_list)) return;
+  if (internal::IsOtherOpenGLContext(*watcher)) return;
 
   WatcherLock lock(watcher, "OnDrawOrDispatch");
   auto* session = watcher->session.get();
@@ -1777,7 +1785,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
     // ReShade raises no event for glDrawBuffers or DSA attachment changes, so utils::state would miss writers: GL itself
     // says what the draw framebuffer and the image units are. Each query can synchronise with a threaded driver, so draws
     // that could not be measured anyway (outside the shader filter, no event open) are skipped first.
-    if (!internal::MatchesFilter(*session, make_writer()) && !session->open_event.has_value()) return;
+    if (session->shader_hash.has_value() && !session->open_event.has_value() && !internal::MatchesFilter(*session, make_writer())) return;
 
     const auto& opengl = session->opengl;
     const auto& functions = *opengl.functions;
@@ -1812,10 +1820,18 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
         // Only the back buffers count: a draw into the front buffer does not change the watched image.
         int draw_buffer = 0;
         functions.get_integerv(gl_enum::DRAW_BUFFER0, &draw_buffer);
-        const auto draws_to_back_buffer = draw_buffer == static_cast<int>(gl_enum::BACK) || draw_buffer == static_cast<int>(gl_enum::BACK_LEFT)
-                                          || draw_buffer == static_cast<int>(gl_enum::BACK_RIGHT) || draw_buffer == static_cast<int>(gl_enum::LEFT)
-                                          || draw_buffer == static_cast<int>(gl_enum::RIGHT) || draw_buffer == static_cast<int>(gl_enum::FRONT_AND_BACK);
-        writes_watched_resource = opengl.watches_default_framebuffer && draws_to_back_buffer;
+        switch (static_cast<unsigned int>(draw_buffer)) {
+          case gl_enum::BACK:
+          case gl_enum::BACK_LEFT:
+          case gl_enum::BACK_RIGHT:
+          case gl_enum::LEFT:
+          case gl_enum::RIGHT:
+          case gl_enum::FRONT_AND_BACK:
+            writes_watched_resource = opengl.watches_default_framebuffer;
+            break;
+          default:
+            break;
+        }
       } else {
         for (std::uint32_t index = 0u; index < opengl.max_draw_buffers && !writes_watched_resource; ++index) {
           int draw_buffer = 0;
@@ -1920,6 +1936,9 @@ inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_li
   const auto written_resource = (target.view.handle != 0u ? recording_cmd_list->get_device()->get_resource_from_view(target.view) : target.resource);
   if (written_resource.handle != session->watched_resource.handle
       && written_resource.handle != session->original_resource.handle) return;
+  // OpenGL uploads and copies to other mip levels or layers of the watched texture are common and do not change the region.
+  if (session->device_api == reshade::api::device_api::opengl && target.view.handle == 0u && target.subresource.has_value()
+      && target.subresource.value() != session->subresource) return;
 
   // A filter by shader hash never matches a non-shader writer; it is still measured when it closes an open event.
   internal::RecordImmediateWriter(session, recording_cmd_list, WriterInfo{.kind = kind, .command_index = command_index}, !session->shader_hash.has_value());
@@ -2330,7 +2349,7 @@ inline void ProcessLifetimes(Watcher* watcher, reshade::api::device* device, boo
     // Each timeline's progress is behind its leaf mutex (FenceCompletion): no driver call under the watcher lock.
     std::unordered_map<std::uint64_t, std::uint64_t> completed_values;
     for (const auto& [queue_handle, queue_fence] : watcher->queue_fences) {
-      completed_values[queue_handle] = internal::GetCompletedValue(*queue_fence.timeline);
+      completed_values[queue_handle] = internal::GetCompletedValue(queue_fence.timeline.get());
     }
     watcher->completed_fence_values = completed_values;
 
@@ -2469,7 +2488,7 @@ inline void WaitForAttachedFenceValues(Watcher* watcher, reshade::api::device* d
   }
   bool all_reached = true;
   for (const auto& [timeline, value] : waits) {
-    if (!internal::WaitTimeline(*timeline, value)) {
+    if (!internal::WaitTimeline(timeline.get(), value)) {
       all_reached = false;
     }
   }
@@ -2540,7 +2559,7 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
     bool gpu_finished = false;
     if (orphaned_session->stats_timeline != nullptr) {
       const auto value = internal::SignalTimeline(orphaned_session->stats_timeline.get(), queue);
-      gpu_finished = (value != 0u && internal::WaitTimeline(*orphaned_session->stats_timeline, value));
+      gpu_finished = (value != 0u && internal::WaitTimeline(orphaned_session->stats_timeline.get(), value));
     }
     if (gpu_finished) {
       for (const auto texture : orphaned_textures) {
@@ -2566,7 +2585,7 @@ inline void OnCommandQueueDestroyed(Watcher* watcher, reshade::api::command_queu
   bool waited = false;
   if (!signal_in_flight_timed_out) {
     const auto value = internal::SignalTimeline(timeline.get(), queue);
-    waited = (value != 0u && internal::WaitTimeline(*timeline, value));
+    waited = (value != 0u && internal::WaitTimeline(timeline.get(), value));
   }
   if (!waited) {
     if (has_submissions) {
@@ -2910,11 +2929,11 @@ inline void ProcessAtFrameEnd(
             return false;
           }
           const auto fence_value = session->in_flight.front().fence_value;
-          if (internal::GetCompletedValue(*session->stats_timeline) < fence_value) {
+          if (internal::GetCompletedValue(session->stats_timeline.get()) < fence_value) {
             if (!wait) return false;
             // Bounded, so a GPU that never reaches the value (hang without a device removal) fails the watch instead of
             // blocking present forever.
-            if (!internal::WaitTimeline(*session->stats_timeline, fence_value)) {
+            if (!internal::WaitTimeline(session->stats_timeline.get(), fence_value)) {
               unlocked_failure = "The GPU did not finish the region statistics within the wait timeout.";
               return false;
             }
@@ -3171,6 +3190,7 @@ inline void ProcessAtFrameEnd(
                   reshade::api::resource_usage::copy_dest,
                   &session->verify_readback)) {
             cmd_list->copy_texture_region(session->watched_resource, session->subresource, &session->region, session->verify_readback, 0u, nullptr);
+            RestoreDefaultReadBuffer(session->opengl);
             session->verify_point = session->points_base + session->points.size() - 1u;
             session->verify_copied = true;
           }
@@ -3458,7 +3478,7 @@ inline void ProcessAtFrameEnd(
 
         int game_program = 0;
         functions.get_integerv(gl_enum::CURRENT_PROGRAM, &game_program);
-        const auto game_alpha_test = (opengl.compatibility_profile && functions.is_enabled(gl_enum::ALPHA_TEST) != 0u);
+        const auto game_alpha_test = (opengl.compatibility_context && functions.is_enabled(gl_enum::ALPHA_TEST) != 0u);
         struct GameImageUnit {
           int name = 0;
           int level = 0;
@@ -3480,21 +3500,28 @@ inline void ProcessAtFrameEnd(
         }
 
         if (!opengl.first_reduction_checked) {
-          for (std::uint32_t drained = 0u; drained < 16u && functions.get_error() != 0u; ++drained) {
-          }
+          DrainOpenGLErrors(functions);
         }
 
-        // The UAV clear is an assert stub on ReShade's OpenGL backend: the stats are zeroed with an upload.
-        std::vector<std::uint32_t> zeros(static_cast<std::size_t>(STATS_STRIDE) * MAX_SLOTS, 0u);
+        // The UAV clear is an assert stub on ReShade's OpenGL backend: the rows of the used slots are zeroed with an upload.
+        static thread_local std::vector<std::uint32_t> zero_stats(static_cast<std::size_t>(STATS_STRIDE) * MAX_SLOTS, 0u);
+        const auto used_rows = reshade::api::subresource_box{
+            .left = 0u,
+            .top = 0u,
+            .front = 0u,
+            .right = STATS_STRIDE,
+            .bottom = opengl_slots_to_reduce,
+            .back = 1u,
+        };
         device->update_texture_region(
             reshade::api::subresource_data{
-                .data = zeros.data(),
+                .data = zero_stats.data(),
                 .row_pitch = STATS_STRIDE * sizeof(std::uint32_t),
                 .slice_pitch = STATS_STRIDE * MAX_SLOTS * sizeof(std::uint32_t),
             },
             session->stats_texture,
             0u,
-            nullptr);
+            &used_rows);
         functions.memory_barrier(gl_enum::ALL_BARRIER_BITS);
         cmd_list->bind_pipeline(reshade::api::pipeline_stage::all_compute, opengl.pipeline);
         cmd_list->push_descriptors(
@@ -3520,8 +3547,11 @@ inline void ProcessAtFrameEnd(
         cmd_list->dispatch((session->width + GROUP_SIZE - 1u) / GROUP_SIZE, (session->height + GROUP_SIZE - 1u) / GROUP_SIZE, opengl_slots_to_reduce);
         functions.memory_barrier(gl_enum::ALL_BARRIER_BITS);
 
-        const auto reduction_error = (opengl.first_reduction_checked ? 0u : functions.get_error());
-        opengl.first_reduction_checked = true;
+        unsigned int reduction_error = 0u;
+        if (!opengl.first_reduction_checked) {
+          opengl.first_reduction_checked = true;
+          reduction_error = functions.get_error();
+        }
 
         cmd_list->bind_pipeline(
             reshade::api::pipeline_stage::all_compute,
@@ -3531,6 +3561,9 @@ inline void ProcessAtFrameEnd(
         }
         for (std::size_t index = 0u; index < image_units.size(); ++index) {
           const auto& game_unit = game_image_units[index];
+          // An empty unit is not rebound: ReShade's hook of glBindImageTexture queries the texture target, which is a GL
+          // error for texture 0 on 4.5 contexts. Our textures unbind themselves when they are deleted at the end of the watch.
+          if (game_unit.name == 0) continue;
           functions.bind_image_texture(
               image_units[index],
               static_cast<unsigned int>(game_unit.name),
@@ -4071,7 +4104,12 @@ inline void ProcessAtFrameEnd(
       continue;
     }
 
-    const auto scratch_format = reshade::api::format_to_default_typed(resource_desc.texture.format, 0);
+    auto scratch_format = reshade::api::format_to_default_typed(resource_desc.texture.format, 0);
+    if (device_api == reshade::api::device_api::opengl
+        && (scratch_format == reshade::api::format::r8g8b8x8_unorm || scratch_format == reshade::api::format::b8g8r8x8_unorm)) {
+      // An OpenGL back buffer without alpha bits is reported as an x8 format: it is watched as RGBA8, since its copy is a blit.
+      scratch_format = reshade::api::format::r8g8b8a8_unorm;
+    }
     switch (scratch_format) {
       case reshade::api::format::r8g8b8a8_unorm:
       case reshade::api::format::r8g8b8a8_unorm_srgb:
@@ -4198,11 +4236,9 @@ inline void ProcessAtFrameEnd(
       }
 
       // Errors the game left pending would be taken for the watch's own by the checks after its first copy and reduction.
-      for (std::uint32_t drained = 0u; drained < 16u && functions->get_error() != 0u; ++drained) {
-      }
+      DrainOpenGLErrors(*functions);
       int max_image_units = 0;
       int max_draw_buffers = 0;
-      int profile_mask = 0;
       std::array<int, 3> max_group_counts = {};
       functions->get_integerv(gl_enum::MAX_TEXTURE_SIZE, &opengl_max_texture_size);
       functions->get_integerv(gl_enum::MAX_IMAGE_UNITS, &max_image_units);
@@ -4210,10 +4246,14 @@ inline void ProcessAtFrameEnd(
       for (std::uint32_t axis = 0u; axis < max_group_counts.size(); ++axis) {
         functions->get_integeri_v(gl_enum::MAX_COMPUTE_WORK_GROUP_COUNT, axis, &max_group_counts[axis]);
       }
-      // The profile mask does not exist before OpenGL 3.2: a failing query means a legacy compatibility context.
-      functions->get_integerv(gl_enum::CONTEXT_PROFILE_MASK, &profile_mask);
-      const auto profile_query_failed = (functions->get_error() != 0u);
-      opengl_setup.compatibility_profile = (profile_query_failed || (profile_mask & gl_enum::CONTEXT_COMPATIBILITY_PROFILE_BIT) != 0);
+      // ReShade calls a context a compatibility context when it lists GL_ARB_compatibility, and only then does its
+      // bind_pipeline disable the alpha test: the same test decides whether the watch restores it.
+      int extension_count = 0;
+      functions->get_integerv(gl_enum::NUM_EXTENSIONS, &extension_count);
+      for (int index = 0; index < extension_count && !opengl_setup.compatibility_context; ++index) {
+        const auto* extension = functions->get_stringi(gl_enum::EXTENSIONS, static_cast<unsigned int>(index));
+        opengl_setup.compatibility_context = (extension != nullptr && std::string_view(reinterpret_cast<const char*>(extension)) == "GL_ARB_compatibility");
+      }
 
       if (max_image_units < 2 || opengl_max_texture_size <= 0 || max_draw_buffers <= 0) {
         complete_request(request, make_error("The OpenGL context reports fewer than two image units or no usable texture size, which the region reduction needs."));
@@ -4520,6 +4560,7 @@ inline void ProcessAtFrameEnd(
     }
     watcher->session = std::move(new_session);
     watcher->has_session.store(true, std::memory_order_release);
+    watcher->opengl_context.store(watcher->session->opengl.context, std::memory_order_release);
     watcher->watched_resource_handle.store(watched_resource_handle, std::memory_order_release);
     lock.Unlock();
     reshade::log::message(reshade::log::level::info, start_message.c_str());
@@ -4617,7 +4658,7 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
         final_signal.value = value;
       }
     }
-    if (final_signal.value != 0u && !internal::WaitTimeline(*final_signal.timeline, final_signal.value)) {
+    if (final_signal.value != 0u && !internal::WaitTimeline(final_signal.timeline.get(), final_signal.value)) {
       all_reached = false;
     }
   }
@@ -4634,8 +4675,8 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
         pending_stats_value = std::max(pending_stats_value, frame.fence_value);
       }
     }
-    if (session->stats_timeline != nullptr && pending_stats_value != 0u && !internal::WaitTimeline(*session->stats_timeline, pending_stats_value)) {
-      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(stats fence wait timed out at device destruction)");
+    if (session->stats_timeline != nullptr && pending_stats_value != 0u && !internal::WaitTimeline(session->stats_timeline.get(), pending_stats_value)) {
+      reshade::log::message(reshade::log::level::warning, "devkit::watch_region(stats fence wait failed at device destruction: timed out, or the OpenGL context is not current)");
     }
     for (const auto& entry : session->scratch_entries) {
       if (entry.texture.handle != 0u) {

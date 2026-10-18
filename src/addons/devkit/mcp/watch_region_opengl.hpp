@@ -65,9 +65,9 @@ constexpr unsigned int IMAGE_BINDING_LAYER = 0x8F3Du;
 constexpr unsigned int IMAGE_BINDING_ACCESS = 0x8F3Eu;
 constexpr unsigned int IMAGE_BINDING_FORMAT = 0x906Eu;
 constexpr unsigned int READ_ONLY = 0x88B8u;
+constexpr unsigned int NUM_EXTENSIONS = 0x821Du;
+constexpr unsigned int EXTENSIONS = 0x1F03u;
 constexpr unsigned int ALPHA_TEST = 0x0BC0u;
-constexpr unsigned int CONTEXT_PROFILE_MASK = 0x9126u;
-constexpr unsigned int CONTEXT_COMPATIBILITY_PROFILE_BIT = 0x00000002u;
 constexpr unsigned int ALL_BARRIER_BITS = 0xFFFFFFFFu;
 constexpr unsigned int SYNC_GPU_COMMANDS_COMPLETE = 0x9117u;
 constexpr unsigned int SYNC_FLUSH_COMMANDS_BIT = 0x00000001u;
@@ -87,7 +87,7 @@ struct OpenGLFunctions {
   void(APIENTRY* enable)(unsigned int) = nullptr;
   unsigned int(APIENTRY* get_error)() = nullptr;
   void(APIENTRY* get_framebuffer_attachment_parameteriv)(unsigned int, unsigned int, unsigned int, int*) = nullptr;
-  void(APIENTRY* flush)() = nullptr;
+  const unsigned char*(APIENTRY* get_stringi)(unsigned int, unsigned int) = nullptr;
   void(APIENTRY* read_buffer)(unsigned int) = nullptr;
   void(APIENTRY* bind_framebuffer)(unsigned int, unsigned int) = nullptr;
   void(APIENTRY* memory_barrier)(unsigned int) = nullptr;
@@ -116,7 +116,10 @@ struct OpenGLFunctions {
 
   // OpenGL 1.1 entry points are opengl32 exports; the rest come from the driver through wglGetProcAddress.
   const auto load = [&](auto* function, const char* name, bool exported) {
-    const auto address = (exported ? reinterpret_cast<std::uintptr_t>(GetProcAddress(module, name)) : reinterpret_cast<std::uintptr_t>(get_proc_address(name)));
+    std::uintptr_t address = reinterpret_cast<std::uintptr_t>(get_proc_address(name));
+    if (exported) {
+      address = reinterpret_cast<std::uintptr_t>(GetProcAddress(module, name));
+    }
     const auto is_valid = (address > 3u && address != (std::numeric_limits<std::uintptr_t>::max)());
     *function = (is_valid ? reinterpret_cast<std::remove_reference_t<decltype(*function)>>(address) : nullptr);
     return *function != nullptr;
@@ -129,9 +132,9 @@ struct OpenGLFunctions {
       && load(&loaded.is_enabled, "glIsEnabled", true)
       && load(&loaded.enable, "glEnable", true)
       && load(&loaded.get_error, "glGetError", true)
-      && load(&loaded.flush, "glFlush", true)
       && load(&loaded.read_buffer, "glReadBuffer", true)
       && load(&loaded.get_integeri_v, "glGetIntegeri_v", false)
+      && load(&loaded.get_stringi, "glGetStringi", false)
       && load(&loaded.get_framebuffer_attachment_parameteriv, "glGetFramebufferAttachmentParameteriv", false)
       && load(&loaded.bind_framebuffer, "glBindFramebuffer", false)
       && load(&loaded.memory_barrier, "glMemoryBarrier", false)
@@ -149,7 +152,8 @@ struct OpenGLFunctions {
 // there (no worker thread and no extra context, unlike gpu_fence::OpenGLFence, whose thread has to be retired outside
 // ReShade's WGL locks). A sync object belongs to the context it was created on: it is deleted only while that context is
 // current and leaked otherwise, because a delete on another context could hit the game's own objects. Held by
-// FenceTimeline, which keeps the completed value in its FenceCompletion.
+// FenceTimeline, which keeps the completed value in its FenceCompletion. Not locked: every access is on the presenting
+// thread with the session's context current.
 struct OpenGLSyncTimeline {
   struct PendingSync {
     std::uint64_t value = 0u;
@@ -166,8 +170,8 @@ struct OpenGLSyncTimeline {
   OpenGLSyncTimeline& operator=(const OpenGLSyncTimeline&) = delete;
   ~OpenGLSyncTimeline() {
     if (pending.empty() || functions == nullptr || functions->get_current_context() != context) return;
-    for (const auto& [value, sync] : pending) {
-      functions->delete_sync(sync);
+    for (const auto& pending_sync : pending) {
+      functions->delete_sync(pending_sync.sync);
     }
   }
 };
@@ -187,7 +191,7 @@ struct OpenGLReduction {
   std::uint32_t max_image_units = 0u;
   std::uint32_t max_draw_buffers = 0u;
   std::uint32_t atlas_columns = 1u;
-  bool compatibility_profile = false;
+  bool compatibility_context = false;
   bool watches_default_framebuffer = false;
   // The default framebuffer's read buffer at the start of the watch: ReShade's copy from it leaves GL_BACK set.
   int default_read_buffer = 0;
@@ -196,5 +200,25 @@ struct OpenGLReduction {
   bool first_copy_checked = false;
   bool first_reduction_checked = false;
 };
+
+// Clears the pending GL errors (at most 16; the game's own pending errors go with them, see DEVKIT_MCP.md).
+inline void DrainOpenGLErrors(const OpenGLFunctions& functions) {
+  std::uint32_t drained = 0u;
+  while (drained < 16u && functions.get_error() != 0u) {
+    ++drained;
+  }
+}
+
+// ReShade's copy from the default framebuffer sets its read buffer to GL_BACK and does not put it back: restores the game's
+// value (recorded at the start of the watch) when it differed.
+inline void RestoreDefaultReadBuffer(const OpenGLReduction& opengl) {
+  if (!opengl.watches_default_framebuffer || opengl.default_read_buffer == static_cast<int>(gl_enum::BACK)) return;
+  const auto& functions = *opengl.functions;
+  int read_framebuffer = 0;
+  functions.get_integerv(gl_enum::READ_FRAMEBUFFER_BINDING, &read_framebuffer);
+  functions.bind_framebuffer(gl_enum::READ_FRAMEBUFFER, 0u);
+  functions.read_buffer(static_cast<unsigned int>(opengl.default_read_buffer));
+  functions.bind_framebuffer(gl_enum::READ_FRAMEBUFFER, static_cast<unsigned int>(read_framebuffer));
+}
 
 }  // namespace renodx::addons::devkit::mcp::watch_region
