@@ -4106,8 +4106,10 @@ inline void ProcessAtFrameEnd(
 
     auto scratch_format = reshade::api::format_to_default_typed(resource_desc.texture.format, 0);
     if (device_api == reshade::api::device_api::opengl
-        && (scratch_format == reshade::api::format::r8g8b8x8_unorm || scratch_format == reshade::api::format::b8g8r8x8_unorm)) {
-      // An OpenGL back buffer without alpha bits is reported as an x8 format: it is watched as RGBA8, since its copy is a blit.
+        && (scratch_format == reshade::api::format::r8g8b8x8_unorm || scratch_format == reshade::api::format::b8g8r8x8_unorm)
+        && static_cast<unsigned int>(target.resolved_resource.handle >> 40u) == gl_enum::FRAMEBUFFER_DEFAULT) {
+      // A back buffer without alpha bits is reported as an x8 format: it is watched as RGBA8, since its copy is a blit. A
+      // GL_RGB8 texture is reported as x8 too, but cannot be copied into an RGBA8 atlas and stays refused.
       scratch_format = reshade::api::format::r8g8b8a8_unorm;
     }
     switch (scratch_format) {
