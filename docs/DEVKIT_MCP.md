@@ -362,9 +362,13 @@ into its cell of a grid atlas, and one compute dispatch at the end of the frame 
   GL queries per draw while a watch runs (none otherwise); with a threaded driver they can cost real frame time, and draws
   outside `shaderHash` with no event open are skipped before the queries. Copies, blits, clears, resolves, `glTexSubImage*`
   (also from a pixel unpack buffer, reported as `update`) and `glCopyTexSubImage*` arrive as ReShade events; those to another
-  mip level or array layer than the watched one are ignored. Not seen: `glCopyTexImage1D/2D` (ReShade's hooks raise no event
-  for them, so a texture a game refills that way, as Wolfenstein's scene texture, shows no writer although its content
-  changes every frame; the end-of-frame numbers are still right), `glGenerateMipmap` (levels above 0), image stores from
+  mip level or array layer than the watched one are ignored. Not seen: `glBlitFramebufferEXT`, `glBlitFramebufferANGLE`
+  and `glCopyImageSubDataNV` (ReShade hooks only the core `glBlitFramebuffer`, `glBlitNamedFramebuffer` and
+  `glCopyImageSubData`, and some drivers return a different entry point for the extension names; a texture a game refills
+  that way shows no writer although its content changes every frame, and the end-of-frame numbers are still right.
+  Measured on Wolfenstein: The New Order: in a level it resolves its 2-sample scene into the single-sample scene texture
+  with `glBlitFramebufferEXT`, called from the game executable, at an entry point that differs from the core one), `glCopyTexImage1D/2D`
+  (ReShade's hooks raise no event for them either; that game does not import them), `glGenerateMipmap` (levels above 0), image stores from
   fragment shaders, draws into `glTextureView` views of the watched texture, and a cube map face other than face 0 (the
   attachment query returns no face). A `glClear` of framebuffer 0 counts whatever its draw buffer is.
 - The region rectangle is passed unchanged to ReShade's `copy_texture_region`, exactly like `devkit_analyze_resource`, so both
