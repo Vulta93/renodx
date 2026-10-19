@@ -112,6 +112,7 @@ bool SaveSceneBeforeHud(reshade::api::command_list* cmd_list) {
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0xD46EFAB6),
+    CustomShaderEntry(0x36401A42),
     {
         0x707C2DA8,
         {
@@ -346,6 +347,17 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
+        .key = "ShadowFilterWidth",
+        .binding = &shader_injection.shadow_filter_width,
+        .default_value = 3.f,
+        .label = "Shadow Filter Width",
+        .section = "Shadows",
+        .tooltip = "Width of the soft shadow filter. 1 is the original game (blocky shadow edges), higher values hide the blocks.",
+        .min = 1.f,
+        .max = 4.f,
+        .format = "%.1f",
+    },
+    new renodx::utils::settings::Setting{
         .key = "IntermediateEncoding",
         .binding = &shader_injection.intermediate_encoding,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -409,6 +421,7 @@ void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ColorGradeHighlightSaturation", 50.f);
   renodx::utils::settings::UpdateSetting("ColorGradeBlowout", 0.f);
   renodx::utils::settings::UpdateSetting("ColorGradeFlare", 0.f);
+  renodx::utils::settings::UpdateSetting("ShadowFilterWidth", 1.f);
 }
 
 bool initialized = false;
@@ -432,7 +445,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::shader::expected_constant_buffer_space = 50;
         renodx::mods::shader::expected_constant_buffer_index = 13;
         renodx::mods::shader::allow_multiple_push_constants = true;
-        renodx::mods::shader::constant_buffer_offset = 100 * 4;
+        renodx::mods::shader::constant_buffer_offset = 150 * 4;
 
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;

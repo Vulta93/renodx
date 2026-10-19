@@ -42,15 +42,15 @@ struct ShaderInjectData {
   float swap_chain_encoding;
   float swap_chain_encoding_color_space;
   float hud_clamp;
-  float padding1;
+  float shadow_filter_width;
 };
 
 #ifndef __cplusplus
 #if (__SHADER_TARGET_MAJOR == 3)
 
-// ps_3_0 replaced game shaders: constants c100..c107, pushed from ShaderInjectData before each replaced draw (the game uses
-// c0-c13, c32-c41, c48-c49, c57-c71 and c192-c223; c57 is its punch fade parameter, so c50-c57 must not be used).
-float4 shader_injection[8] : register(c100);
+// ps_3_0 replaced game shaders: constants c150..c157, pushed from ShaderInjectData before each replaced draw (the pixel shaders
+// of the game read c0-c13, c32-c41, c46-c49, c54-c55, c57-c66, c68-c71, c76-c108 and c192-c223; c109-c191 are free).
+float4 shader_injection[8] : register(c150);
 
 #define RENODX_PEAK_WHITE_NITS                 shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS              shader_injection[0][1]
@@ -73,6 +73,7 @@ float4 shader_injection[8] : register(c100);
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection[7][0]
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection[7][1]
 #define RENODX_HUD_CLAMP                       shader_injection[7][2]
+#define RENODX_SHADOW_FILTER_WIDTH             shader_injection[7][3]
 
 #else
 #if ((__SHADER_TARGET_MAJOR == 5 && __SHADER_TARGET_MINOR >= 1) || __SHADER_TARGET_MAJOR >= 6)

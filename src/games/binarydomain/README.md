@@ -48,6 +48,12 @@ The 8-bit era image is gamma-2 encoded and the display decodes it with its own c
   white, the float16 buffer did not (the pulse reached the Peak Brightness). The scene as it was just before the first HUD
   sprite is kept in a native D3D9 texture, bound to ps_3_0 sampler 14 (no game shader uses it) at the final pass and
   unbound at present. This is an end-of-chain approximation of "clamp after every blend": identical for additive stacks.
+- **0x36401A42** (shadow filter, an addon-only improvement, not a vanilla fix): the game's soft shadow pass blends 7 reads of the
+  shadow data with depth-aware weights (out.x = sum(w * x) / sum(w), out.yzw = center tap). Its tap spacing leaves the
+  shadow edges blocky (observed inside the bus, also in the base game, and worse with the filter switched off). The
+  replacement is the same math with the distance of the 6 outer taps from the center scaled by **Shadow Filter Width**
+  (1 = original, default 3, up to 4); widths 2 and 3 were judged much better than the original in game and about equal to
+  each other.
 
 ## Resource upgrades
 
@@ -71,10 +77,10 @@ clone test showed a value of 2.0 reaching the HUD buffer unclamped through all o
 - **`CustomShader::on_drawn` is not used.** It cancels the draw and replays it through the ReShade command list, which draws
   nothing for this game's full-screen quads: a black screen, and HUD copies piling up. The copy is done at the first
   0x707C2DA8 draw after the finish copy instead.
-- Shader constants c100-c107 carry `shader_injection`. D3D9 constants are device-global, so the block must not overlap a
-  register the game sets and reads later. The 62 pixel and 3 vertex shaders dumped by a community shader pack show the
-  engine uses c0-c13, c32-c41, c48-c49, c57-c71 and c192-c223 (c57 is its punch fade parameter, read by 35 shaders), so
-  c50-c57 are avoided. c72-c191 are unused by every dumped shader.
+- Shader constants c150-c157 carry `shader_injection`. D3D9 constants are device-global, so the block must not overlap a
+  register the game sets and reads later. Disassembling all 491 pixel shaders dumped with the Devkit shows the game reads
+  c0-c13, c32-c41, c46-c49, c54-c55, c57-c66, c68-c71, c76-c108 and c192-c223 (c57, its punch fade parameter, is read by 174
+  shaders, and 6 read c100-c107), so c109-c191 is the free range. Vertex shaders have their own constant registers.
 - Preset Off and Vanilla still run the float16 upgrade, the HUD cap and the Game / UI split (at 203/203 it is the identity).
   The original clamped to white after every blend; Vanilla clamps the finished scene once, in the finish pass, after the haze
   sprites. It is not bit-identical to the original: the output is HDR10 with white at Game Brightness, while the original on
@@ -83,7 +89,7 @@ clone test showed a value of 2.0 reaching the HUD buffer unclamped through all o
 ## Settings
 
 Tone Mapper (Vanilla, None, Roll-off, PsychoV), Peak / Game / UI Brightness, color grading (Exposure, Highlights, Shadows, Contrast,
-Saturation, Highlight Saturation, Blowout, Flare), Display Output (Intermediate Encoding, Swapchain Decoding, Gamma
+Saturation, Highlight Saturation, Blowout, Flare), Shadow Filter Width, Display Output (Intermediate Encoding, Swapchain Decoding, Gamma
 Correction, Clamp Color Space, Force Borderless, Prevent Fullscreen, Encoding). Roll-off compresses the max channel in the
 swap chain color space: identity up to 0.6 x Peak, Peak at 16 x Game Brightness (first estimate, not measured); it also runs after PsychoV.
 
