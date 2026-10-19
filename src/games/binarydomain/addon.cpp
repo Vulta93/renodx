@@ -137,7 +137,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
               const auto target_desc = device->get_resource_desc(target_resource);
               const auto back_buffer_desc = renodx::utils::swapchain::GetBackBufferDesc(cmd_list);
               if (target_desc.texture.width != back_buffer_desc.texture.width
-                  || target_desc.texture.height != back_buffer_desc.texture.height) {
+                  || target_desc.texture.height != back_buffer_desc.texture.height
+                  || target_desc.texture.format != reshade::api::format::r16g16b16a16_float) {
                 return false;
               }
               scene_finish_target = target_resource.handle;
@@ -216,7 +217,7 @@ renodx::utils::settings::Settings settings = {
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .tooltip = "Vanilla keeps the original look, clipped at white. None extends the original curve past white without limiting it. "
+        .tooltip = "Vanilla keeps the original look, clipped at white. None extends the original curve past white, hard-limited at Peak Brightness. "
                    "Roll-off extends it and compresses the brightest highlights smoothly to Peak Brightness. "
                    "PsychoV maps the scene with the PsychoV observer model anchored to the original curve, then the same roll-off.",
         .labels = {"Vanilla", "None", "Roll-off", "PsychoV"},
@@ -539,7 +540,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           renodx::mods::swapchain::use_resize_buffer = setting->GetValue() < 4;
           renodx::mods::swapchain::use_resize_buffer_on_demand = renodx::mods::swapchain::use_resize_buffer;
           renodx::mods::swapchain::set_color_space = !renodx::mods::swapchain::use_resize_buffer;
-          shader_injection.swap_chain_encoding_color_space = is_hdr10 ? 1.f : 0.f;
+          shader_injection.swap_chain_encoding_color_space = (is_hdr10 ? 1.f : 0.f);
           settings.push_back(setting);
         }
 

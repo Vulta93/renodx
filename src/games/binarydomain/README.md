@@ -67,7 +67,7 @@ clone test showed a value of 2.0 reaching the HUD buffer unclamped through all o
   (`extended-vanilla`) instead. **PsychoV17** is an optional Tone Mapper (not the default): `psychotm_test17` on the exposed
   scene, anchored to the vanilla curve at output midgray (exposed scene 0.236185 -> 0.18) with the analytic slope
   (cone response 0.97521), peak = Peak / Game Brightness, bleaching off (the function default is 1; it desaturates bright
-  colors, which is a look and not neutral), BT.2020 gamut compression, followed by the same
+  colors, which is a look and not neutral), followed by the same
   Roll-off (haze, bloom and HUD are added after the tone map). It matches vanilla at midgray and below but has no closing
   shoulder, so it is brighter than vanilla from the upper mid-tones up (+16% at an exposed scene value of 1, +39% at
   1.7). Cost: about 557 ps_3_0 instruction slots in each of the two tone map draws.
