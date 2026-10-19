@@ -1,0 +1,17 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "binarydomain",
+  "title": "Binary Domain",
+  "status": "experimental",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "deploy": {
+    "steam_appid": 203750,
+    "game_exe": "BinaryDomain.exe",
+    "api": "d3d9",
+    "architecture": [
+      "x86"
+    ]
+  }
+}
