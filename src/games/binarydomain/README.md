@@ -105,7 +105,11 @@ Runtime checks done (author, in game): HDR10 on; Game and UI Brightness act sepa
 startup videos are fine; the HUD pulse effect stays at UI brightness; muzzle flashes reach Peak Brightness (they are part of
 the scene, not the HUD, so they follow Game Brightness); lamps reach Peak and show the warm bulb colour (Blowout whitens
 them); Alt-Tab returns cleanly; fullscreen works (the mod runs it borderless). Devkit measurements: no NaN / Inf / negative
-pixels in the final output; final output max luminance below the HUD buffer's after the cap.
+pixels in the final output; final output max luminance below the HUD buffer's after the cap; the scene finish copy runs once per
+frame on the back-buffer sized target (its other five draws are the small luminance chain targets and keep the original shader).
+Also checked: an in-game engine cutscene and the pause menu; the game's own brightness and gamma options still change the
+picture in both directions; a Release build without the Devkit; a lower 16:9 resolution (the resolution is set by the external
+configurator before launch, so there is no in-game resolution change).
 
 ## Known limitations / not tested
 
@@ -116,6 +120,5 @@ pixels in the final output; final output max luminance below the HUD buffer's af
 - The blinking ammo cache is a scene effect (not HUD, it stays with the HUD shaders off). It reaches about 650 nits, below Peak.
 - The lamp shape showing through the bus walls is also in the base game (compared with the add-on removed).
 - The white clip of the Roll-off is an estimate; peak white of the brightest scenes was not measured over varied content.
-- Device Reset / resolution change with the pre-HUD texture bound, other aspect ratios, fades to white, cutscenes without
+- Device Reset with the pre-HUD texture bound, non-16:9 aspect ratios, fades to white, cutscenes without
   HUD sprites and a second HUD shader (0x1F45D316 draws before the first 0x707C2DA8) were not exercised.
-- The game's own brightness / gamma option (c192) was only checked at its default.
