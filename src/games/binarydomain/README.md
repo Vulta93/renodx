@@ -71,9 +71,10 @@ clone test showed a value of 2.0 reaching the HUD buffer unclamped through all o
 - **`CustomShader::on_drawn` is not used.** It cancels the draw and replays it through the ReShade command list, which draws
   nothing for this game's full-screen quads: a black screen, and HUD copies piling up. The copy is done at the first
   0x707C2DA8 draw after the finish copy instead.
-- Shader constants c50-c57 carry `shader_injection`. D3D9 constants are device-global. The engine keeps its constants at fixed
-  registers (c32 material, c58 fog, c60-c63 light scatter, c64-c66 location, c68 shadow, c192+ pixel user, c224 vertex user)
-  and none of the 35 disassembled shaders reads c50-c57; the other tracked shaders (about 100) were not disassembled.
+- Shader constants c100-c107 carry `shader_injection`. D3D9 constants are device-global, so the block must not overlap a
+  register the game sets and reads later. The 62 pixel and 3 vertex shaders dumped by a community shader pack show the
+  engine uses c0-c13, c32-c41, c48-c49, c57-c71 and c192-c223 (c57 is its punch fade parameter, read by 35 shaders), so
+  c50-c57 are avoided. c72-c191 are unused by every dumped shader.
 - Preset Off and Vanilla still run the float16 upgrade, the HUD cap and the Game / UI split (at 203/203 it is the identity).
   The original clamped to white after every blend; Vanilla clamps the finished scene once, in the finish pass, after the haze
   sprites. It is not bit-identical to the original: the output is HDR10 with white at Game Brightness, while the original on

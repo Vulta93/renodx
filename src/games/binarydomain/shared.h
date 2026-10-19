@@ -48,8 +48,9 @@ struct ShaderInjectData {
 #ifndef __cplusplus
 #if (__SHADER_TARGET_MAJOR == 3)
 
-// ps_3_0 replaced game shaders: constants c50..c57, pushed from ShaderInjectData before each replaced draw.
-float4 shader_injection[8] : register(c50);
+// ps_3_0 replaced game shaders: constants c100..c107, pushed from ShaderInjectData before each replaced draw (the game uses
+// c0-c13, c32-c41, c48-c49, c57-c71 and c192-c223; c57 is its punch fade parameter, so c50-c57 must not be used).
+float4 shader_injection[8] : register(c100);
 
 #define RENODX_PEAK_WHITE_NITS                 shader_injection[0][0]
 #define RENODX_DIFFUSE_WHITE_NITS              shader_injection[0][1]
