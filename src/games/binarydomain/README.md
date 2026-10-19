@@ -105,6 +105,8 @@ pixels in the final output; final output max luminance below the HUD buffer's af
 - The full resolution translucent layer is a float16 target now and its particle output is not clamped, so effects drawn there
   (muzzle flashes were observed reaching Peak Brightness) keep their range; the half resolution layer and the bloom stay 8-bit
   and clipped. Which effects use which layer was not catalogued.
+- The blocky shadows inside the bus are in the base game too (compared with the add-on removed), not caused by the mod.
+- The blinking ammo cache is a scene effect (not HUD, it stays with the HUD shaders off). It reaches about 650 nits, below Peak.
 - The white clip of the Roll-off is an estimate; peak white of the brightest scenes was not measured over varied content.
 - Device Reset / resolution change with the pre-HUD texture bound, other aspect ratios, fades to white, cutscenes without
   HUD sprites and a second HUD shader (0x1F45D316 draws before the first 0x707C2DA8) were not exercised.
