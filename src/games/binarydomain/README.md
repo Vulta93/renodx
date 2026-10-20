@@ -39,7 +39,8 @@ The 8-bit era image is gamma-2 encoded and the display decodes it with its own c
   exposure is read in the shader (c66.x), the replaced shader sees the game's own constants.
 - **0x19BC57FB** (plain texture copy): replaced only for the back-buffer sized copy into the HUD buffer (decided in
   `on_replace` from the render target size; the luminance downsample chain uses the same shader and keeps the original).
-  Applies color grading, the Game / UI brightness split (`RenderIntermediatePass`) and the Roll-off to the finished scene,
+  Applies color grading, the Game / UI brightness split (`RenderIntermediatePass`) and, for the Roll-off and PsychoV tone
+  mappers, the Roll-off limiter to the finished scene,
   haze sprites included. The split has to happen here: the haze sprites are drawn after the tone map and ignore Game
   Brightness, so a split inside the tone map left the UI slider moving most of the picture.
 - **0x707C2DA8** (HUD sprite): `saturate` of the output, which the original 8-bit target did implicitly.
@@ -67,8 +68,13 @@ clone test showed a value of 2.0 reaching the HUD buffer unclamped through all o
   (`extended-vanilla`) instead. **PsychoV17** is an optional Tone Mapper (not the default): `psychotm_test17` on the exposed
   scene, anchored to the vanilla curve at output midgray (exposed scene 0.236185 -> 0.18) with the analytic slope
   (cone response 0.97521), peak = Peak / Game Brightness, bleaching off (the function default is 1; it desaturates bright
-  colors, which is a look and not neutral), followed by the same
-  Roll-off (haze, bloom and HUD are added after the tone map). It matches vanilla at midgray and below but has no closing
+  colors, which is a look and not neutral). It is followed by the same limiter as the Roll-off, starting at 0.8 x Peak
+  (the Roll-off starts at 0.6 x Peak). Reason: in this game bloom, the particle layer and the haze sprites are added after
+  the tone map, so PsychoV highlights reach the finish pass above Peak (a lamp core measured about 1.8x Peak without the
+  limiter, about 26,800 pixels above Peak, flat at Peak after `SwapChainPass`). Cost: the limiter also compresses PsychoV's
+  own top band, so a pixel that PsychoV alone brings exactly to Peak ends at about 0.93 x Peak (computed from the formula,
+  Peak 1360, Game Brightness 203). With the limiter the same lamp had no pixel above Peak and its brightest value at about
+  0.99 x Peak (measured with the Devkit, Peak 1360; Roll-off: about 0.96 x Peak). It matches vanilla at midgray and below but has no closing
   shoulder, so it is brighter than vanilla from the upper mid-tones up (+16% at an exposed scene value of 1, +39% at
   1.7). Cost: about 557 ps_3_0 instruction slots in each of the two tone map draws.
 - **Native D3D9 for the pre-HUD copy** (`CreateTexture`, `StretchRect`, `SetTexture` on `get_native()`), not
@@ -91,7 +97,11 @@ clone test showed a value of 2.0 reaching the HUD buffer unclamped through all o
 Tone Mapper (Vanilla, None, Roll-off, PsychoV), Peak / Game / UI Brightness, color grading (Exposure, Highlights, Shadows, Contrast,
 Saturation, Highlight Saturation, Blowout, Flare), Shadow Filter Width, Display Output (Intermediate Encoding, Swapchain Decoding, Gamma
 Correction, Clamp Color Space, Force Borderless, Prevent Fullscreen, Encoding). Roll-off compresses the max channel in the
-swap chain color space: identity up to 0.6 x Peak, Peak at 16 x Game Brightness (first estimate, not measured); it also runs after PsychoV.
+swap chain color space: identity up to 0.6 x Peak (0.8 x Peak after PsychoV), Peak at 16 x Game Brightness. None does not use it.
+Measured with the Devkit in the author's session (Tone Mapper None, Game Brightness units, buffer after the finish copy):
+lamps about 10x, a red light about 20x (BT.2020 max channel), muzzle flashes
+hundreds of times white. At Game Brightness 203 and up to 2000 nits Peak the clip changes the Roll-off output by about 3% or less
+compared with no clip (more at a lower Game Brightness).
 
 ## Verification
 
@@ -119,6 +129,9 @@ configurator before launch, so there is no in-game resolution change).
 - The blocky shadows inside the bus are in the base game too (compared with the add-on removed), not caused by the mod.
 - The blinking ammo cache is a scene effect (not HUD, it stays with the HUD shaders off). It reaches about 650 nits, below Peak.
 - The lamp shape showing through the bus walls is also in the base game (compared with the add-on removed).
-- The white clip of the Roll-off is an estimate; peak white of the brightest scenes was not measured over varied content.
+- The white clip of the Roll-off (16x) is a chosen value, not derived from documentation; it was checked against measured highlights in a few scenes only (outdoor lamps, a red light, shooting).
+- A translucent HUD element over a scene pixel that is several times brighter than Peak (muzzle flash, lamp) can lose
+  contrast, because the final limit is applied after the HUD blend. Most likely with None; inputs above the 16x clip also
+  exceed Peak under Roll-off and PsychoV. Not tested.
 - Device Reset with the pre-HUD texture bound, non-16:9 aspect ratios, fades to white, cutscenes without
   HUD sprites and a second HUD shader (0x1F45D316 draws before the first 0x707C2DA8) were not exercised.

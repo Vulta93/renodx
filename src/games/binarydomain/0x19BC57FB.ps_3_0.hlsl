@@ -4,7 +4,8 @@
 // full resolution copy that hands the finished scene to the HUD buffer; the luminance downsample chain, which uses the
 // same shader, keeps the original (see addon.cpp). At this point the scene is complete: tone map, fog sprites and AA are
 // done and the HUD has not been drawn, so this is where the user-facing look is applied to the whole scene at once:
-// color grading, the Game / UI brightness split (HUD drawn afterwards stays at UI Brightness) and the roll-off.
+// color grading, the Game / UI brightness split (HUD drawn afterwards stays at UI Brightness) and, for the Roll-off and
+// PsychoV tone mappers, the roll-off limiter.
 // Input: the scene in the game's 2.2 encoding (vanilla encoded value in the SDR range, HDR above it).
 
 static const float TONE_MAP_TYPE_ROLLOFF = 4.f;  // addon-only values (renodx::draw uses 0-3): Roll-off 4, PsychoV 5
@@ -41,14 +42,16 @@ float4 main(float2 uv : TEXCOORD0) : COLOR {
 
   // Roll-off: exponential roll-off (renodx::tonemap::ExponentialRollOff, clip version) on the max channel taken in the
   // swap chain encoding colour space (BT.2020 for HDR10) where SwapChainPass clamps at Peak, colour scaled so hue is
-  // kept: identity up to 0.6x Peak, Peak at the white clip. The clip is a first estimate, not yet measured. Applied in the
-  // Roll-off and PsychoV tone mappers.
+  // kept, Peak at the white clip (16x Game Brightness). Used by the Roll-off tone mapper (identity up to 0.6x Peak) and by
+  // PsychoV (identity up to 0.8x Peak). This game adds bloom, the particle layer and the haze sprites after the tone map,
+  // so PsychoV output can go well above Peak by the time it reaches this pass; the limit is applied here, not only by
+  // SwapChainPass. None leaves the limit to SwapChainPass.
   [branch]
   if (RENODX_TONE_MAP_TYPE >= TONE_MAP_TYPE_ROLLOFF) {
     float3 color = max(0, renodx::draw::DecodeColor(output, RENODX_INTERMEDIATE_ENCODING));
     float peak = RENODX_PEAK_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
     float clip = max(16.f * RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS, peak);
-    float rolloff_start = 0.6f * peak;
+    float rolloff_start = (RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_ROLLOFF ? 0.6f : 0.8f) * peak;
     [branch]
     if (RENODX_SWAP_CHAIN_GAMMA_CORRECTION != 0.f) {
       const float gamma = RENODX_SWAP_CHAIN_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f;

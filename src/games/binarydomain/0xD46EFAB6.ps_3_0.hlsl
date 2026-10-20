@@ -9,7 +9,7 @@
 // exactly, above it the curve continues linearly instead of closing at white. Tone Mapper PsychoV: PsychoV17 anchored to
 // the vanilla curve (midgray). The result stays in the game's 2.2 encoding, which is the vanilla encoded value in the SDR
 // range, so the fog sprites and the AA pass that follow blend as they always did. Grading, the Game / UI brightness split
-// and the roll-off happen later, in 0x19BC57FB, on the finished scene.
+// and the roll-off (Roll-off and PsychoV tone mappers) happen later, in 0x19BC57FB, on the finished scene.
 
 float4 c_location[3] : register(c64);  // c65 = (1 / size, half texel), c66.x = exposure
 float4 c_ps_user : register(c192);     // c192.x = layer sampling offset scale

@@ -219,7 +219,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Tone Mapping",
         .tooltip = "Vanilla keeps the original look, clipped at white. None extends the original curve past white, hard-limited at Peak Brightness. "
                    "Roll-off extends it and compresses the brightest highlights smoothly to Peak Brightness. "
-                   "PsychoV maps the scene with the PsychoV observer model anchored to the original curve, then the same roll-off.",
+                   "PsychoV maps the scene with the PsychoV observer model anchored to the original curve; the brightest highlights are then compressed smoothly to Peak Brightness, like Roll-off.",
         .labels = {"Vanilla", "None", "Roll-off", "PsychoV"},
         .parse = [](float value) {
           // shader values: 4 = Roll-off, 5 = PsychoV
