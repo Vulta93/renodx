@@ -92,6 +92,10 @@ Tone Mapper, Gamma Correction and the grading sliders are shown in the Intermedi
   and `frame` unclamped; vanilla's 8-bit target clamped the sum at 1. With the float 480x270 chain the glow can go
   slightly above 1 (measured 1.21 in the bloom target, lamp glow about 1.26 / 340 nits in the final image). Kept by
   decision: it looks right, the lamp itself still carries the HDR range.
+- Bloom threshold: 0x1F5C414B stores the adapted average scene brightness (81 samples, linear average) in an 8-bit
+  1x1 target (0xFC9, previous frame 0xFC8). It could only clip if the whole frame averaged above game white; a sunny
+  outdoor frame averages about 0.45, so it does not. The average now includes highlights above 1, so the threshold can
+  sit slightly higher than vanilla in very bright scenes; outdoors with the sun the bloom looked right (2026-10-21).
 - Smoke: 0x30270368, 0x77B690CD (alpha x4) and 0x4BED1C4E write unclamped alpha into the float scene target. They are
   drawn in the fireplace smoke (snapshots), which looks correct; the blend state is not readable on OpenGL, so this is
   a visual check, not a measurement. First suspects if smoke ever looks too bright.
