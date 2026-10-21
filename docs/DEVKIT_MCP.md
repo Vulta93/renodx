@@ -52,8 +52,15 @@ The exact MCP schema can evolve, but the current workflow is built around these 
 
 - `devkit_list_shaders`
 - `devkit_list_draws`
-- `devkit_get_draw`
+- `devkit_get_draw` (`includeConstantValues: true` adds the constant values the draw saw, see section 6)
 - `devkit_get_shader`
+- `devkit_list_replacements` (which registered shader replacements drew in the snapshot, see section 6)
+
+`devkit_queue_snapshot`, `devkit_analyze_resource` and `devkit_watch_region` take `delaySeconds` (0-30): the tool waits that
+long before it queues the request. Use it when the game is paused while you talk to the agent: start the call, unpause,
+and the capture lands on gameplay instead of the pause menu. The wait happens before queueing, so it does not count
+against the tools' own 15 s wait for the next present. It runs on the MCP connection's thread: other Devkit tool calls wait
+until it ends, and the arguments other than `delaySeconds` are only checked after it.
 
 ### Resource inspection
 
@@ -140,6 +147,62 @@ For HDR work, the most important draw categories are:
 - the actual final copy or swapchain pass
 
 If the final pass is only a one-texture blit from an already SDR target, it is not the place to recover HDR.
+
+### Constant values (`devkit_get_draw` with `includeConstantValues`)
+
+Exposure, white point, LUT strength and grade parameters usually live in constants. With `includeConstantValues: true`,
+`devkit_get_draw` adds, as 32-bit words read both as float (`floatValues`) and as uint (`uintValues`):
+
+- Per constant buffer bound to the pixel stage (draws) or compute stage (dispatches): the bytes copied when the snapshot
+  recorded the draw, because games rewrite the same buffer between draws. At most 4096 bytes from the bound offset
+  (`valuesTruncated` when that cap was reached; a whole-buffer bind of exactly 4096 bytes also reports it). `valuesSource`:
+  - `cpu_cache`: the bytes the CPU last wrote through map/unmap or `update_buffer_region` (`utils::constants`). This is the
+    D3D10/11 path, and OpenGL uniform buffers written the same way. D3D9 has no constant buffers (see the shader constants
+    below).
+  - `untracked`: the Devkit setting **Trace Constant Buffers** (Settings > Trace, ReShade.ini `TraceConstantBuffers`) was
+    off when the game started (it only registers its hooks at startup, so enable it and restart), or the buffer was not created
+    as a constant buffer, or it was mapped at that moment.
+  - `not_read_by_shader`: the active shader's reflected bindings do not include this buffer. When the shader's bindings are
+    not reflected, every bound buffer is captured.
+  - `unsupported_api`: D3D12 and Vulkan. Their games write constant buffers through persistent maps or GPU copies, which the
+    CPU-side cache never sees, so it would only report zeros. Use the root/push constants below, or read the buffer's
+    layout from the decompiled shader.
+- `pushConstants` for the active stage (pixel for draws, compute for dispatches), at most 1024 words each (longer ranges
+  are cut without a flag), `firstValue` being the word index of `floatValues[0]`. They do not need Trace Constant Buffers.
+  - D3D12 root constants and Vulkan push constants, only for the root signature / pipeline layout bound for the draw's bind
+    point (the one its descriptor tables are bound with). When no descriptor table was bound since the last root signature
+    change, that layout is unknown and the values of every layout pushed during the snapshot are listed (check
+    `layoutHandle`).
+  - D3D9 shader constants: `layoutParam` 5/6/7 are the pixel shader's float/int/bool constants. Float and int register N start
+    at word 4 * N; bool register N is word N.
+  - OpenGL `glUniform*`: word 4 * location. One array per context, not per program: a location means something different in
+    every program, so a word can come from another program. Arrays and matrices fill consecutive words from 4 * location,
+    overlapping the next locations. `glProgramUniform*` is not hooked by ReShade, so those writes are missing.
+
+Limits: values are recorded only from calls the game makes during snapshot frames (like the other bindings the snapshot
+records). A constant the game set before the snapshot frame and did not set again is missing, or shows a value from an
+earlier snapshot on D3D9 and the D3D11/OpenGL immediate context, whose state is kept between frames. Vertex shader
+constants are not included. Reflection names for the words are not resolved: read them from the decompiled shader's
+cbuffer layout.
+
+Constant buffer binds in snapshot draws (`constantBuffers`, with or without values) are the pixel or compute stage's, like
+SRVs and UAVs: before this change a vertex shader bind on D3D11 could overwrite the pixel shader's slot.
+
+### Replacement status (`devkit_list_replacements`)
+
+Lists every shader hash a loaded add-on registered a replacement for on the device: `compileTime` (registered for
+replacement when the game creates a pipeline) and `runtime` (registered for replacement when a pipeline is bound). RenoDX
+mods usually register both; the Devkit's live shaders are runtime only. For the current snapshot it counts, per hash,
+`snapshotDraws` (draws whose pipeline uses the original hash; snapshot draws always record original hashes) and
+`snapshotDrawsReplaced` (of those, draws whose pipeline had the replacement in effect when the draw was captured: created
+with it, or with a bind-time replacement pipeline built for that stage). Loading or unloading live shaders afterwards does
+not change these counts; take a new snapshot. `snapshotPending` is true while a snapshot is queued or capturing. Reading it:
+
+- `snapshotDraws: 0`: the shader did not draw in the snapshot frame (wrong scene, or the hash is not the one the game uses).
+- `snapshotDraws` above `snapshotDrawsReplaced`: the original shader still drew for some draws, for example a pipeline created
+  before the mod loaded or a replacement that failed to compile.
+
+It answers "is my shader live and drawing here?" without reading `ReShade.log`. Queue a snapshot first.
 
 ## 7. Shader inspection and dumping
 
@@ -252,6 +315,37 @@ The PNG is for quick visual inspection, not for HDR truth.
   BT.709) the result adds `analysis.nits`: luminance and max-channel stats in nits, luminance percentiles (p50/p90/p99/p99.9)
   and the share of pixels above 203/400/1000/4000 nits. Only use it on a resource that actually holds that encoding, such as
   the swap chain or an HDR10/scRGB output target.
+
+### Measure point
+
+`devkit_analyze_resource` takes `measurePoint`, and every result reports which one it used:
+
+- `present` (default): read inside the Devkit's own `present` handler, before ReShade's effects and overlay. Add-ons whose
+  `present` handlers run after the Devkit's (ReShade calls them in load order; add-ons in the game folder load in directory
+  order, which is why the Devkit is installed as `zz-renodx-devkit.addon64`) are not included.
+- `frame_end`: read in `reshade_present`, which ReShade raises after every add-on's `present` handler and after its own
+  effects and overlay, the same point as the watch's end-of-frame measurement. Includes the ReShade menu, FPS/clock and any
+  active effect such as Lilium: disable them for clean numbers. A back buffer is read at the frame end of its own swap chain
+  (as the watch does). Needs a swap chain with a ReShade effect runtime on the game's device (otherwise the call times out
+  after 15 s; so does a D3D9 present that ReShade skips). Not verified with a RenoDX DX9 proxy mod, where the effect
+  runtime runs on the proxy device: expect the timeout there and use `present`. Refused on Vulkan for now: the analysis flushes ReShade's immediate command list and waits
+  for the queue, and inside `reshade_present` that would submit ReShade's effect commands without the present's wait
+  semaphores.
+
+### Multisampled resources
+
+On D3D9, D3D10/11 and OpenGL, `devkit_analyze_resource` resolves a multisampled texture (ReShade's `resolve_texture_region`,
+which averages the samples) into a temporary single-sample texture of the source's own format (an sRGB target stays sRGB; a typeless one is resolved
+with the typed format of the analyzed view, else its default typed format) and analyzes that; the result reports
+`resolvedFromSampleCount`. The whole texture is resolved on every API (D3D10/11 cannot resolve a box, and an OpenGL
+multisample blit must keep identical bounds), then the region is copied out of it. Refused, besides D3D12/Vulkan and
+depth-stencil: formats D3D10/11 cannot resolve (integer formats), and a multisampled OpenGL default framebuffer (ReShade's
+GL resolve flips its rows, which a multisample blit does not allow; analyze the texture the game renders into before
+presenting). OpenGL does not report resolve support, so an integer multisampled texture there keeps one sample instead
+of averaging. `devkit_dump_resource_with_hash` shares this path. The numbers describe the resolved image, which is what the game's own resolve produces
+for a plain box resolve. Refused: multisampled depth-stencil resources, and every multisampled resource on D3D12 and
+Vulkan, where the resolve needs the texture in a resolve-source state the tool does not know. `devkit_watch_region` still
+refuses multisampled textures: watch the texture the game resolves into instead.
 
 ### Watching a region over time (`devkit_watch_region`, D3D9Ex, D3D11, D3D12, Vulkan, OpenGL)
 
@@ -570,8 +664,9 @@ writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that 
 - When another add-on performs a write itself inside the same ReShade event as a game writer (for example a mod redirecting a
   clear onto its clone), its handler may run before or after the Devkit's, so that write lands on either side of the
   measurement.
-- Follow-up: `devkit_analyze_resource` still reads the texture inside the Devkit's own `present` handler, so on a back buffer
-  it can miss what add-ons loaded after the Devkit draw at present (the ordering problem fixed here for the watch).
+- `devkit_analyze_resource` reads by default inside the Devkit's own `present` handler, so on a back buffer it can miss
+  what add-ons loaded after the Devkit draw at present. `measurePoint: "frame_end"` reads in `reshade_present` instead (see
+  "Measure point" in section 10); it is refused on Vulkan for now.
 - Cross-queue points are reduced at the second frame end after their execution at the earliest (later when the GPU
   runs behind), so they hold scratch textures longer (on busy targets the pool can reach the budget: use a region or
   `shaderHash`), and a 1-frame watch on such a game closes a few frames later.

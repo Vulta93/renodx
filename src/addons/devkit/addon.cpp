@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cctype>
 #include <charconv>
@@ -26,6 +27,7 @@
 #include <filesystem>
 #include <format>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -34,6 +36,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -230,7 +233,23 @@ struct PipelineBindDetails {
   reshade::api::pipeline pipeline;
   reshade::api::pipeline_stage pipeline_stage;
   std::vector<uint32_t> shader_hashes;
+  // Original hashes whose replacement was in effect when the draw was recorded: the pipeline was created with it, or
+  // its bind-time replacement pipeline was built for that stage.
+  std::vector<uint32_t> replaced_shader_hashes;
 };
+
+// 32-bit values pushed for one layout parameter and stage set (D3D12 root constants, Vulkan push constants, D3D9 shader
+// constants, OpenGL uniforms). In command list state, values is indexed by value offset and first_written is the lowest
+// offset written; in a recorded draw, values holds the captured words starting at offset first_written.
+struct PushConstantValues {
+  uint32_t first_written = UINT32_MAX;
+  std::vector<uint32_t> values;
+};
+
+using PushConstantKey = std::tuple<uint64_t, uint32_t, reshade::api::shader_stage>;
+
+constexpr uint64_t MAX_CAPTURED_CONSTANT_BUFFER_BYTES = 4096u;
+constexpr size_t MAX_CAPTURED_PUSH_CONSTANT_VALUES = 1024u;
 
 struct DrawDetails {
   enum class DrawMethods : std::uint8_t {
@@ -248,6 +267,11 @@ struct DrawDetails {
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> uav_binds;
   std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> constants;
+  // Copied while the draw is recorded, since games rewrite the same constant buffer between draws. A buffer the
+  // constants tracker does not know (Trace Constant Buffers off at startup) maps to std::nullopt.
+  std::map<std::pair<uint32_t, uint32_t>, std::optional<std::vector<uint8_t>>> constant_buffer_bytes;
+  bool constant_buffer_values_supported = false;
+  std::map<PushConstantKey, PushConstantValues> push_constants;
   std::map<uint32_t, ResourceViewDetails> render_targets;
   std::vector<PipelineBindDetails> pipeline_binds;
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
@@ -336,7 +360,9 @@ struct __declspec(uuid("3224946b-5c5f-478a-8691-83fbb9f88f1b")) CommandListData 
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> pixel_uav_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> compute_srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> compute_uav_binds;
-  std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> constants;
+  std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> pixel_constants;
+  std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> compute_constants;
+  std::map<PushConstantKey, PushConstantValues> push_constants;
   std::map<uint32_t, ResourceViewDetails> render_targets;
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
@@ -412,6 +438,8 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
 
   reshade::api::effect_runtime* runtime = nullptr;
   std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_resource_analysis_requests;
+  // measurePoint 'frame_end' requests, processed in reshade_present.
+  std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_frame_end_resource_analysis_requests;
   std::deque<std::shared_ptr<PendingLiveShaderRequest>> pending_live_shader_requests;
 
   std::unordered_map<uint32_t, std::set<uint32_t>> shader_draw_indexes;
@@ -2622,7 +2650,8 @@ std::vector<DeviceData*> device_data_list;
 [[nodiscard]] devkit_draw_summary::DrawSummary BuildDrawSummary(
     size_t draw_index,
     const DrawDetails& draw_details,
-    bool include_details) {
+    bool include_details,
+    bool include_constant_values) {
   std::set<uint32_t> shader_hashes;
   for (const auto& pipeline_bind : draw_details.pipeline_binds) {
     shader_hashes.insert(pipeline_bind.shader_hashes.begin(), pipeline_bind.shader_hashes.end());
@@ -2687,13 +2716,22 @@ std::vector<DeviceData*> device_data_list;
     });
   }
 
+  const auto to_floats = [](std::span<const uint32_t> words) {
+    std::vector<float> floats;
+    floats.reserve(words.size());
+    for (const auto word : words) {
+      floats.push_back(std::bit_cast<float>(word));
+    }
+    return floats;
+  };
+
   std::vector<devkit_draw_summary::ConstantBufferSummary> constant_buffers = {};
   constant_buffers.reserve(draw_details.constants.size());
   for (const auto& [slot_space, buffer_range] : draw_details.constants) {
     const auto slot = slot_space.first;
     const auto space = slot_space.second;
     if (buffer_range.buffer.handle == 0u) continue;
-    constant_buffers.push_back(devkit_draw_summary::ConstantBufferSummary{
+    auto& constant_buffer = constant_buffers.emplace_back(devkit_draw_summary::ConstantBufferSummary{
         .slot = slot,
         .space = space,
         .buffer_handle = FormatHandle(buffer_range.buffer.handle),
@@ -2703,6 +2741,41 @@ std::vector<DeviceData*> device_data_list;
         .used_by_active_shader =
             IsResourceBindUsedByShader(draw_details.resource_binds, ResourceBind::BindType::CBV, slot, space),
     });
+    if (!include_constant_values) continue;
+    const auto captured_bytes = draw_details.constant_buffer_bytes.find(slot_space);
+    if (!draw_details.constant_buffer_values_supported) {
+      constant_buffer.values_source = "unsupported_api";
+    } else if (captured_bytes == draw_details.constant_buffer_bytes.end()) {
+      constant_buffer.values_source = "not_read_by_shader";
+    } else if (!captured_bytes->second.has_value()) {
+      constant_buffer.values_source = "untracked";
+    } else {
+      const auto& bytes = captured_bytes->second.value();
+      std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
+      std::memcpy(words.data(), bytes.data(), words.size() * sizeof(uint32_t));
+      constant_buffer.values_source = "cpu_cache";
+      constant_buffer.values_truncated = bytes.size() == MAX_CAPTURED_CONSTANT_BUFFER_BYTES
+                                         && buffer_range.size > MAX_CAPTURED_CONSTANT_BUFFER_BYTES;
+      constant_buffer.float_values = to_floats(words);
+      constant_buffer.uint_values = std::move(words);
+    }
+  }
+
+  if (include_constant_values) {
+    std::vector<devkit_draw_summary::PushConstantSummary> push_constants = {};
+    push_constants.reserve(draw_details.push_constants.size());
+    for (const auto& [push_constant_key, pushed] : draw_details.push_constants) {
+      const auto& [layout_handle, layout_param, stages] = push_constant_key;
+      push_constants.push_back(devkit_draw_summary::PushConstantSummary{
+          .layout_handle = FormatHandle(layout_handle),
+          .layout_param = layout_param,
+          .stages = StreamToString(stages),
+          .first_value = pushed.first_written,
+          .float_values = to_floats(pushed.values),
+          .uint_values = pushed.values,
+      });
+    }
+    draw_summary.push_constants = std::move(push_constants);
   }
 
   std::vector<devkit_draw_summary::RenderTargetSummary> render_targets = {};
@@ -2834,9 +2907,39 @@ std::vector<DeviceData*> device_data_list;
   }
   auto* device_data = device_data_list[device_index];
 
+  if (request->at_frame_end && device_data->device->get_api() == reshade::api::device_api::vulkan) {
+    // The analysis flushes ReShade's immediate command list and waits for the queue. Inside reshade_present on Vulkan
+    // that list already holds ReShade's effect commands, which would then be submitted without the present's wait
+    // semaphores (the watch defers its own signal to finish_present for the same reason).
+    const std::string error = "measurePoint 'frame_end' is not supported on Vulkan yet; use 'present', or devkit_watch_region, whose end-of-frame measurement is taken there.";
+    {
+      std::scoped_lock request_lock(request->mutex);
+      request->result = devkit_resource_analysis::ToolResult{
+          .text = error,
+          .structured_content = devkit_resource_analysis::json{{"error", error}},
+          .is_error = true,
+      };
+      request->completed = true;
+    }
+    request->cv.notify_all();
+    return true;
+  }
+
   std::unique_lock device_lock(device_data->mutex);
-  device_data->pending_resource_analysis_requests.push_back(request);
+  if (request->at_frame_end) {
+    device_data->pending_frame_end_resource_analysis_requests.push_back(request);
+  } else {
+    device_data->pending_resource_analysis_requests.push_back(request);
+  }
   return true;
+}
+
+[[nodiscard]] devkit_resource_analysis::ProcessingContext BuildResourceAnalysisProcessingContext() {
+  return devkit_resource_analysis::ProcessingContext{
+      .format_handle = [](uint64_t value) { return FormatHandle(value); },
+      .format_format = [](reshade::api::format format) { return StreamToString(format); },
+      .build_resource_view_summary = [](reshade::api::resource_view resource_view, reshade::api::device* device) { return BuildResourceViewSummary(GetResourceViewDetails(resource_view, device)); },
+  };
 }
 
 void CancelPendingResourceAnalysisRequest(
@@ -2850,6 +2953,7 @@ void CancelPendingResourceAnalysisRequest(
 
   std::unique_lock device_lock(device_data->mutex);
   std::erase(device_data->pending_resource_analysis_requests, request);
+  std::erase(device_data->pending_frame_end_resource_analysis_requests, request);
 }
 
 [[nodiscard]] bool EnqueuePendingWatchRegionRequest(
@@ -4117,10 +4221,10 @@ void ProcessPendingLiveShaderRequests(
         std::vector<devkit_draw_summary::DrawSummary> draws;
         draws.reserve(device_data->draw_details_list.size());
         for (size_t index = 0; index < device_data->draw_details_list.size(); ++index) {
-          draws.push_back(BuildDrawSummary(index, device_data->draw_details_list[index], false));
+          draws.push_back(BuildDrawSummary(index, device_data->draw_details_list[index], false, false));
         }
         return draws; },
-      .get_draw = [](uint32_t device_index, uint32_t draw_index) {
+      .get_draw = [](uint32_t device_index, uint32_t draw_index, bool include_constant_values) {
         std::shared_lock list_lock(device_data_list_mutex);
         if (device_index >= device_data_list.size()) {
           throw std::runtime_error(std::format("Device #{} is not available.", device_index));
@@ -4132,7 +4236,7 @@ void ProcessPendingLiveShaderRequests(
           throw std::runtime_error(std::format("drawIndex {} is out of range.", draw_index));
         }
 
-        return BuildDrawSummary(draw_index, device_data->draw_details_list[draw_index], true); },
+        return BuildDrawSummary(draw_index, device_data->draw_details_list[draw_index], true, include_constant_values); },
       .build_snapshot_summary = [](uint32_t device_index) {
         std::shared_lock list_lock(device_data_list_mutex);
         if (device_index >= device_data_list.size()) {
@@ -4220,6 +4324,52 @@ void ProcessPendingLiveShaderRequests(
                 {"traceQueued", snapshot_trace_with_snapshot.load()},
             },
         }; },
+      .list_replacements = [](uint32_t device_index) {
+        std::shared_lock list_lock(device_data_list_mutex);
+        if (device_index >= device_data_list.size()) {
+          throw std::runtime_error(std::format("Device #{} is not available.", device_index));
+        }
+        auto* device_data = device_data_list[device_index];
+
+        // Ordered by hash so that repeated calls list the replacements in the same order.
+        std::map<uint32_t, devkit_shader_summary::ReplacementSummary> replacements;
+        renodx::utils::shader::ForEachCompileTimeReplacement(device_data->device, [&](uint32_t shader_hash, std::span<const uint8_t> /*bytecode*/) {
+          replacements[shader_hash].compile_time = true;
+        });
+        renodx::utils::shader::ForEachRuntimeReplacement(device_data->device, [&](uint32_t shader_hash, std::span<const uint8_t> /*bytecode*/) {
+          replacements[shader_hash].runtime = true;
+        });
+
+        std::shared_lock device_lock(device_data->mutex);
+        devkit_shader_summary::ReplacementListSummary result = {
+            .captured_draws = device_data->draw_details_list.size(),
+            .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device),
+        };
+        for (const auto& draw_details : device_data->draw_details_list) {
+          for (const auto& pipeline_bind : draw_details.pipeline_binds) {
+            for (const auto shader_hash : pipeline_bind.shader_hashes) {
+              const auto replacement_entry = replacements.find(shader_hash);
+              if (replacement_entry == replacements.end()) continue;
+              auto& replacement = replacement_entry->second;
+              ++replacement.snapshot_draws;
+              if (std::ranges::find(pipeline_bind.replaced_shader_hashes, shader_hash) != pipeline_bind.replaced_shader_hashes.end()) {
+                ++replacement.snapshot_draws_replaced;
+              }
+            }
+          }
+        }
+
+        result.replacements.reserve(replacements.size());
+        for (auto& [shader_hash, replacement] : replacements) {
+          replacement.hash = FormatShaderHash(shader_hash);
+          replacement.hash_value = shader_hash;
+          if (const auto shader_details = device_data->shader_details.find(shader_hash);
+              shader_details != device_data->shader_details.end()) {
+            replacement.stage = StreamToString(shader_details->second.shader_type);
+          }
+          result.replacements.push_back(std::move(replacement));
+        }
+        return result; },
   };
 }
 
@@ -4936,6 +5086,30 @@ void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade
   devkit_watch_region::OnExecuteSecondaryCommandList(&device_data->watch_region_watcher, cmd_list, secondary_cmd_list);
 }
 
+void OnPushConstants(
+    reshade::api::command_list* cmd_list,
+    reshade::api::shader_stage stages,
+    reshade::api::pipeline_layout layout,
+    uint32_t layout_param,
+    uint32_t first,
+    uint32_t count,
+    const void* values) {
+  if (cmd_list->get_device() != snapshot_device) return;
+  auto* data = renodx::utils::data::Get<CommandListData>(cmd_list);
+  if (data == nullptr) return;
+
+  // OpenGL addresses uniforms by location * 4, so a stray large location must not allocate without bound.
+  constexpr uint64_t MAX_PUSH_CONSTANT_VALUES = 65536u;
+  if (count == 0u || static_cast<uint64_t>(first) + count > MAX_PUSH_CONSTANT_VALUES) return;
+
+  auto& pushed = data->push_constants[{layout.handle, layout_param, stages}];
+  if (pushed.values.size() < first + count) {
+    pushed.values.resize(first + count, 0u);
+  }
+  std::copy_n(static_cast<const uint32_t*>(values), count, pushed.values.begin() + first);
+  pushed.first_written = std::min(pushed.first_written, first);
+}
+
 void OnPushDescriptors(
     reshade::api::command_list* cmd_list,
     reshade::api::shader_stage stages,
@@ -5041,6 +5215,12 @@ void OnPushDescriptors(
     }
 
     case reshade::api::descriptor_type::constant_buffer: {
+      // Constant buffers are kept per pixel and compute stage: D3D11 binds every stage's buffers through the same layout
+      // parameter, so one map would let a vertex or compute bind overwrite the pixel shader's slot. A bind visible to
+      // both (OpenGL binds uniform buffers for all stages) goes into both.
+      const bool binds_pixel = renodx::utils::bitwise::HasFlag(stages, reshade::api::shader_stage::pixel);
+      const bool binds_compute = renodx::utils::bitwise::HasFlag(stages, reshade::api::shader_stage::compute);
+      if (!binds_pixel && !binds_compute) return;
       for (uint32_t i = 0; i < update.count; i++) {
         uint32_t pair_a = 0u;
         uint32_t pair_b = 0u;
@@ -5081,7 +5261,12 @@ void OnPushDescriptors(
         }
         const auto buffer_range =
             static_cast<const reshade::api::buffer_range*>(update.descriptors)[i];
-        data->constants[{pair_a, pair_b}] = buffer_range;
+        if (binds_pixel) {
+          data->pixel_constants[{pair_a, pair_b}] = buffer_range;
+        }
+        if (binds_compute) {
+          data->compute_constants[{pair_a, pair_b}] = buffer_range;
+        }
       }
       return;
     }
@@ -5183,6 +5368,15 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         if (std::ranges::find(bind.shader_hashes, identity.shader_hash) == bind.shader_hashes.end()) {
           bind.shader_hashes.push_back(identity.shader_hash);
         }
+        const bool replaced_on_create = std::ranges::find(info->replaced_shader_subobject_indexes, identity.subobject_index)
+                                        != info->replaced_shader_subobject_indexes.end();
+        const bool replaced_on_bind = info->details.initialized_replacement
+                                      && info->details.replacement_pipeline.handle != 0u
+                                      && renodx::utils::bitwise::HasFlag(info->details.replacement_stages, identity.stage);
+        if ((replaced_on_create || replaced_on_bind)
+            && std::ranges::find(bind.replaced_shader_hashes, identity.shader_hash) == bind.replaced_shader_hashes.end()) {
+          bind.replaced_shader_hashes.push_back(identity.shader_hash);
+        }
       }
     }
     return *bound_shaders;
@@ -5197,12 +5391,13 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     draw_details.draw_method = draw_method;
     draw_details.cmd_list_handle = reinterpret_cast<uint64_t>(cmd_list);
     draw_details.cmd_list_draw_index = command_list_data->draw_counter++;
-    draw_details.constants = command_list_data->constants;
     // draw_details.pipeline_binds = command_list_data->pipeline_binds;
     if (draw_method == DrawDetails::DrawMethods::DISPATCH) {
+      draw_details.constants = command_list_data->compute_constants;
       draw_details.srv_binds = command_list_data->compute_srv_binds;
       draw_details.uav_binds = command_list_data->compute_uav_binds;
     } else {
+      draw_details.constants = command_list_data->pixel_constants;
       draw_details.srv_binds = command_list_data->pixel_srv_binds;
       draw_details.uav_binds = command_list_data->pixel_uav_binds;
     }
@@ -5274,6 +5469,10 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         draw_method == DrawDetails::DrawMethods::DISPATCH
             ? reshade::api::pipeline_stage::compute_shader
             : reshade::api::pipeline_stage::pixel_shader);
+    const auto device_api = device->get_api();
+    // The root signature / pipeline layout bound for this draw's bind point (D3D12 and Vulkan), used below to drop root
+    // and push constants pushed for another layout.
+    std::optional<uint64_t> bound_layout_handle = std::nullopt;
     if (bound_pipeline.handle != 0u) {
       auto* pipeline_shader_details = renodx::utils::shader::GetPipelineShaderDetails(bound_pipeline);
       if (pipeline_shader_details != nullptr) {
@@ -5285,6 +5484,12 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         if (!descriptor_table_state.has_value()) return false;
         const auto& bound_pipeline_layout = descriptor_table_state->layout;
         const auto& bound_descriptor_tables = descriptor_table_state->tables;
+        // utils::state only knows this layout once descriptor tables were bound with it (0 after a root signature change
+        // without tables); then no layout filter is applied.
+        if ((device_api == reshade::api::device_api::d3d12 || device_api == reshade::api::device_api::vulkan)
+            && bound_pipeline_layout.handle != 0u) {
+          bound_layout_handle = bound_pipeline_layout.handle;
+        }
         if (bound_pipeline_layout == pipeline_shader_details->layout) {
           const bool has_reflected_resource_binds = draw_details.resource_binds.has_value() && !draw_details.resource_binds->empty();
           auto* descriptor_data = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
@@ -5472,6 +5677,46 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           });
         }
       }
+    }
+
+    // Constant values, after the descriptor-table walk above has added the constant buffers bound through tables. They are
+    // kept only for what the active shader reads (every bound buffer when its bindings are not reflected), with caps so
+    // that a snapshot of thousands of draws stays small.
+    const bool has_reflected_shader_binds = draw_details.resource_binds.has_value() && !draw_details.resource_binds->empty();
+    // D3D12 and Vulkan games write constant buffers through persistent maps or copies, which the CPU-side cache never
+    // sees, so their buffer values are not reported; root and push constants are.
+    draw_details.constant_buffer_values_supported = (device_api != reshade::api::device_api::d3d12
+                                                     && device_api != reshade::api::device_api::vulkan);
+    for (const auto& [slot_space, buffer_range] : draw_details.constants) {
+      if (!draw_details.constant_buffer_values_supported) break;
+      if (buffer_range.buffer.handle == 0u) continue;
+      const auto& [slot, space] = slot_space;
+      if (has_reflected_shader_binds
+          && !IsResourceBindUsedByShader(draw_details.resource_binds, ResourceBind::BindType::CBV, slot, space)) {
+        continue;
+      }
+      draw_details.constant_buffer_bytes[slot_space] = renodx::utils::constants::GetResourceCacheRange(
+          buffer_range.buffer,
+          buffer_range.offset,
+          std::min(buffer_range.size, MAX_CAPTURED_CONSTANT_BUFFER_BYTES));
+    }
+
+    const auto active_stage = (draw_method == DrawDetails::DrawMethods::DISPATCH
+                                   ? reshade::api::shader_stage::compute
+                                   : reshade::api::shader_stage::pixel);
+    // D3D12 root arguments and Vulkan push constants belong to the bound layout; values pushed for an earlier one are stale.
+    // D3D9 and OpenGL push into one global layout.
+    for (const auto& [push_constant_key, pushed] : command_list_data->push_constants) {
+      const auto& [layout_handle, layout_param, stages] = push_constant_key;
+      if (!renodx::utils::bitwise::HasAnyFlag(stages, active_stage)) continue;
+      if (bound_layout_handle.has_value() && layout_handle != bound_layout_handle.value()) continue;
+      const auto captured_end = std::min<size_t>(pushed.values.size(), pushed.first_written + MAX_CAPTURED_PUSH_CONSTANT_VALUES);
+      draw_details.push_constants.emplace(
+          push_constant_key,
+          PushConstantValues{
+              .first_written = pushed.first_written,
+              .values = {pushed.values.begin() + pushed.first_written, pushed.values.begin() + captured_end},
+          });
     }
 
     draw_details.render_targets.clear();
@@ -9387,6 +9632,42 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
     }
   }
 
+  // measurePoint 'frame_end' analyses run before the watch records its frame-end reductions, so that their flush and
+  // wait for the queue do not split the watch's work.
+  std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_frame_end_requests;
+  {
+    std::unique_lock device_lock(device_data->mutex);
+    pending_frame_end_requests.swap(device_data->pending_frame_end_resource_analysis_requests);
+  }
+  // As for the watch, a back buffer of another swap chain is read at that swap chain's own frame end.
+  std::vector<uint64_t> own_back_buffer_handles;
+  for (uint32_t index = 0u; index < runtime->get_back_buffer_count(); ++index) {
+    own_back_buffer_handles.push_back(runtime->get_back_buffer(index).handle);
+  }
+  std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> other_swap_chain_requests;
+  std::erase_if(pending_frame_end_requests, [&](const std::shared_ptr<devkit_resource_analysis::PendingRequest>& request) {
+    const auto resource = renodx::utils::resource::GetResourceFromView(device, request->resource_view);
+    const bool is_other_back_buffer = renodx::utils::swapchain::IsBackBuffer(resource)
+                                      && std::ranges::find(own_back_buffer_handles, resource.handle) == own_back_buffer_handles.end();
+    if (is_other_back_buffer) {
+      other_swap_chain_requests.push_back(request);
+    }
+    return is_other_back_buffer;
+  });
+  devkit_resource_analysis::ProcessPendingRequests(
+      pending_frame_end_requests,
+      device_index,
+      device,
+      runtime->get_command_queue(),
+      BuildResourceAnalysisProcessingContext());
+  if (!other_swap_chain_requests.empty()) {
+    std::unique_lock device_lock(device_data->mutex);
+    device_data->pending_frame_end_resource_analysis_requests.insert(
+        device_data->pending_frame_end_resource_analysis_requests.begin(),
+        other_swap_chain_requests.begin(),
+        other_swap_chain_requests.end());
+  }
+
   std::span<const uint8_t> reduce_shader = __watch_region_reduce_dx11;
   switch (device->get_api()) {
     case reshade::api::device_api::d3d9:
@@ -9488,11 +9769,7 @@ void OnPresent(
         device_index,
         device_data->device,
         queue,
-        devkit_resource_analysis::ProcessingContext{
-            .format_handle = [](uint64_t value) { return FormatHandle(value); },
-            .format_format = [](reshade::api::format format) { return StreamToString(format); },
-            .build_resource_view_summary = [](reshade::api::resource_view resource_view, reshade::api::device* device) { return BuildResourceViewSummary(GetResourceViewDetails(resource_view, device)); },
-        });
+        BuildResourceAnalysisProcessingContext());
 
     std::deque<std::shared_ptr<PendingLiveShaderRequest>> pending_live_shader_requests;
     {
@@ -9677,6 +9954,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
 
+      reshade::register_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::register_event<reshade::addon_event::draw>(OnDraw);
       reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
@@ -9758,6 +10036,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::create_resource>(OnCreateResource);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+      reshade::unregister_event<reshade::addon_event::push_constants>(OnPushConstants);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
       reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);

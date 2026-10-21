@@ -28,6 +28,7 @@
 
 #include <include/reshade.hpp>
 
+#include "../../../utils/bitwise.hpp"
 #include "../../../utils/exr.hpp"
 #include "../../../utils/mcp/types.hpp"
 #include "../../../utils/mcp/arguments.hpp"
@@ -70,6 +71,9 @@ struct PendingRequest {
   bool prefer_clone = false;
   std::optional<reshade::api::subresource_box> region = std::nullopt;
   Signal signal = Signal::RAW;
+  // measurePoint 'frame_end': read in reshade_present, after every add-on's present handler and ReShade's effects and
+  // overlay, instead of in the Devkit's own present handler.
+  bool at_frame_end = false;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -760,12 +764,47 @@ inline void EncodePreviewPixel(
         .is_error = true,
     };
   }
-  if (target.resolved_resource_desc.texture.samples != 1u) {
-    return ToolResult{
-        .text = "Multisampled resources are not currently supported.",
-        .structured_content = json{{"error", "Multisampled resources are not currently supported."}},
-        .is_error = true,
-    };
+  const auto sample_count = target.resolved_resource_desc.texture.samples;
+  // The resolve keeps the source's own format (an sRGB target stays sRGB) because D3D10/11 drop a resolve whose typed
+  // formats differ. A typeless source is resolved the way the view reads it (sRGB or not), else as its default typed
+  // format.
+  const auto resource_format = target.resolved_resource_desc.texture.format;
+  const auto view_format = target.resolved_view_desc.format;
+  const bool view_types_resource = view_format != reshade::api::format::unknown
+                                   && !reshade::api::format_is_typeless(view_format)
+                                   && reshade::api::format_to_typeless(view_format) == reshade::api::format_to_typeless(resource_format);
+  const auto resolve_format = (reshade::api::format_is_typeless(resource_format) && view_types_resource
+                                   ? view_format
+                                   : reshade::api::format_to_default_typed(resource_format));
+  if (sample_count != 1u) {
+    std::optional<std::string> multisample_error = std::nullopt;
+    switch (device->get_api()) {
+      case reshade::api::device_api::d3d12:
+      case reshade::api::device_api::vulkan:
+        // A resolve needs the source in its resolve-source state, which the tool does not know on these APIs.
+        multisample_error = "Multisampled resources can only be analyzed on D3D9, D3D10/11 and OpenGL.";
+        break;
+      default:
+        if (renodx::utils::bitwise::HasAnyFlag(target.resolved_resource_desc.usage, reshade::api::resource_usage::depth_stencil)) {
+          multisample_error = "Multisampled depth-stencil resources cannot be resolved for analysis.";
+        } else if (device->get_api() == reshade::api::device_api::opengl
+                   && static_cast<uint32_t>(target.resolved_resource.handle >> 40u) == 0x8218u /* GL_FRAMEBUFFER_DEFAULT */) {
+          // ReShade's GL resolve is a framebuffer blit that flips rows of the default framebuffer, and a blit from a
+          // multisampled framebuffer must keep identical source and destination bounds.
+          multisample_error = "A multisampled OpenGL default framebuffer cannot be resolved for analysis; analyze the texture the game renders into before presenting.";
+        } else if (!device->check_format_support(resolve_format, reshade::api::resource_usage::resolve_dest)) {
+          // Integer formats cannot be resolved; the runtime would drop the call and the readback would be empty.
+          multisample_error = "The format of this multisampled resource cannot be resolved for analysis.";
+        }
+        break;
+    }
+    if (multisample_error.has_value()) {
+      return ToolResult{
+          .text = multisample_error.value(),
+          .structured_content = json{{"error", multisample_error.value()}},
+          .is_error = true,
+      };
+    }
   }
 
   const auto summary_view = target.used_clone ? target.resolved_view : resource_view;
@@ -833,9 +872,44 @@ inline void EncodePreviewPixel(
 
   auto* cmd_list = queue->get_immediate_command_list();
   const auto* source_box = (region.has_value() ? &region.value() : nullptr);
-  cmd_list->copy_texture_region(target.resolved_resource, subresource, source_box, intermediate, 0, nullptr);
+  // A multisampled texture cannot be copied into the single-sample readback texture: it is first resolved (averaged)
+  // into a single-sample texture, which is then read like any other. The whole subresource is resolved (D3D10/11 cannot
+  // resolve a box, and an OpenGL multisample blit must keep identical bounds), then the region is copied out of it.
+  reshade::api::resource copy_source = target.resolved_resource;
+  uint32_t copy_source_subresource = subresource;
+  reshade::api::resource resolved_multisample = {0u};
+  if (sample_count != 1u) {
+    if (!device->create_resource(
+            reshade::api::resource_desc(
+                texture_width,
+                texture_height,
+                1,
+                1,
+                target.resolved_resource_desc.texture.format,
+                1,
+                reshade::api::memory_heap::gpu_only,
+                reshade::api::resource_usage::resolve_dest | reshade::api::resource_usage::copy_source),
+            nullptr,
+            reshade::api::resource_usage::resolve_dest,
+            &resolved_multisample)) {
+      device->destroy_resource(intermediate);
+      return ToolResult{
+          .text = "Failed to create the single-sample texture to resolve the multisampled resource into.",
+          .structured_content = json{{"error", "Failed to create the single-sample texture to resolve the multisampled resource into."}},
+          .is_error = true,
+      };
+    }
+    cmd_list->resolve_texture_region(target.resolved_resource, subresource, nullptr, resolved_multisample, 0, 0, 0, 0, resolve_format);
+    cmd_list->barrier(resolved_multisample, reshade::api::resource_usage::resolve_dest, reshade::api::resource_usage::copy_source);
+    copy_source = resolved_multisample;
+    copy_source_subresource = 0u;
+  }
+  cmd_list->copy_texture_region(copy_source, copy_source_subresource, source_box, intermediate, 0, nullptr);
   queue->flush_immediate_command_list();
   queue->wait_idle();
+  if (resolved_multisample.handle != 0u) {
+    device->destroy_resource(resolved_multisample);
+  }
 
   ToolResult tool_result = {
       .text = "Failed to map the readback resource.",
@@ -1355,6 +1429,9 @@ inline void EncodePreviewPixel(
             result["analysis"]["nits"]["luminance"]["max"].get<double>(),
             result["analysis"]["nits"]["luminance"]["mean"].get<double>());
       }
+      if (sample_count != 1u) {
+        result["resolvedFromSampleCount"] = sample_count;
+      }
       tool_result = ToolResult{
           .text = text,
           .structured_content = result,
@@ -1381,6 +1458,10 @@ inline void EncodePreviewPixel(
   const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
   const auto signal = internal::ParseSignal(mcp_arguments::GetOptional<std::string>(arguments, "signal").value_or("raw"));
   const auto region = internal::ParseRegion(arguments);
+  const auto measure_point = mcp_arguments::GetOptional<std::string>(arguments, "measurePoint").value_or("present");
+  if (measure_point != "present" && measure_point != "frame_end") {
+    throw std::runtime_error("measurePoint must be 'present' or 'frame_end'.");
+  }
 
   std::optional<std::filesystem::path> output_path = std::nullopt;
   if (!output_path_value.empty()) {
@@ -1406,6 +1487,7 @@ inline void EncodePreviewPixel(
   request->prefer_clone = prefer_clone;
   request->region = region;
   request->signal = signal;
+  request->at_frame_end = (measure_point == "frame_end");
 
   if (!context.enqueue_request(device_index, request)) {
     const auto error = std::format("Failed to queue the resource analysis request for device #{}.", device_index);
@@ -1424,9 +1506,12 @@ inline void EncodePreviewPixel(
       if (context.cancel_request) {
         context.cancel_request(device_index, request);
       }
+      const auto error = (request->at_frame_end
+                              ? std::string("Timed out waiting for the next frame end (reshade_present) to process the resource analysis request: measurePoint 'frame_end' needs a swap chain with a ReShade effect runtime.")
+                              : std::string("Timed out waiting for the next present to process the resource analysis request."));
       return ToolResult{
-          .text = "Timed out waiting for the next present to process the resource analysis request.",
-          .structured_content = json{{"error", "Timed out waiting for the next present to process the resource analysis request."}},
+          .text = error,
+          .structured_content = json{{"error", error}},
           .is_error = true,
       };
     }
@@ -1559,6 +1644,9 @@ inline void ProcessPendingRequests(
           .structured_content = json{{"error", exception.what()}},
           .is_error = true,
       };
+    }
+    if (!result.is_error && result.structured_content.is_object()) {
+      result.structured_content["measurePoint"] = (request->at_frame_end ? "frame_end" : "present");
     }
 
     {

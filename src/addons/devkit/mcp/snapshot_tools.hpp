@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "../../../utils/mcp/types.hpp"
@@ -49,9 +50,10 @@ struct ToolContext {
       const std::optional<std::string>& stage_filter)>
       list_shaders;
   std::function<std::vector<draw_summary::DrawSummary>(std::uint32_t device_index)> list_draws;
-  std::function<draw_summary::DrawSummary(std::uint32_t device_index, std::uint32_t draw_index)> get_draw;
+  std::function<draw_summary::DrawSummary(std::uint32_t device_index, std::uint32_t draw_index, bool include_constant_values)> get_draw;
   std::function<snapshot_summary::SnapshotSummary(std::uint32_t device_index)> build_snapshot_summary;
   std::function<ToolResult(std::uint32_t device_index)> queue_snapshot;
+  std::function<shader_summary::ReplacementListSummary(std::uint32_t device_index)> list_replacements;
 };
 
 namespace internal {
@@ -406,7 +408,10 @@ inline ToolResult HandleGetDrawTool(const json& arguments, const ToolContext& co
   }
   const auto draw_index = mcp_arguments::GetRequired<std::uint32_t>(arguments, "drawIndex");
   const auto device_index = internal::ResolveDeviceIndex(arguments, context);
-  const auto draw = context.get_draw(device_index, draw_index);
+  const auto draw = context.get_draw(
+      device_index,
+      draw_index,
+      mcp_arguments::GetOptional<bool>(arguments, "includeConstantValues").value_or(false));
   json result = draw;
   result["deviceIndex"] = device_index;
 
@@ -447,6 +452,51 @@ inline ToolResult HandleQueueSnapshotTool(const json& arguments, const ToolConte
   }
 
   return context.queue_snapshot(internal::ResolveDeviceIndex(arguments, context));
+}
+
+inline ToolResult HandleListReplacementsTool(const json& arguments, const ToolContext& context) {
+  if (!context.list_replacements) {
+    throw std::runtime_error("The snapshot tool context is not configured.");
+  }
+
+  const auto device_index = internal::ResolveDeviceIndex(arguments, context);
+  const auto list = context.list_replacements(device_index);
+  const auto drawn_count = std::ranges::count_if(list.replacements, [](const shader_summary::ReplacementSummary& replacement) {
+    return replacement.snapshot_draws != 0u;
+  });
+  const auto fully_replaced_count = std::ranges::count_if(list.replacements, [](const shader_summary::ReplacementSummary& replacement) {
+    return replacement.snapshot_draws != 0u && replacement.snapshot_draws_replaced == replacement.snapshot_draws;
+  });
+
+  std::string text;
+  if (list.snapshot_pending) {
+    text = std::format(
+        "Device #{} has {} registered shader replacement(s). A snapshot is queued or still capturing: call again once it has finished for draw counts.",
+        device_index,
+        list.replacements.size());
+  } else if (list.captured_draws == 0u) {
+    text = std::format(
+        "Device #{} has {} registered shader replacement(s). There is no snapshot, so draw counts are 0: queue a snapshot to see which replaced shaders draw.",
+        device_index,
+        list.replacements.size());
+  } else {
+    text = std::format(
+        "Device #{} has {} registered shader replacement(s); {} drew in the snapshot ({} captured draws), {} of them replaced in every draw.",
+        device_index,
+        list.replacements.size(),
+        drawn_count,
+        list.captured_draws,
+        fully_replaced_count);
+  }
+  return ToolResult{
+      .text = std::move(text),
+      .structured_content = json{
+          {"deviceIndex", device_index},
+          {"capturedDraws", list.captured_draws},
+          {"snapshotPending", list.snapshot_pending},
+          {"replacements", list.replacements},
+      },
+  };
 }
 
 }  // namespace renodx::addons::devkit::mcp::snapshot_tools

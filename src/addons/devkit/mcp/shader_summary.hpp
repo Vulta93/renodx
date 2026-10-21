@@ -74,4 +74,36 @@ inline void to_json(json& j, const TrackedShaderSummary& value) {
   }
 }
 
+// One shader hash that an add-on (a game mod, or the Devkit's live shaders) registered a replacement for, and how the
+// draws of the current snapshot used it. Snapshot draws record the original shader hash, so the counts match by it.
+struct ReplacementSummary {
+  std::string hash;
+  std::uint32_t hash_value = 0u;
+  std::optional<std::string> stage = std::nullopt;
+  bool compile_time = false;
+  bool runtime = false;
+  std::size_t snapshot_draws = 0u;
+  std::size_t snapshot_draws_replaced = 0u;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const ReplacementSummary& value) {
+  j = {
+      {"hash", value.hash},
+      {"hashValue", value.hash_value},
+      {"stage", value.stage.has_value() ? json(value.stage.value()) : json(nullptr)},
+      {"compileTime", value.compile_time},
+      {"runtime", value.runtime},
+      {"snapshotDraws", value.snapshot_draws},
+      {"snapshotDrawsReplaced", value.snapshot_draws_replaced},
+  };
+}
+
+// Read under one lock, so that the captured draw count matches the per-hash counts.
+struct ReplacementListSummary {
+  std::size_t captured_draws = 0u;
+  bool snapshot_pending = false;
+  std::vector<ReplacementSummary> replacements;
+};
+
 }  // namespace renodx::addons::devkit::mcp::shader_summary

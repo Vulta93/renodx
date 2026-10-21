@@ -5,11 +5,14 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include "../../../utils/mcp/server.hpp"
 #include "../../../utils/mcp/arguments.hpp"
@@ -55,6 +58,18 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
     });
   };
 
+  // delaySeconds lets a capture land on gameplay after the game is unpaused. The wait happens before the request is
+  // queued, so it does not count against the tool's own wait for the next present.
+  const auto wait_requested_delay = [](const renodx::utils::mcp::json& arguments) {
+    const auto delay_seconds = renodx::utils::mcp::arguments::GetOptional<std::uint32_t>(arguments, "delaySeconds");
+    if (!delay_seconds.has_value()) return;
+    std::this_thread::sleep_for(std::chrono::seconds(renodx::utils::mcp::arguments::ValidateRange<std::uint32_t>(
+        "delaySeconds",
+        delay_seconds.value(),
+        0u,
+        tool_catalog::MAX_CAPTURE_DELAY_SECONDS)));
+  };
+
   register_tool("devkit_status", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                       const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleStatusTool(arguments, build_snapshot_tools_context());
@@ -95,16 +110,22 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                           const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleListDrawsTool(arguments, build_snapshot_tools_context());
   });
+  register_tool("devkit_list_replacements", [build_snapshot_tools_context = context.build_snapshot_tools_context](
+                                                 const renodx::utils::mcp::json& arguments) {
+    return snapshot_tools::HandleListReplacementsTool(arguments, build_snapshot_tools_context());
+  });
   register_tool("devkit_get_draw", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                         const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleGetDrawTool(arguments, build_snapshot_tools_context());
   });
-  register_tool("devkit_analyze_resource", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
+  register_tool("devkit_analyze_resource", [wait_requested_delay, build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                const renodx::utils::mcp::json& arguments) {
+    wait_requested_delay(arguments);
     return resource_analysis::HandleAnalyzeResourceTool(arguments, build_analyze_resource_tool_context());
   });
-  register_tool("devkit_watch_region", [build_watch_region_tool_context = context.build_watch_region_tool_context](
+  register_tool("devkit_watch_region", [wait_requested_delay, build_watch_region_tool_context = context.build_watch_region_tool_context](
                                            const renodx::utils::mcp::json& arguments) {
+    wait_requested_delay(arguments);
     return watch_region::HandleWatchRegionTool(arguments, build_watch_region_tool_context());
   });
   register_tool("devkit_dump_resource_with_hash", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
@@ -151,8 +172,9 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                                const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleSnapshotSummaryTool(arguments, build_snapshot_tools_context());
   });
-  register_tool("devkit_queue_snapshot", [build_snapshot_tools_context = context.build_snapshot_tools_context](
+  register_tool("devkit_queue_snapshot", [wait_requested_delay, build_snapshot_tools_context = context.build_snapshot_tools_context](
                                              const renodx::utils::mcp::json& arguments) {
+    wait_requested_delay(arguments);
     return snapshot_tools::HandleQueueSnapshotTool(arguments, build_snapshot_tools_context());
   });
 }

@@ -5,9 +5,13 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "../../../utils/mcp/types.hpp"
 
 namespace renodx::addons::devkit::mcp::tool_catalog {
+inline constexpr std::uint32_t MAX_CAPTURE_DELAY_SECONDS = 30u;
+
 inline renodx::utils::mcp::InputSchemaProperty MakeFlexibleHandleProperty() {
   return renodx::utils::mcp::InputSchemaProperty{
       .types = {"string"},
@@ -205,14 +209,30 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_list_replacements",
+        {
+            .title = "List Replacements",
+            .description = "List every shader hash an add-on registered a replacement for on the device (compileTime: registered for replacement when the game creates a pipeline; runtime: registered for replacement when a pipeline is bound. RenoDX mods usually register both; the Devkit's live shaders are runtime only), with how the current snapshot's draws used it, recorded when each draw was captured: snapshotDraws (draws whose pipeline uses the original hash) and snapshotDrawsReplaced (of those, draws whose pipeline had the replacement in effect at that moment: created with it, or a bind-time replacement pipeline built for that stage). A registered hash with snapshotDraws 0 did not draw in the snapshot frame; snapshotDraws above snapshotDrawsReplaced means the original shader still drew. Counts need a finished snapshot (devkit_queue_snapshot); snapshotPending is true while one is queued or capturing.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                },
+            },
+            .annotations = {
+                .read_only_hint = true,
+            },
+        },
+    },
+    {
         "devkit_get_draw",
         {
             .title = "Get Draw",
-            .description = "Return full details for a single captured draw, including bindings and blend state.",
+            .description = "Return full details for a single captured draw, including bindings and blend state. includeConstantValues adds the constant values the draw saw, copied when the snapshot recorded it: per bound constant buffer, valuesSource (cpu_cache: the bytes the CPU last wrote through map/unmap or update_buffer_region, at most 4096 bytes from the bound offset, valuesTruncated when that cap was reached; untracked: the Devkit setting 'Trace Constant Buffers' was off when the game started, the buffer is not a tracked constant buffer, or it was mapped at that moment; not_read_by_shader: the active shader's reflected bindings do not include it; unsupported_api: D3D12/Vulkan, whose buffers are written through persistent maps or copies the CPU cache cannot see) with floatValues and uintValues (32-bit words); and pushConstants for the active stage and, on D3D12/Vulkan, the bound layout (D3D12 root constants, Vulkan push constants, D3D9 Set*ShaderConstantF/I with register N at word 4*N and Set*ShaderConstantB at word N (layoutParam 5/6/7 for the pixel shader's F/I/B), OpenGL glUniform* at word 4*location, keyed per context, not per program; at most 1024 words each, firstValue = word of values[0]). Values come only from calls the game makes during snapshot frames: a constant set before the snapshot frame is missing, or on D3D9 and immediate contexts can be left over from an earlier snapshot.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
                     {"drawIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"includeConstantValues", {.types = {"boolean"}}},
                 },
                 .required = {"drawIndex"},
             },
@@ -225,7 +245,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_analyze_resource",
         {
             .title = "Analyze Resource",
-            .description = "Copy a tracked resource view, or its instantiated clone when requested, into a temporary readback texture, summarize its current contents, and optionally save a PNG preview or RGBA16F EXR dump. Optionally restrict everything to a pixel region (regionX/regionY/regionWidth/regionHeight, all four together) and add a display-light summary in nits (signal 'pq' for HDR10 ST 2084 BT.2020 targets, 'scrgb' for linear 1.0 = 80 nits BT.709 targets) with luminance percentiles and shares above 203/400/1000/4000 nits.",
+            .description = "Copy a tracked resource view, or its instantiated clone when requested, into a temporary readback texture, summarize its current contents, and optionally save a PNG preview or RGBA16F EXR dump. Optionally restrict everything to a pixel region (regionX/regionY/regionWidth/regionHeight, all four together) and add a display-light summary in nits (signal 'pq' for HDR10 ST 2084 BT.2020 targets, 'scrgb' for linear 1.0 = 80 nits BT.709 targets) with luminance percentiles and shares above 203/400/1000/4000 nits. delaySeconds (0-30) waits that long before queueing the request, so the capture can land on gameplay after the game is unpaused; other Devkit tool calls wait until it is done. measurePoint 'present' (default) reads in the Devkit's own present handler, before ReShade's effects and overlay and possibly before present work of add-ons loaded after the Devkit; 'frame_end' reads in reshade_present, after every add-on's present handler and after ReShade's visible effects and overlay (menu, FPS/clock, Lilium), so disable those for clean numbers (D3D9/D3D11/D3D12/OpenGL; refused on Vulkan; needs a swap chain with a ReShade effect runtime). Multisampled textures are resolved (averaged) into a single-sample copy first on D3D9/D3D10/D3D11/OpenGL (resolvedFromSampleCount); refused on D3D12/Vulkan, for depth-stencil, for formats D3D10/11 cannot resolve, and for a multisampled OpenGL default framebuffer.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
@@ -238,6 +258,8 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
                     {"regionWidth", {.types = {"integer"}, .minimum = 1}},
                     {"regionHeight", {.types = {"integer"}, .minimum = 1}},
                     {"signal", {.types = {"string"}, .enum_values = {"raw", "pq", "scrgb"}}},
+                    {"delaySeconds", {.types = {"integer"}, .minimum = 0, .maximum = MAX_CAPTURE_DELAY_SECONDS}},
+                    {"measurePoint", {.types = {"string"}, .enum_values = {"present", "frame_end"}}},
                 },
                 .required = {"resourceViewHandle"},
             },
@@ -250,7 +272,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_watch_region",
         {
             .title = "Watch Region",
-            .description = "Measure a pixel region of a texture on the GPU before every command that writes it (draws with it as render target, compute dispatches with it as UAV, copies, render target and UAV clears, resolves, updates; on D3D12/Vulkan render passes with it as attachment count as one writer listing their draws) and once at the end of every frame (ReShade's reshade_present, after every add-on's present handler; on the back buffer this final measurement also includes ReShade's visible effects and everything drawn on its overlay (menu, FPS/clock, add-on on-screen drawing), so disable them for clean final numbers), then report which writers changed the region and how. frames=1 returns a per-writer trace in command order (commandIndex is the ordinal among draws, dispatches and copies of the frame, in submission order on D3D12/Vulkan; it is offset from devkit_list_draws indexes, so match snapshot draws by shader hash and relative order); frames>1 watches that many frames and aggregates per writer (shader hashes): executions, how often the region changed, min/mean/max of the region peak before and after, how often the peak was lowered or values went from above 1.0 to at most 1.0, and the most repeated after-peak (a ceiling). Writers whose state before or after could not be measured are never dropped: they are counted per reason (unmeasured.reasons, unmeasuredExecutions per writer, unmeasured.frames). The region (regionX/regionY/regionWidth/regionHeight, all four together) defaults to the whole texture; signal 'pq' or 'scrgb' reports luminance in nits. shaderHash limits measuring to writers using that shader. includeUnchanged also lists writers that did not change the region (frames=1). verify also reads the region back to the CPU at one measurement point at the end of the watch and checks the GPU statistics of that same point against it. scratchBudgetMB (D3D9/OpenGL/D3D12/Vulkan, default 512) caps the VRAM used for the region copies taken inside the game's command lists. On D3D12/Vulkan a swap-chain image is followed: all images of its swap chain count as the watched texture. Vulkan images without copy-source usage are refused unless the Devkit setting 'Watch Region: Copyable Vulkan Images' was enabled before the game created them. OpenGL (GL 4.3 compute; only the context that presents the swap chain is measured; the region rectangle is exactly the one devkit_analyze_resource reads, which on the default framebuffer may count rows from the bottom, OpenGL's origin (check with a known bright pixel); colour textures, renderbuffers and the default framebuffer, no multisampled, depth or three-channel formats; draws into texture views of the watched texture are not seen). D3D9Ex (DX9 games running a RenoDX proxy mod, a wrapper that creates the device with CreateDeviceEx such as dxwrapper's D3d9to9Ex, or the Devkit's Force DX9Ex), D3D11, D3D12 and Vulkan; blocks until the watch completes.",
+            .description = "Measure a pixel region of a texture on the GPU before every command that writes it (draws with it as render target, compute dispatches with it as UAV, copies, render target and UAV clears, resolves, updates; on D3D12/Vulkan render passes with it as attachment count as one writer listing their draws) and once at the end of every frame (ReShade's reshade_present, after every add-on's present handler; on the back buffer this final measurement also includes ReShade's visible effects and everything drawn on its overlay (menu, FPS/clock, add-on on-screen drawing), so disable them for clean final numbers), then report which writers changed the region and how. frames=1 returns a per-writer trace in command order (commandIndex is the ordinal among draws, dispatches and copies of the frame, in submission order on D3D12/Vulkan; it is offset from devkit_list_draws indexes, so match snapshot draws by shader hash and relative order); frames>1 watches that many frames and aggregates per writer (shader hashes): executions, how often the region changed, min/mean/max of the region peak before and after, how often the peak was lowered or values went from above 1.0 to at most 1.0, and the most repeated after-peak (a ceiling). Writers whose state before or after could not be measured are never dropped: they are counted per reason (unmeasured.reasons, unmeasuredExecutions per writer, unmeasured.frames). The region (regionX/regionY/regionWidth/regionHeight, all four together) defaults to the whole texture; signal 'pq' or 'scrgb' reports luminance in nits. shaderHash limits measuring to writers using that shader. includeUnchanged also lists writers that did not change the region (frames=1). verify also reads the region back to the CPU at one measurement point at the end of the watch and checks the GPU statistics of that same point against it. scratchBudgetMB (D3D9/OpenGL/D3D12/Vulkan, default 512) caps the VRAM used for the region copies taken inside the game's command lists. On D3D12/Vulkan a swap-chain image is followed: all images of its swap chain count as the watched texture. Vulkan images without copy-source usage are refused unless the Devkit setting 'Watch Region: Copyable Vulkan Images' was enabled before the game created them. OpenGL (GL 4.3 compute; only the context that presents the swap chain is measured; the region rectangle is exactly the one devkit_analyze_resource reads, which on the default framebuffer may count rows from the bottom, OpenGL's origin (check with a known bright pixel); colour textures, renderbuffers and the default framebuffer, no multisampled, depth or three-channel formats; draws into texture views of the watched texture are not seen). D3D9Ex (DX9 games running a RenoDX proxy mod, a wrapper that creates the device with CreateDeviceEx such as dxwrapper's D3d9to9Ex, or the Devkit's Force DX9Ex), D3D11, D3D12 and Vulkan; blocks until the watch completes. delaySeconds (0-30) waits that long before queueing the watch, so it can start on gameplay after the game is unpaused; other Devkit tool calls wait until it is done.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
@@ -266,6 +288,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
                     {"includeUnchanged", {.types = {"boolean"}}},
                     {"verify", {.types = {"boolean"}}},
                     {"scratchBudgetMB", {.types = {"integer"}, .minimum = 1, .maximum = 8192}},
+                    {"delaySeconds", {.types = {"integer"}, .minimum = 0, .maximum = MAX_CAPTURE_DELAY_SECONDS}},
                 },
                 .required = {"resourceViewHandle"},
             },
@@ -278,7 +301,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_dump_resource_with_hash",
         {
             .title = "Dump Resource With Hash",
-            .description = "Read back a tracked resource view, compute a raw-byte CRC32, prefer a matching tracked upload CRC when available, and dump a hash-named PNG for replacement workflows.",
+            .description = "Read back a tracked resource view, compute a raw-byte CRC32, prefer a matching tracked upload CRC when available, and dump a hash-named PNG for replacement workflows. Multisampled textures are resolved first, as in devkit_analyze_resource.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
@@ -434,10 +457,11 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_queue_snapshot",
         {
             .title = "Queue Snapshot",
-            .description = "Queue a new snapshot capture for a device on the next present.",
+            .description = "Queue a new snapshot capture for a device on the next present. delaySeconds (0-30) waits that long before queueing, so the snapshot can land on gameplay after the game is unpaused; the call returns once it is queued, and other Devkit tool calls wait until then.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"delaySeconds", {.types = {"integer"}, .minimum = 0, .maximum = MAX_CAPTURE_DELAY_SECONDS}},
                 },
             },
         },

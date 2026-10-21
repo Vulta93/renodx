@@ -57,6 +57,11 @@ struct ConstantBufferSummary {
   std::optional<std::uint64_t> size = std::nullopt;
   bool full_range = false;
   bool used_by_active_shader = false;
+  // Only with includeConstantValues: the bytes the draw saw, as 32-bit words read as float and as uint.
+  std::optional<std::string> values_source = std::nullopt;
+  std::optional<std::vector<float>> float_values = std::nullopt;
+  std::optional<std::vector<std::uint32_t>> uint_values = std::nullopt;
+  bool values_truncated = false;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -69,6 +74,40 @@ inline void to_json(json& j, const ConstantBufferSummary& value) {
       {"size", value.size.has_value() ? json(value.size.value()) : json(nullptr)},
       {"fullRange", value.full_range},
       {"usedByActiveShader", value.used_by_active_shader},
+  };
+  if (value.values_source.has_value()) {
+    j["valuesSource"] = value.values_source.value();
+    j["valuesTruncated"] = value.values_truncated;
+  }
+  if (value.float_values.has_value()) {
+    j["floatValues"] = value.float_values.value();
+  }
+  if (value.uint_values.has_value()) {
+    j["uintValues"] = value.uint_values.value();
+  }
+}
+
+// Root constants (D3D12), push constants (Vulkan), D3D9 shader constants and OpenGL uniforms, as the snapshot saw them
+// for the active stage. firstValue is the index of values[0] in 32-bit words: D3D9 register cN starts at word 4 * N,
+// an OpenGL uniform at location L at word 4 * L.
+struct PushConstantSummary {
+  std::string layout_handle;
+  std::uint32_t layout_param = 0u;
+  std::string stages;
+  std::uint32_t first_value = 0u;
+  std::vector<float> float_values;
+  std::vector<std::uint32_t> uint_values;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const PushConstantSummary& value) {
+  j = {
+      {"layoutHandle", value.layout_handle},
+      {"layoutParam", value.layout_param},
+      {"stages", value.stages},
+      {"firstValue", value.first_value},
+      {"floatValues", value.float_values},
+      {"uintValues", value.uint_values},
   };
 }
 
@@ -166,6 +205,7 @@ struct DrawSummary {
   std::optional<std::vector<SlotResourceBindingSummary>> srv_bindings = std::nullopt;
   std::optional<std::vector<SlotResourceBindingSummary>> uav_bindings = std::nullopt;
   std::optional<std::vector<ConstantBufferSummary>> constant_buffers = std::nullopt;
+  std::optional<std::vector<PushConstantSummary>> push_constants = std::nullopt;
   std::optional<std::vector<RenderTargetSummary>> render_targets = std::nullopt;
   std::optional<std::vector<PipelineBindSummary>> pipelines = std::nullopt;
   std::optional<std::vector<ResourceBindSummary>> shader_resource_binds = std::nullopt;
@@ -202,6 +242,9 @@ inline void to_json(json& j, const DrawSummary& value) {
   }
   if (value.constant_buffers.has_value()) {
     j["constantBuffers"] = value.constant_buffers.value();
+  }
+  if (value.push_constants.has_value()) {
+    j["pushConstants"] = value.push_constants.value();
   }
   if (value.render_targets.has_value()) {
     j["renderTargets"] = value.render_targets.value();
