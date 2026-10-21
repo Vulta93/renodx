@@ -346,7 +346,14 @@ class Server {
   struct ConnectionState {
     std::uint64_t id = 0u;
     HANDLE pipe = INVALID_HANDLE_VALUE;
+    // Set as the connection thread's last action, so a later accept can join it without waiting.
+    std::atomic_bool finished = false;
     mutable std::mutex write_mutex;
+  };
+
+  struct ConnectionThread {
+    std::thread thread;
+    std::shared_ptr<ConnectionState> connection;
   };
 
  public:
@@ -428,11 +435,24 @@ class Server {
       worker_thread_.join();
     }
 
+    // Joining, rather than waiting for the connections to unregister, means no connection thread still runs this
+    // module's code once Stop returns (an add-on can be unloaded right after), and it returns at once for threads the
+    // process already terminated, which never unregister.
+    std::vector<ConnectionThread> connection_threads;
     {
-      std::unique_lock lock(state_mutex_);
-      state_condition_.wait(lock, [this]() {
-        return connections_.empty();
-      });
+      std::scoped_lock lock(state_mutex_);
+      connection_threads = std::move(connection_threads_);
+      connection_threads_.clear();
+    }
+    for (auto& connection_thread : connection_threads) {
+      if (connection_thread.thread.joinable()) {
+        connection_thread.thread.join();
+      }
+    }
+
+    {
+      std::scoped_lock lock(state_mutex_);
+      connections_.clear();
       listener_pipe_ = INVALID_HANDLE_VALUE;
     }
 
@@ -555,13 +575,27 @@ class Server {
       auto connection = std::make_shared<ConnectionState>();
       connection->id = next_connection_id_.fetch_add(1u, std::memory_order_relaxed);
       connection->pipe = pipe;
+      std::vector<ConnectionThread> finished_threads;
       {
         std::scoped_lock lock(state_mutex_);
         connections_[connection->id] = connection;
         connection_count_.store(connections_.size(), std::memory_order_release);
+        for (auto it = connection_threads_.begin(); it != connection_threads_.end();) {
+          if (it->connection->finished.load(std::memory_order_acquire)) {
+            finished_threads.push_back(std::move(*it));
+            it = connection_threads_.erase(it);
+          } else {
+            ++it;
+          }
+        }
+        connection_threads_.push_back(ConnectionThread{
+            .thread = std::thread(&Server::RunConnection, this, connection),
+            .connection = connection,
+        });
       }
-
-      std::thread(&Server::RunConnection, this, connection).detach();
+      for (auto& finished_thread : finished_threads) {
+        finished_thread.thread.join();
+      }
     }
 
     HANDLE listener_pipe = INVALID_HANDLE_VALUE;
@@ -603,6 +637,7 @@ class Server {
     }
 
     RemoveConnection(connection->id);
+    connection->finished.store(true, std::memory_order_release);
   }
 
   void RemoveConnection(std::uint64_t connection_id) {
@@ -695,6 +730,7 @@ class Server {
   std::condition_variable state_condition_;
   HANDLE listener_pipe_ = INVALID_HANDLE_VALUE;
   std::unordered_map<std::uint64_t, std::shared_ptr<ConnectionState>> connections_;
+  std::vector<ConnectionThread> connection_threads_;
 };
 
 class Client {
