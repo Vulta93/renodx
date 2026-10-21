@@ -688,9 +688,17 @@ writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that 
   (`nv.sl.dlss_g.tex2d.fake-swapchain-buffer`), not the swap-chain images; watch those, not the swap chain.
 - Follow-up: the hooks still do their lookups (render targets, view descriptions) under the watcher lock; doing them before
   taking it would remove the lookup rule above.
-- Known issue, not caused by the watch: the game process can hang on exit with the Devkit loaded and has to be ended from
-  Task Manager; this predates the MCP work. Seen in Gears of War: E-Day (D3D12) and on every exit of Sleeping Dogs:
-  Definitive Edition (D3D11); two DOOM 2016 (Vulkan) exits after watches did not hang. Cause not yet investigated.
+- Exit hang (fixed, not yet tested in a game). ReShade unloads add-ons with `FreeLibrary` when the last device is destroyed
+  (`reshade::unload_addons`) while the MCP threads still run. The Devkit stopped its MCP server in `DllMain`, where joining
+  those threads deadlocks on the loader lock, and the pipe server waited for connection threads that process termination had
+  already killed. Now:
+  - the server stops in `AddonUninit`, which ReShade calls before `FreeLibrary`, outside the loader lock;
+  - `utils::ipc::Server::Stop` joins its connection threads instead of waiting for them to unregister, so no connection
+    thread runs Devkit code once it returns;
+  - on process termination nothing is stopped (the session object is never destroyed), since the other threads are gone;
+  - analysis, dump and live-shader requests still waiting for a present fail when their device is destroyed.
+  A tool call sleeping in `delaySeconds` still delays the unload until its delay ends (up to 30 s). Seen before in Gears of
+  War: E-Day (D3D12), Sleeping Dogs DE (D3D11) and Wolfenstein: The New Order (OpenGL + D3D11 proxy).
 
 ## 11. Current practical caveats
 

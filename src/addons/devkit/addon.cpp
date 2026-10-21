@@ -125,7 +125,9 @@ inline constexpr std::wstring_view DEVKIT_MCP_PIPE_PREFIX = L"renodx-devkit-mcp"
 std::atomic<reshade::api::device*> snapshot_device = nullptr;
 std::atomic<reshade::api::device*> snapshot_queued_device = nullptr;
 std::atomic<uint32_t> snapshot_submission_counter = 0u;
-auto devkit_mcp_session = devkit_mcp_server_session::Create(DEVKIT_MCP_PIPE_PREFIX);
+// Never destroyed: on process termination the CRT would run its destructor, whose Stop touches locks and threads the
+// terminated process left in any state. AddonUninit and DllMain stop it explicitly instead.
+auto& devkit_mcp_session = *new devkit_mcp_server_session::Session(devkit_mcp_server_session::Create(DEVKIT_MCP_PIPE_PREFIX));
 std::atomic<uint32_t> devkit_primary_device_api = 0u;
 
 std::atomic_bool snapshot_trace_with_snapshot = false;
@@ -4515,6 +4517,27 @@ void OnDestroyDevice(reshade::api::device* device) {
     devkit_primary_device_api.store(0u, std::memory_order_release);
   }
   std::unique_lock device_lock(device_data->mutex);
+  // Requests still waiting for a present of this device fail now rather than at their 15 s timeout, so the MCP server
+  // stops promptly when ReShade unloads the add-ons after the last device (AddonUninit joins the connection threads).
+  const auto fail_pending_requests = [](auto* requests) {
+    for (const auto& request : *requests) {
+      {
+        std::scoped_lock request_lock(request->mutex);
+        if (request->completed) continue;
+        request->result = ToolResult{
+            .text = "The device was destroyed before the request could be processed.",
+            .structured_content = devkit_resource_analysis::json{{"error", "The device was destroyed before the request could be processed."}},
+            .is_error = true,
+        };
+        request->completed = true;
+      }
+      request->cv.notify_all();
+    }
+    requests->clear();
+  };
+  fail_pending_requests(&device_data->pending_resource_analysis_requests);
+  fail_pending_requests(&device_data->pending_frame_end_resource_analysis_requests);
+  fail_pending_requests(&device_data->pending_live_shader_requests);
   renodx::utils::data::Delete<DeviceData>(device);
 }
 
@@ -9901,6 +9924,13 @@ bool initialized = false;
 extern "C" __declspec(dllexport) constexpr const char* NAME = "RenoDX DevKit";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "RenoDX DevKit Module";
 
+// ReShade unloads add-ons with FreeLibrary when the last device is destroyed (reshade::unload_addons), with the MCP
+// threads still running. Joining them in DllMain would wait for the loader lock the exiting threads need, so the server
+// stops here, which ReShade calls before FreeLibrary and outside the loader lock.
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
+  devkit_mcp_server_session::Stop(devkit_mcp_session);
+}
+
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
@@ -9979,7 +10009,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
-      devkit_mcp_server_session::Stop(devkit_mcp_session);
+      // On process termination (lpv_reserved set) the other threads are already gone, possibly holding the server's
+      // locks, so nothing is stopped. Otherwise AddonUninit normally stopped the server and this is a no-op: every
+      // ReShade unload path that reaches a started server calls AddonUninit before FreeLibrary.
+      if (lpv_reserved == nullptr) {
+        devkit_mcp_server_session::Stop(devkit_mcp_session);
+      }
       if (original_wgl_swap_buffers != nullptr) {
         // Never let an exception leave DllMain.
         try {
