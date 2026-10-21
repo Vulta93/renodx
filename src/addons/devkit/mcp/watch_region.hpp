@@ -98,7 +98,9 @@ constexpr std::uint32_t MAX_SLOTS = 1024u;
 constexpr std::uint32_t READBACK_RING_SIZE = 3u;
 constexpr std::uint32_t GROUP_SIZE = 16u;
 constexpr std::uint32_t MAX_FRAMES = 3600u;
-constexpr std::uint32_t MAX_COMPUTE_UAV_SLOTS = 8u;
+// UAV slots scanned for writers: compute UAVs, and D3D11 pixel-shader UAVs (the D3D11.0 limit; D3D11.1 slots 8-63
+// are not scanned).
+constexpr std::uint32_t MAX_UAV_SLOTS = 8u;
 // D3D12/Vulkan: default and maximum VRAM for the region copies taken inside the game's command lists.
 constexpr std::uint32_t DEFAULT_SCRATCH_BUDGET_MB = 512u;
 constexpr std::uint32_t MAX_SCRATCH_BUDGET_MB = 8192u;
@@ -1639,7 +1641,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
       // The dispatch writes the watched subresource when it is bound as a compute UAV, through root/push descriptors or
       // through a descriptor table range visible to the compute stage.
       std::uint64_t written_image = 0u;
-      for (std::uint32_t slot = 0u; slot < MAX_COMPUTE_UAV_SLOTS && written_image == 0u; ++slot) {
+      for (std::uint32_t slot = 0u; slot < MAX_UAV_SLOTS && written_image == 0u; ++slot) {
         const auto view = renodx::utils::state::GetBoundResourceView(
             cmd_list, reshade::api::shader_stage::compute, reshade::api::descriptor_type::unordered_access_view, slot);
         written_image = internal::GetWatchedImageOfView(*session, device, view);
@@ -1857,7 +1859,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
       }
     }
   } else if (is_dispatch) {
-    for (std::uint32_t slot = 0u; slot < MAX_COMPUTE_UAV_SLOTS && !writes_watched_resource; ++slot) {
+    for (std::uint32_t slot = 0u; slot < MAX_UAV_SLOTS && !writes_watched_resource; ++slot) {
       const auto view = renodx::utils::state::GetBoundResourceView(
           cmd_list, reshade::api::shader_stage::compute, reshade::api::descriptor_type::unordered_access_view, slot);
       if (view.handle == 0u) continue;
@@ -1869,6 +1871,15 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
       if (device->get_resource_from_view(view).handle == session->watched_resource.handle) {
         writes_watched_resource = true;
         break;
+      }
+    }
+    // D3D11 pixel shaders also write through UAVs bound with OMSetRenderTargetsAndUnorderedAccessViews.
+    if (session->device_api == reshade::api::device_api::d3d11) {
+      for (std::uint32_t slot = 0u; slot < MAX_UAV_SLOTS && !writes_watched_resource; ++slot) {
+        const auto view = renodx::utils::state::GetBoundResourceView(
+            cmd_list, reshade::api::shader_stage::pixel, reshade::api::descriptor_type::unordered_access_view, slot);
+        if (view.handle == 0u) continue;
+        writes_watched_resource = device->get_resource_from_view(view).handle == session->watched_resource.handle;
       }
     }
   }

@@ -658,7 +658,9 @@ writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that 
 - Only commands the game issues are hooked. Passes that add-ons draw through the ReShade API (for example a mod's swap chain
   proxy pass at present) are not reported as writers; their effect lands in the end-of-frame measurement. When a mod
   redirects the game's rendering into clones, watch the clone (`preferClone: true`).
-- Draws that write the texture through a pixel-shader UAV are not detected.
+- D3D11 draws that write the texture through a pixel-shader UAV (`OMSetRenderTargetsAndUnorderedAccessViews`, slots 0-7)
+  are reported as draw writers. D3D11.1 slots 8-63, and pixel-shader UAV writes on D3D12/Vulkan, are not detected. Not yet
+  tested in a game.
 - If the watched texture is destroyed during the watch, or the swap chain the watch measures on is resized, switched to
   or from fullscreen or closed, the watch stops and returns an error.
 - When another add-on performs a write itself inside the same ReShade event as a game writer (for example a mod redirecting a
