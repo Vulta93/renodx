@@ -907,6 +907,25 @@ inline void EncodePreviewPixel(
   cmd_list->copy_texture_region(copy_source, copy_source_subresource, source_box, intermediate, 0, nullptr);
   queue->flush_immediate_command_list();
   queue->wait_idle();
+  if (device->get_api() == reshade::api::device_api::opengl) {
+    // ReShade 6.8's OpenGL backend caches the framebuffer of every texture it blits into (the multisample resolve, and
+    // the readback copy of a default-framebuffer source), keyed by name, size and format, and drops that cache only in
+    // destroy_resource_view (_fbo_lookup_version). The driver reuses the names of the textures destroyed below, so without
+    // a flush the next analysis blits into an orphaned texture and reads back zeros. A view with the texture's own format
+    // is usually the texture itself; either way destroying it deletes at most the view and flushes the cache.
+    reshade::api::resource_view flush_view = {0u};
+    if (device->create_resource_view(
+            intermediate,
+            reshade::api::resource_usage::copy_dest,
+            reshade::api::resource_view_desc(intermediate_format),
+            &flush_view)) {
+      device->destroy_resource_view(flush_view);
+    } else {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "devkit::analyze_resource(could not flush ReShade's OpenGL framebuffer cache; the next read may return zeros)");
+    }
+  }
   if (resolved_multisample.handle != 0u) {
     device->destroy_resource(resolved_multisample);
   }
