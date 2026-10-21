@@ -640,7 +640,8 @@ Refused or limited cases on D3D12/Vulkan, all stated in the output:
 - D3D12 textures with `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` and Vulkan images without `TRANSFER_SRC` usage are
   refused. Device-level texture updates are ignored.
 - Many Vulkan games create their render targets without `TRANSFER_SRC` (in DOOM 2016 only the swap chain and RenoDX's clones
-  have it). The opt-in Devkit setting **Watch Region: Copyable Vulkan Images** (Settings > Other, ReShade.ini key
+  have it). `devkit_analyze_resource` and `devkit_dump_resource_with_hash` refuse such images with the same hint instead of
+  issuing an invalid copy. The opt-in Devkit setting **Watch Region: Copyable Vulkan Images** (Settings > Other, ReShade.ini key
   `WatchRegionCopySourceUsage` in `[renodx-dev]`, off by default) adds `copy_source` usage to every image the game creates
   from then on, in the Devkit's `create_resource` handler. It only affects images created after it is enabled: turn it on and
   restart the game. It follows the rules of the Vulkan clone targets in `utils/resource_upgrade.hpp` (`OnCreateResource`):

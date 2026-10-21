@@ -764,6 +764,23 @@ inline void EncodePreviewPixel(
         .is_error = true,
     };
   }
+  // Copying a Vulkan image without TRANSFER_SRC usage is invalid and can lose the device; same rule as
+  // devkit_watch_region.
+  if (device->get_api() == reshade::api::device_api::vulkan
+      && !renodx::utils::bitwise::HasAnyFlag(
+          target.resolved_resource_desc.usage, reshade::api::resource_usage::copy_source)) {
+    const auto error = std::format(
+        "The {} was created without VK_IMAGE_USAGE_TRANSFER_SRC_BIT, so it cannot be copied for analysis. Enable the "
+        "Devkit setting \"Watch Region: Copyable Vulkan Images\" (Settings > Other) and restart the game{}; the setting "
+        "skips shared and sparse images and formats without copy support.",
+        (target.used_clone ? "clone" : "image"),
+        (target.used_clone ? "" : ", or analyze its clone (preferClone: true) when a mod clones it"));
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
   const auto sample_count = target.resolved_resource_desc.texture.samples;
   // The resolve keeps the source's own format (an sRGB target stays sRGB) because D3D10/11 drop a resolve whose typed
   // formats differ. A typeless source is resolved the way the view reads it (sRGB or not), else as its default typed
