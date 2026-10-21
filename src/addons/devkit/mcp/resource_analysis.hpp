@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <numbers>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -983,6 +984,21 @@ inline void EncodePreviewPixel(
     double nits_max_channel_sum = 0.0;
     std::array<uint64_t, 4> nits_pixels_above = {};
     constexpr std::array<double, 4> NITS_THRESHOLDS = {203.0, 400.0, 1000.0, 4000.0};
+    // Colour statistics from display light in CIE 1976 u'v': saturation s_uv = 13 x the distance from the D65 white
+    // point, which does not change with brightness, and the hue angle around it. Pixels below MIN_COLOR_NITS, whose
+    // chromaticity is mostly noise, are left out; the hue histogram counts pixels at or above NEUTRAL_SATURATION.
+    constexpr double MIN_COLOR_NITS = 1.0;
+    constexpr double NEUTRAL_SATURATION = 0.05;
+    constexpr size_t HUE_BIN_COUNT = 12u;
+    std::vector<float> saturation_values;
+    if (signal != Signal::RAW) {
+      saturation_values.reserve(static_cast<size_t>(width) * static_cast<size_t>(height));
+    }
+    double saturation_min = std::numeric_limits<double>::infinity();
+    double saturation_max = -std::numeric_limits<double>::infinity();
+    double saturation_sum = 0.0;
+    uint64_t chromatic_pixel_count = 0u;
+    std::array<uint64_t, HUE_BIN_COUNT> hue_bin_pixels = {};
     uint32_t channel_count = 4u;
     uint64_t pixel_count = 0u;
     uint64_t finite_pixel_count = 0u;
@@ -1113,6 +1129,38 @@ inline void EncodePreviewPixel(
         for (size_t threshold_index = 0; threshold_index < NITS_THRESHOLDS.size(); ++threshold_index) {
           nits_pixels_above[threshold_index] += (nits_luminance > NITS_THRESHOLDS[threshold_index] ? 1u : 0u);
         }
+
+        // The colour statistics stay last in the pixel loop: their early continues skip dark and neutral pixels.
+        if (nits_luminance < MIN_COLOR_NITS) continue;
+        // XYZ (D65) of the display light in the signal's primaries: BT.2020 for PQ, BT.709 for scRGB.
+        const auto xyz = (signal == Signal::PQ
+                              ? std::array<double, 3>{
+                                    (0.6369580 * nits[0]) + (0.1446169 * nits[1]) + (0.1688810 * nits[2]),
+                                    (0.2627002 * nits[0]) + (0.6779981 * nits[1]) + (0.0593017 * nits[2]),
+                                    (0.0280727 * nits[1]) + (1.0609851 * nits[2]),
+                                }
+                              : std::array<double, 3>{
+                                    (0.4123908 * nits[0]) + (0.3575843 * nits[1]) + (0.1804808 * nits[2]),
+                                    (0.2126390 * nits[0]) + (0.7151687 * nits[1]) + (0.0721923 * nits[2]),
+                                    (0.0193308 * nits[0]) + (0.1191948 * nits[1]) + (0.9505322 * nits[2]),
+                                });
+        const auto uv_denominator = xyz[0] + (15.0 * xyz[1]) + (3.0 * xyz[2]);
+        if (uv_denominator <= 0.0) continue;
+        // D65 white (x 0.3127, y 0.3290) in u'v', consistent with the matrices above.
+        const auto u_offset = (4.0 * xyz[0] / uv_denominator) - 0.197830;
+        const auto v_offset = (9.0 * xyz[1] / uv_denominator) - 0.468320;
+        const auto saturation = 13.0 * std::sqrt((u_offset * u_offset) + (v_offset * v_offset));
+        saturation_values.push_back(static_cast<float>(saturation));
+        saturation_min = std::min(saturation_min, saturation);
+        saturation_max = std::max(saturation_max, saturation);
+        saturation_sum += saturation;
+        if (saturation < NEUTRAL_SATURATION) continue;
+        ++chromatic_pixel_count;
+        auto hue_degrees = std::atan2(v_offset, u_offset) * (180.0 / std::numbers::pi);
+        if (hue_degrees < 0.0) {
+          hue_degrees += 360.0;
+        }
+        ++hue_bin_pixels[std::min(static_cast<size_t>(hue_degrees / (360.0 / HUE_BIN_COUNT)), HUE_BIN_COUNT - 1u)];
       }
     }
 
@@ -1364,32 +1412,54 @@ inline void EncodePreviewPixel(
         };
       }
       if (signal != Signal::RAW) {
-        json percentiles = json::object();
-        if (!nits_luminance_values.empty()) {
+        // Reorders the values; percentiles take the nearest rank.
+        const auto compute_percentiles = [](std::vector<float>* values) {
           constexpr std::array<std::pair<const char*, double>, 4> PERCENTILES = {{
               {"p50", 0.50},
               {"p90", 0.90},
               {"p99", 0.99},
               {"p99_9", 0.999},
           }};
+          json percentiles = json::object();
+          if (values->empty()) return percentiles;
           for (const auto& [name, fraction] : PERCENTILES) {
-            auto nth = nits_luminance_values.begin()
-                       + static_cast<std::ptrdiff_t>(fraction * static_cast<double>(nits_luminance_values.size() - 1u));
-            std::nth_element(nits_luminance_values.begin(), nth, nits_luminance_values.end());
+            auto nth = values->begin() + static_cast<std::ptrdiff_t>(fraction * static_cast<double>(values->size() - 1u));
+            std::nth_element(values->begin(), nth, values->end());
             percentiles[name] = *nth;
           }
-        }
+          return percentiles;
+        };
         const auto nits_count = static_cast<std::uint64_t>(nits_luminance_values.size());
         result["analysis"]["nits"] = {
             {"signal", std::string(GetSignalName(signal))},
             {"primaries", (signal == Signal::PQ ? "bt2020" : "bt709")},
             {"luminance", ScalarStats(nits_luminance_min, nits_luminance_max, nits_luminance_sum, nits_count)},
-            {"luminancePercentiles", percentiles},
+            {"luminancePercentiles", compute_percentiles(&nits_luminance_values)},
             {"maxChannel", ScalarStats(nits_max_channel_min, nits_max_channel_max, nits_max_channel_sum, nits_count)},
             {"pixelsLuminanceAbove203", RatioStats(nits_pixels_above[0], nits_count)},
             {"pixelsLuminanceAbove400", RatioStats(nits_pixels_above[1], nits_count)},
             {"pixelsLuminanceAbove1000", RatioStats(nits_pixels_above[2], nits_count)},
             {"pixelsLuminanceAbove4000", RatioStats(nits_pixels_above[3], nits_count)},
+        };
+
+        const auto color_count = static_cast<std::uint64_t>(saturation_values.size());
+        json hue_histogram = json::array();
+        for (size_t bin = 0; bin < HUE_BIN_COUNT; ++bin) {
+          hue_histogram.push_back({
+              {"fromDegrees", bin * (360u / HUE_BIN_COUNT)},
+              {"toDegrees", (bin + 1u) * (360u / HUE_BIN_COUNT)},
+              {"pixels", RatioStats(hue_bin_pixels[bin], chromatic_pixel_count)},
+          });
+        }
+        result["analysis"]["color"] = {
+            {"space", "cie1976_uv"},
+            {"minNits", MIN_COLOR_NITS},
+            {"pixelsCounted", RatioStats(color_count, nits_count)},
+            {"saturation", ScalarStats(saturation_min, saturation_max, saturation_sum, color_count)},
+            {"saturationPercentiles", compute_percentiles(&saturation_values)},
+            {"neutralSaturationBelow", NEUTRAL_SATURATION},
+            {"pixelsChromatic", RatioStats(chromatic_pixel_count, color_count)},
+            {"hueHistogram", hue_histogram},
         };
       }
       if (!output_json.is_null()) {

@@ -332,6 +332,29 @@ The PNG is for quick visual inspection, not for HDR truth.
   for the queue, and inside `reshade_present` that would submit ReShade's effect commands without the present's wait
   semaphores.
 
+### Colour statistics (saturation and hue)
+
+With `signal: pq` or `scrgb`, `analysis.color` describes the chromaticity of the display light in CIE 1976 u'v' (XYZ from
+the signal's primaries, D65 white). Pixels below `minNits` (1 nit), whose chromaticity is mostly noise, are left out
+(`pixelsCounted`):
+
+- `saturation` (min/max/mean) and `saturationPercentiles` (p50/p90/p99/p99_9) of s_uv = 13 x the distance from the D65
+  white point. Unlike chroma in ICtCp or CIELAB the metric does not change with brightness, so an HDR preset that only
+  brightens a colour leaves it unchanged (perceived colourfulness still rises with luminance, the Hunt effect, so equal
+  s_uv does not mean equal-looking saturation between SDR and HDR). For orientation (computed): white 0, light pink 0.07, skin about 0.55, BT.709 cyan 0.79,
+  yellow 1.10, green 1.55, magenta 2.28, red 3.36, blue 4.05; BT.2020 red 4.71.
+- `pixelsChromatic`: pixels with s_uv >= `neutralSaturationBelow` (0.05).
+- `hueHistogram`: 12 bins of 30 degrees of the hue angle around D65 (`atan2(v' - v'n, u' - u'n)`), each with its share
+  of the chromatic pixels. For orientation (computed): BT.709 red about 12 degrees, yellow 86, green 128, cyan 192, blue
+  266, magenta 308.
+
+Use it to compare two captures of the same spot with the mod's own toggle or preset, if it has one (for example a vanilla
+tone mapper setting against the HDR one), ideally on the same small region: a lower saturation mean or p90 means the mod
+desaturates, a shifted histogram means hue shifts. Compare `pixelsCounted` first: the 1-nit floor selects pixels by
+brightness, so when a preset moves many pixels across it the two captures measure different pixels and the comparison is
+not valid. The Devkit cannot switch a mod's replacements off: compile-time replacements are built into the game's
+pipelines and cannot be undone without recreating them. Not yet tested in a game.
+
 ### Multisampled resources
 
 On D3D9, D3D10/11 and OpenGL, `devkit_analyze_resource` resolves a multisampled texture (ReShade's `resolve_texture_region`,
