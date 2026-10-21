@@ -111,7 +111,9 @@ Tone Mapper, Gamma Correction and the grading sliders are shown in the Intermedi
 ## Known issues
 - Alpha of the scene target reads 2.0 after the haze passes (UNORM clamped it to 1); no visible effect found.
 - The 1x1 average-luminance target and a 160x120 helper stay 8-bit; their effect on bloom in bright scenes is untested.
-- Untested: without id5Tweaker.
+- Tested only with id5Tweaker (by decision, not tested without it).
+
+Tested (2026-10-21): menus scale with UI Brightness; fades and loading screens look normal.
 
 Tested Bink cutscenes (2026-10-21): one draw (0x13072711) converts the 8-bit YUV planes straight into the back buffer,
 values 0..1, so video white lands at UI Brightness (SDR, no inverse tone map); picture and colours correct.
