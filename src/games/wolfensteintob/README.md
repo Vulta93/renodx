@@ -77,6 +77,14 @@ Tone Mapper, Gamma Correction and the grading sliders are shown in the Intermedi
   `1 - |localPos|^8`), harmless in UNORM, a black blob with green fringes on float targets. Its replacement clamps the
   output like UNORM. Its vertex shader **0x25010C88** is replaced only to pin attribute locations. Old Blood's decal has an
   extra fog input (`vofi_TexCoord5`), so New Order's 0x97DA5C21 / 0x0686B625 replacements do not apply.
+- Side effect fixed: the terrain shader **0x18F094C4** produces NaN on edge-on and silhouette pixels, where
+  `cross( dFdx, dFdy )` is zero and `normalize()` of it returns NaN (it reaches every output). Vanilla's targets 0xFA1 /
+  0xFA3 / 0xFA5 are RGBA8 UNORM (MSAA) and stored NaN as 0; in RGBA16F it survives the MSAA resolve and the post LUT
+  turns it black: a dithered black line along distant mountain ridges (car scene). The replacement stores NaN as 0 on
+  all three outputs (colour keeps its range above 1; alpha, feedback and normals are clamped to [0, 1] like UNORM;
+  negative colour is not floored, unchanged from before). Vertex shader **0x67FD4AF1** only pins attribute locations.
+  Checked: ridge clean, same as vanilla SDR without the addon (2026-10-21). The sun-shadow pass 0xC773AA1C was suspected
+  first and ruled out by test. Other materials may carry the same zero-normal NaN; only this terrain shader was seen.
 
 ### OpenGL specifics
 - Shader replacements are GLSL (`0x<HASH>.frag.glsl` / `.vert.glsl`); original uniforms kept in order; attribute and

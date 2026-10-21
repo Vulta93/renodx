@@ -52,6 +52,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntry(0x9DBD325F),  // main post-process + colour LUT (GLSL)
     CustomShaderEntry(0x7B8FA202),  // box-projected damage decal: UNORM-equivalent clamp (negative edge fade)
     CustomShaderEntry(0x25010C88),  // its vertex shader, only to pin the attribute locations in the replacement program
+    CustomShaderEntry(0x18F094C4),  // terrain: store NaN as 0 like UNORM (black specks on distant ridges)
+    CustomShaderEntry(0x67FD4AF1),  // its vertex shader, only to pin the attribute locations in the replacement program
     // CustomShaderEntry(0x00000000),
     // CustomSwapchainShader(0x00000000),
     // BypassShaderEntry(0x00000000),
