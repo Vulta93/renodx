@@ -1,0 +1,18 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "wolfensteintob",
+  "title": "Wolfenstein: The Old Blood",
+  "summary": "RenoDX HDR mod for Wolfenstein: The Old Blood (OpenGL, HDR10 through the RenoDX Display Proxy).",
+  "status": "experimental",
+  "notes": [
+    "Requires ReShade with add-on support installed as opengl32.dll and [INSTALL] HookDirectX=1 in ReShade.ini."
+  ],
+  "deploy": {
+    "steam_appid": 350080,
+    "game_exe": "WolfOldBlood_x64.exe",
+    "api": "opengl",
+    "architecture": [
+      "x64"
+    ]
+  }
+}
