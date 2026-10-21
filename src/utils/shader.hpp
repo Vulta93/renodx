@@ -110,6 +110,17 @@ static cross_addon::Shared<SharedData> shared;
 }  // namespace internal
 
 template <typename F>
+static void ForEachCompileTimeReplacement(reshade::api::device* device, F&& callback) {
+  if (internal::shared.data == nullptr) return;
+  internal::shared.data->compile_time_replacements.for_each([&](const auto& entry) {
+    const auto& [key, bytecode] = entry;
+    if (key.first == device) {
+      std::invoke(callback, key.second, bytecode);
+    }
+  });
+}
+
+template <typename F>
 static void ForEachRuntimeReplacement(reshade::api::device* device, F&& callback) {
   if (internal::shared.data == nullptr) return;
   internal::shared.data->runtime_replacements.for_each([&](const auto& entry) {
