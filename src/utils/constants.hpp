@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -164,14 +165,13 @@ static bool OnUpdateBufferRegion(
   if (!shared.data->capture_constant_buffers) return false;
 
   shared.data->buffer_range_data.modify_if(resource.handle, [&](std::pair<const uint64_t, BufferRangeData>& pair) {
-    if (size == UINT64_MAX) {
-      pair.second.cache.resize(0);
-      return;
+    // UINT64_MAX is a whole-buffer update (D3D10/11 UpdateSubresource without a box).
+    const auto update_size = (size == UINT64_MAX ? device->get_resource_desc(resource).buffer.size - offset : size);
+    if (pair.second.cache.size() < offset + update_size) {
+      pair.second.cache.resize(offset + update_size, 0);
     }
-    if (pair.second.cache.size() < offset + size) {
-      pair.second.cache.resize(offset + size, 0);
-    }
-    memcpy(pair.second.cache.data() + offset, static_cast<const uint8_t*>(buffer_data) + offset, size);
+    // ReShade passes the data of the updated range itself, not of the whole buffer.
+    memcpy(pair.second.cache.data() + offset, buffer_data, update_size);
   });
 
   return false;
@@ -256,6 +256,23 @@ inline std::vector<uint8_t> GetResourceCache(reshade::api::device* device, resha
   std::vector<uint8_t> value;
   shared.data->buffer_range_data.if_contains(resource.handle, [&](const std::pair<const uint64_t, BufferRangeData>& pair) {
     value.assign(pair.second.cache.begin(), pair.second.cache.end());
+  });
+  return value;
+}
+
+// Copies at most max_size bytes from offset of a tracked constant buffer, as the CPU last wrote them through unmap or
+// update_buffer_region. std::nullopt when that is unknown: the buffer is not tracked (capture was off when the add-on
+// loaded, or it was not created with constant_buffer usage), or it is mapped right now, so the CPU may be writing it
+// without the cache seeing the writes (persistently mapped upload buffers).
+inline std::optional<std::vector<uint8_t>> GetResourceCacheRange(reshade::api::resource resource, uint64_t offset, uint64_t max_size) {
+  std::optional<std::vector<uint8_t>> value = std::nullopt;
+  shared.data->buffer_range_data.if_contains(resource.handle, [&](const std::pair<const uint64_t, BufferRangeData>& pair) {
+    if (!pair.second.mapping.empty()) return;
+    const auto& cache = pair.second.cache;
+    if (cache.empty()) return;
+    const auto begin = std::min<uint64_t>(offset, cache.size());
+    const auto end = begin + std::min<uint64_t>(max_size, cache.size() - begin);
+    value.emplace(cache.begin() + begin, cache.begin() + end);
   });
   return value;
 }
