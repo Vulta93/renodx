@@ -378,7 +378,7 @@ float psycho17_NeutwoPeakClip(float x, float peak, float clip) {
   float x2 = x * x;
   float clip2 = clip_safe * clip_safe;
   float peak2 = peak_safe * peak_safe;
-  // RENODX (wolfensteintno): fma() is GLSL 4.00; same expression without the fused rounding for GLSL 1.50.
+  // RENODX (wolfensteintob): fma() is GLSL 4.00; same expression without the fused rounding for GLSL 1.50.
   float denominator_squared = x2 * (clip2 - peak2) + clip2 * peak2;
   return (clip_safe * peak_safe * x) * inversesqrt(max(denominator_squared, 1e-20));
 }
@@ -409,6 +409,30 @@ vec3 psycho17_NakaRushton(
   vec3 contrasted = anchor_out * pow(abs(x) / anchor_in, n);
   vec3 saturated = peak * contrasted / (contrasted + peak_minus_anchor_out);
   return psycho17_CopySign(saturated, x);
+}
+
+// RENODX LOCAL CHANGE (not in the published psychov_17.glsl): White Clip overload of
+// renodx::tonemap::NakaRushton (src/shaders/tonemap/naka_rushton.hlsl, "White Clip" form), `mad` written as a * b + c.
+// The plain curve only approaches `peak` asymptotically; here the input `white_clip` maps exactly to `peak`.
+vec3 psycho17_NakaRushton(
+    vec3 x,
+    vec3 peak,
+    vec3 anchor_in,
+    vec3 anchor_out,
+    float cone_response_exponent,
+    vec3 white_clip) {
+  vec3 peak_minus_anchor_out = peak - anchor_out;
+  vec3 n = cone_response_exponent * peak / peak_minus_anchor_out;
+  vec3 contrasted = anchor_out * pow(abs(x) / anchor_in, n);
+  vec3 contrasted_squared = contrasted * contrasted;
+
+  vec3 white_contrasted = anchor_out * pow(white_clip / anchor_in, n);
+  vec3 white_contrasted_squared = white_contrasted * white_contrasted;
+
+  vec3 optimization_1 = contrasted * (white_contrasted_squared - peak * anchor_out);
+  vec3 numerator = peak * (contrasted_squared * peak_minus_anchor_out + optimization_1);
+  vec3 denominator = white_contrasted_squared * peak_minus_anchor_out + optimization_1;
+  return psycho17_CopySign(numerator / denominator, x);
 }
 
 float psycho17_RayExitTCIE1702(vec2 origin, vec2 direction) {
@@ -1214,12 +1238,31 @@ vec3 psychov_17(
 
   // Naka-Rushton is scale-equivariant if input, peak, and anchors are all
   // normalized by the same adaptive LMS state, so keep the absolute-LMS form.
-  vec3 display_scaled = psycho17_NakaRushton(
-      lms_cones,
-      lms_peak,
-      current_adaptive_state_lms,
-      desired_background_state_lms,
-      cone_response_exponent);
+  vec3 display_scaled;
+  if (clip_point > 0.0) {
+    // RENODX LOCAL CHANGE: clip_point is a White Clip in the input's units (game white = 1); 0 keeps the published
+    // asymptotic curve. Never below 3 x peak: closer to the peak the curve turns into an almost linear hard clip that
+    // overshoots the untonemapped value by up to 4%. Brighter input is capped by its max LMS channel, which keeps its
+    // chromaticity, instead of clipping channels separately afterwards. Scaled by exposure so the same scene value keeps
+    // mapping to the peak; Highlights / Contrast reshape the input and are not compensated.
+    vec3 lms_white = lms_peak * (max(clip_point * exposure, 3.0 * peak_value) / peak_value);
+    vec3 lms_white_ratio = lms_cones / lms_white;
+    float lms_white_max_ratio = max(lms_white_ratio.x, max(lms_white_ratio.y, lms_white_ratio.z));
+    display_scaled = psycho17_NakaRushton(
+        lms_cones / max(1.0, lms_white_max_ratio),
+        lms_peak,
+        current_adaptive_state_lms,
+        desired_background_state_lms,
+        cone_response_exponent,
+        lms_white);
+  } else {
+    display_scaled = psycho17_NakaRushton(
+        lms_cones,
+        lms_peak,
+        current_adaptive_state_lms,
+        desired_background_state_lms,
+        cone_response_exponent);
+  }
   vec3 display_scaled_relative_weighted = psycho17_ToAdaptiveRelativeWeightedLMS(
       display_scaled,
       current_adaptive_state_lms);
@@ -1304,7 +1347,7 @@ vec3 psycho17_SDR(vec3 bt709_input, float cone_response) {
       1.0,             // Contrast
       1.0,             // Purity scale
       1.0,             // Bleaching intensity
-      100.0,           // Clip point
+      0.0,             // Clip point (local change: 0 = published curve)
       1.0,             // Hue restore
       1.0,             // Adaptation contrast
       0,               // White curve mode
@@ -1330,7 +1373,7 @@ vec3 psycho17_HDR(vec3 bt709_input, float peak, float cone_response) {
       1.0,             // Contrast
       1.0,             // Purity scale
       1.0,             // Bleaching intensity
-      100.0,           // Clip point
+      0.0,             // Clip point (local change: 0 = published curve)
       1.0,             // Hue restore
       1.0,             // Adaptation contrast
       0,               // White curve mode
@@ -1495,7 +1538,7 @@ void main() {
 		vec3 renodx_linear = renodx_decode( final.xyz, RENODX_INTERMEDIATE_ENCODING );
 		if ( RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_PSYCHOV ) {
 			// The graded scene (game curve + LUT, extended above white by the bridge) is the untonemapped_graded signal;
-			// measured steady highlights reach >= 20x game white (2026-10-07). Slider mapping as in the HLSL PsychoV-17 mods
+			// measured with Tone Mapper None: fireplace about 30x game white, lamp 12x, muzzle flash 8x. Slider mapping as in the HLSL PsychoV-17 mods
 			// (darktide, rotsp, wutheringwaves): saturation -> purity, blowout -> bleaching; peak relative to game white.
 			renodx_linear = psychov_17(
 				renodx_linear,
@@ -1506,7 +1549,8 @@ void main() {
 				RENODX_TONE_MAP_CONTRAST,
 				RENODX_TONE_MAP_SATURATION,      // purity scale
 				RENODX_TONE_MAP_BLOWOUT,         // bleaching intensity
-				100.0,                           // clip point (unused by test17)
+				30.0,                            // white clip in game white (local change, 0 = published curve): measured
+				                                 // scene top, fireplace about 30x game white (muzzle flash about 8x)
 				RENODX_TONE_MAP_HUE_CORRECTION,  // hue restore
 				1.0,                             // adaptation contrast
 				0,                               // white curve mode

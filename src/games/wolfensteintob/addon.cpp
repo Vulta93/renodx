@@ -650,7 +650,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         }
 
         {
-          // Wolfenstein creates its full-screen render targets (scene colour 0xFBF, half/quarter res) before the swapchain
+          // Wolfenstein creates its full-screen render targets (scene colour 0xFC0, half/eighth res) before the swapchain
           // exists, so a back-buffer size match ("Output size") misses them and the scene stays 8-bit. Match explicit
           // fractions of the window instead (SCENE_UPGRADE_SCALES; start from the screen size,
           // OnCreateResourceFollowWindowSize keeps them on the window).
