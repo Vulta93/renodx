@@ -55,6 +55,7 @@ in vec4 vofi_TexCoord2;
 in vec4 vofi_TexCoord3;
 in vec4 vofi_Color;
 in vec4 vofi_TexCoord0;
+in vec4 vofi_TexCoord5;
 
 layout(location = 0) out vec4 out_FragColor0;
 
@@ -93,18 +94,19 @@ void main() {
 	vec2 texcoord;
 	texcoord.x = tc.x * vofi_TexCoord0.y + vofi_TexCoord0.x;
 	texcoord.y = tc.y * vofi_TexCoord0.w + vofi_TexCoord0.z;
-	float fog = vofi_TexCoord4.w;
+	vec3 fogColor = vofi_TexCoord5.xyz;
+	float fogAmount = vofi_TexCoord5.w;
 	vec4 final = tex2D( samp_transmap, texcoord );
-	fog = saturate( fog * fog );
+	float invFogAmount = saturate( ( 1.0 - fogAmount ) * ( 1.0 - fogAmount ) );
 	final.w *= vofi_Color.w;
 	final.w *= edgefade;
-	final.w *= fog;
-	final.xyz = mix( vec3( 1.0 ), final.xyz, fog );
+	final.w *= invFogAmount;
+	final.xyz = mix( vec3( 1.0 ), final.xyz, invFogAmount );
 	out_FragColor0.xyz = final.xyz * final.w;
 	out_FragColor0.w = final.w;
 	// RENODX: box-projected damage decal. edgefade = 1 - |localPos|^8 reaches about -80 in the corners of the decal
 	// box. The game's RGBA8 UNORM scene target clamped the blend source to [0, 1], so those corners did nothing; on the
-	// RGBA16F upgrade the negative alpha multiplies the wall by up to ~80 (values > 64, Inf, NaN, confirmed with a
-	// per-draw pixel probe). Reproduce the UNORM source clamp: NaN -> 0, then [0, 1].
+	// RGBA16F upgrade the negative alpha multiplies the wall by up to ~80. Reproduce the UNORM source clamp:
+	// NaN -> 0, then [0, 1].
 	out_FragColor0 = clamp( mix( out_FragColor0, vec4( 0.0 ), isnan( out_FragColor0 ) ), 0.0, 1.0 );
 }

@@ -18,7 +18,7 @@ float dot3 ( vec4 a, vec4 b ) { return dot( a.xyz, b.xyz ); }
 float dot4 ( vec4 a, vec4 b ) { return dot( a, b ); }
 float dot4 ( vec2 a, vec4 b ) { return dot( vec4( a, 0.0, 1.0 ), b ); }
 vec4 swizzleColor ( vec4 color ) { return color; }
-uniform vec4 _va_ [8];
+uniform vec4 _va_ [11];
 
 layout(location = 2) in vec4 in_Normal;
 layout(location = 9) in vec4 in_Tangent;
@@ -32,6 +32,7 @@ out vec4 vofi_TexCoord2;
 out vec4 vofi_TexCoord3;
 out vec4 vofi_Color;
 out vec4 vofi_TexCoord0;
+out vec4 vofi_TexCoord5;
 
 void main() {
 	vec4 snormal = in_Normal * 2.0 - 1.0;
@@ -70,7 +71,24 @@ void main() {
 	vofi_TexCoord4.x = origin.x;
 	vofi_TexCoord4.y = origin.y;
 	vofi_TexCoord4.z = origin.z;
-	vofi_TexCoord4.w = saturate( exp2( -( clamp( gl_Position.w - _va_[5 ].x, 0.0, _va_[6 ].x ) * _va_[7 ].x ) ) );
+	vofi_TexCoord4.w = 0.0;
+	{
+		float FLT_EPSILON = 0.01;
+		vec3 cameraToPixel = in_Position.xyz - _va_[5 ].xyz;
+		float distanceToPixel = length( cameraToPixel );
+		float be = _va_[6 ].x * exp2( - _va_[7 ].w * ( _va_[5 ].z - _va_[7 ].x ) );
+		float distanceInFog = max( distanceToPixel - _va_[6 ].y, 0.0 );
+		float effectiveZ = max( cameraToPixel.z, FLT_EPSILON );
+		if ( cameraToPixel.z < -FLT_EPSILON ) {
+			effectiveZ = cameraToPixel.z;
+		}
+		float lineIntegral = be * distanceInFog;
+		lineIntegral *= ( 1.0 - exp2( - _va_[7 ].w * effectiveZ ) ) / ( _va_[7 ].w * effectiveZ );
+		float cosL = dot( _va_[8 ].xyz, normalize( cameraToPixel ) );
+		float inscatterAlpha = 1.0 - saturate( ( cosL - _va_[7 ].y ) * _va_[7 ].z );
+		vofi_TexCoord5.xyz = mix( _va_[9 ].xyz, _va_[10 ].xyz, inscatterAlpha );
+		vofi_TexCoord5.w = 1.0 - max( saturate( exp2( -lineIntegral ) ), _va_[6 ].z );
+	};
 	vec3 pos = in_Position.xyz - origin;
 	vec3 localPos;
 	localPos.x = dot3( pos, tangent );
