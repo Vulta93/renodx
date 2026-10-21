@@ -114,6 +114,10 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                                  const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleListReplacementsTool(arguments, build_snapshot_tools_context());
   });
+  register_tool("devkit_frame_overview", [build_snapshot_tools_context = context.build_snapshot_tools_context](
+                                              const renodx::utils::mcp::json& arguments) {
+    return snapshot_tools::HandleFrameOverviewTool(arguments, build_snapshot_tools_context());
+  });
   register_tool("devkit_get_draw", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                         const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleGetDrawTool(arguments, build_snapshot_tools_context());

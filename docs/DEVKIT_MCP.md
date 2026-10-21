@@ -55,6 +55,7 @@ The exact MCP schema can evolve, but the current workflow is built around these 
 - `devkit_get_draw` (`includeConstantValues: true` adds the constant values the draw saw, see section 6)
 - `devkit_get_shader`
 - `devkit_list_replacements` (which registered shader replacements drew in the snapshot, see section 6)
+- `devkit_frame_overview` (passes, written textures with their readers, and tonemap/LUT/UI/output candidates, see section 6)
 
 `devkit_queue_snapshot`, `devkit_analyze_resource` and `devkit_watch_region` take `delaySeconds` (0-30): the tool waits that
 long before it queues the request. Use it when the game is paused while you talk to the agent: start the call, unpause,
@@ -203,6 +204,49 @@ not change these counts; take a new snapshot. `snapshotPending` is true while a 
   before the mod loaded or a replacement that failed to compile.
 
 It answers "is my shader live and drawing here?" without reading `ReShade.log`. Queue a snapshot first.
+
+### Frame overview (`devkit_frame_overview`)
+
+One call that summarizes the current snapshot, so the tonemapper, LUT, UI and output passes can be found without walking
+thousands of draws:
+
+- `passes`: consecutive commands of the same kind that write the same targets with the same blend state form one pass
+  (render targets for draws, UAVs for dispatches); each copy is its own pass, with its destination as target and its
+  source as input. Each pass has its draw range (`firstDraw`/`lastDraw`, the indexes `devkit_get_draw` takes), `targets`,
+  `blendEnabled` (draws; `null` when the API recorded no blend state), `inputCount`, up to 8 shader hashes and, for
+  candidates, its `inputs` and `hints`. `orderUnknown` marks D3D12/Vulkan commands without a known submission order, which
+  are sorted after every ordered command.
+- Textures are described by the resource the game created: `upgradedFrom` gives the game's format when a RenoDX mod
+  upgraded the resource in place, `cloneFormat`/`cloneActive` the clone a mod renders into instead.
+- `writtenTextures`: every texture a pass writes, latest writer first, with up to its last 8 writer passes and the first 8
+  draws that read it (`readerCommandCount` counts every reading command, copies included). Follow a texture from its
+  writer to its readers to trace the chain.
+- `candidates`: pass indexes per hint; each hint in a pass carries the rule that matched. The order follows the skills
+  (`swapchain-resource-analysis`, `handle-sdr-tonemap-lut`): scene HDR, tonemap, LUT, UI, output.
+  - `tonemap`: a draw (not blended) or dispatch whose first target is large and that reads a float texture of the same
+    size (RGBA16F, R11G11B10F, RGBA32F, RGB32F, RG16F, RGB9E5, as rendered, so a mod's float clone counts) and writes an
+    SDR target (RGBA8/BGRA8/BGRX8, sRGB or not, RGB10A2/BGR10A2), either as rendered or as the game created it before a
+    mod's upgrade or clone.
+  - `lutTextures`, `lutReaderPasses`, `lutBuilderPasses`: textures with the geometry `src/shaders/lut.hlsl` samples (a 3D
+    cube of 16 to 65, or a 2D strip N*N x N with the usual sizes N = 16/32/33/48/64), the passes that read them and those
+    that write them. Noise volumes and ramp strips of the same shape match too.
+  - `uiPasses`: blended draws onto a large swap-chain target or one the game created as SDR, after the last tonemap
+    candidate, in known order.
+  - `outputPass`: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.
+
+Limits: hints are candidates from formats, sizes, blend state and command order, never proof; the skills require proving
+the signal (`devkit_get_draw`, the shader, `devkit_watch_region`) before calling a pass the tonemap. Snapshots record no
+viewports, vertex counts or depth targets: a "large" target covers at least a quarter of the swap chain's back buffer
+(without a swap chain, of the largest target written), so passes at a lower render resolution still count, and depth-only
+passes into different depth targets merge into one pass. Blend state is only recorded from pipelines that carry one, so on
+D3D9 and OpenGL (and for a D3D11 draw that never bound a blend state) `blendEnabled` is `null` and those draws are never
+UI candidates. With a mod loaded, every pass that renders into
+the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely
+one. Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and
+copy sources: reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.
+Copies are described from the resource tracker's current entry for each handle, after the snapshot: a texture destroyed
+since then is left out, and a handle reused since then (for example after a resize) describes the new resource. `maxPasses` (default 40) and `maxResources` (default 32) cap the output; the budget goes to tonemap candidates,
+the output pass, UI, LUT builders and LUT readers first, then to the latest passes. Not yet tested in a game.
 
 ## 7. Shader inspection and dumping
 

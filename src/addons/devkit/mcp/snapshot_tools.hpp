@@ -12,19 +12,23 @@
 #include <format>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "../formatting.hpp"
 #include "../../../utils/mcp/types.hpp"
 #include "../../../utils/mcp/arguments.hpp"
 #include "../../../utils/build_info.hpp"
 #include "device_summary.hpp"
 #include "device_selection.hpp"
 #include "draw_summary.hpp"
+#include "frame_overview.hpp"
 #include "shader_summary.hpp"
 #include "snapshot_summary.hpp"
 
@@ -54,6 +58,7 @@ struct ToolContext {
   std::function<snapshot_summary::SnapshotSummary(std::uint32_t device_index)> build_snapshot_summary;
   std::function<ToolResult(std::uint32_t device_index)> queue_snapshot;
   std::function<shader_summary::ReplacementListSummary(std::uint32_t device_index)> list_replacements;
+  std::function<frame_overview::Input(std::uint32_t device_index)> collect_frame_overview;
 };
 
 namespace internal {
@@ -499,4 +504,430 @@ inline ToolResult HandleListReplacementsTool(const json& arguments, const ToolCo
   };
 }
 
+// Groups the snapshot into passes (consecutive commands writing the same targets with the same blend state) and marks
+// candidate tonemap, LUT, UI and output passes with the rule that matched. The rules follow the order the
+// swapchain-resource-analysis and handle-sdr-tonemap-lut skills describe (scene HDR, tonemap, LUT, UI, output); they
+// are hints to verify with devkit_get_draw, the shader and devkit_watch_region, never proof.
+inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolContext& context) {
+  if (!context.collect_frame_overview) {
+    throw std::runtime_error("The snapshot tool context is not configured.");
+  }
+
+  const auto max_passes = mcp_arguments::ValidateRange(
+      "maxPasses",
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "maxPasses").value_or(40u),
+      1u,
+      2000u);
+  const auto max_resources = mcp_arguments::ValidateRange(
+      "maxResources",
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "maxResources").value_or(32u),
+      0u,
+      2000u);
+  const auto device_index = internal::ResolveDeviceIndex(arguments, context);
+  const auto input = context.collect_frame_overview(device_index);
+
+  using frame_overview::CommandKind;
+  using frame_overview::TextureInfo;
+  constexpr std::size_t MAX_LISTED = 8u;
+  constexpr std::size_t MAX_LUT_TEXTURES = 16u;
+
+  const auto is_float_format = [](reshade::api::format format) {
+    switch (reshade::api::format_to_default_typed(format)) {
+      case reshade::api::format::r16g16b16a16_float:
+      case reshade::api::format::r11g11b10_float:
+      case reshade::api::format::r32g32b32a32_float:
+      case reshade::api::format::r32g32b32_float:
+      case reshade::api::format::r16g16_float:
+      case reshade::api::format::r9g9b9e5:
+        return true;
+      default:
+        return false;
+    }
+  };
+  const auto is_sdr_format = [](reshade::api::format format) {
+    switch (reshade::api::format_to_default_typed(format)) {
+      case reshade::api::format::r8g8b8a8_unorm:
+      case reshade::api::format::r8g8b8a8_unorm_srgb:
+      case reshade::api::format::b8g8r8a8_unorm:
+      case reshade::api::format::b8g8r8a8_unorm_srgb:
+      case reshade::api::format::b8g8r8x8_unorm:
+      case reshade::api::format::b8g8r8x8_unorm_srgb:
+      case reshade::api::format::r10g10b10a2_unorm:
+      case reshade::api::format::b10g10r10a2_unorm:
+        return true;
+      default:
+        return false;
+    }
+  };
+  // The format the GPU renders: a mod's active clone replaces the game's texture.
+  const auto rendered_format = [](const TextureInfo& texture) {
+    return (texture.clone_active && texture.clone_format.has_value() ? texture.clone_format.value() : texture.format);
+  };
+  // LUT geometry src/shaders/lut.hlsl samples: a 3D cube N x N x N, or a 2D strip N*N x N. The N values are the usual
+  // LUT sizes, not a rule of that file; noise volumes and ramp strips of the same shape also match.
+  const auto is_lut_shaped = [](const TextureInfo& texture) {
+    if (texture.type == reshade::api::resource_type::texture_3d) {
+      return texture.width == texture.height && texture.height == texture.depth_or_layers && texture.width >= 16u && texture.width <= 65u;
+    }
+    if (texture.type != reshade::api::resource_type::texture_2d) return false;
+    switch (texture.height) {
+      case 16u:
+      case 32u:
+      case 33u:
+      case 48u:
+      case 64u:
+        return texture.width == texture.height * texture.height;
+      default:
+        return false;
+    }
+  };
+
+  // Snapshots record no viewports or vertex counts. A "large" target covers at least a quarter of the swap chain's back
+  // buffer (without a swap chain, of the largest target written), so passes at a lower render resolution still count.
+  std::uint64_t screen_area = 0u;
+  if (input.swapchain_back_buffer.has_value()) {
+    screen_area = static_cast<std::uint64_t>(input.swapchain_back_buffer->texture.width) * input.swapchain_back_buffer->texture.height;
+  } else {
+    for (const auto& command : input.commands) {
+      for (const auto& target : command.targets) {
+        screen_area = std::max<std::uint64_t>(screen_area, static_cast<std::uint64_t>(target.width) * target.height);
+      }
+    }
+  }
+  const auto is_large = [&](const TextureInfo& texture) {
+    return screen_area != 0u && static_cast<std::uint64_t>(texture.width) * texture.height * 4u >= screen_area;
+  };
+
+  struct Pass {
+    CommandKind kind = CommandKind::DRAW;
+    std::size_t first_draw = 0u;
+    std::size_t last_draw = 0u;
+    std::size_t command_count = 0u;
+    std::vector<TextureInfo> targets;
+    std::vector<TextureInfo> inputs;
+    std::vector<std::uint32_t> shader_hashes;
+    bool blend_known = false;
+    bool blend_enabled = false;
+    bool order_unknown = false;
+    json hints = json::array();
+  };
+  struct ResourceUse {
+    TextureInfo texture;
+    std::vector<std::size_t> writer_passes;
+    std::size_t reader_command_count = 0u;
+    std::vector<std::size_t> reader_draws;
+  };
+
+  // Commands are in frame order, so pass indexes, writer lists and reader lists come out in frame order too.
+  std::vector<Pass> passes;
+  std::map<std::uint64_t, ResourceUse> resources;
+  for (const auto& command : input.commands) {
+    auto starts_pass = (passes.empty()
+                        || command.kind == CommandKind::COPY
+                        || passes.back().kind != command.kind
+                        || passes.back().blend_known != command.blend_known
+                        || passes.back().blend_enabled != command.blend_enabled
+                        || passes.back().order_unknown != command.order_unknown
+                        || passes.back().targets.size() != command.targets.size());
+    for (std::size_t target_index = 0u; !starts_pass && target_index < command.targets.size(); ++target_index) {
+      starts_pass = passes.back().targets[target_index].resource_handle != command.targets[target_index].resource_handle;
+    }
+    if (starts_pass) {
+      passes.push_back(Pass{
+          .kind = command.kind,
+          .first_draw = command.draw_index,
+          .targets = command.targets,
+          .blend_known = command.blend_known,
+          .blend_enabled = command.blend_enabled,
+          .order_unknown = command.order_unknown,
+      });
+      for (const auto& texture : command.targets) {
+        auto& use = resources.try_emplace(texture.resource_handle, ResourceUse{.texture = texture}).first->second;
+        use.writer_passes.push_back(passes.size() - 1u);
+      }
+    }
+    auto& pass = passes.back();
+    pass.last_draw = command.draw_index;
+    ++pass.command_count;
+    if (command.shader_hash != 0u && std::ranges::find(pass.shader_hashes, command.shader_hash) == pass.shader_hashes.end()) {
+      pass.shader_hashes.push_back(command.shader_hash);
+    }
+    for (const auto& texture : command.inputs) {
+      if (std::ranges::none_of(pass.inputs, [&](const TextureInfo& known) { return known.resource_handle == texture.resource_handle; })) {
+        pass.inputs.push_back(texture);
+      }
+      auto& use = resources.try_emplace(texture.resource_handle, ResourceUse{.texture = texture}).first->second;
+      ++use.reader_command_count;
+      if (use.reader_draws.size() < MAX_LISTED && std::ranges::find(use.reader_draws, command.draw_index) == use.reader_draws.end()) {
+        use.reader_draws.push_back(command.draw_index);
+      }
+    }
+  }
+
+  // Candidates, in frame order.
+  std::vector<std::size_t> tonemap_passes;
+  std::vector<std::size_t> lut_builder_passes;
+  std::vector<std::size_t> lut_reader_passes;
+  for (std::size_t pass_index = 0u; pass_index < passes.size(); ++pass_index) {
+    auto& pass = passes[pass_index];
+    if (pass.kind == CommandKind::COPY || pass.targets.empty()) continue;
+
+    const auto lut_target = std::ranges::find_if(pass.targets, is_lut_shaped);
+    if (lut_target != pass.targets.end()) {
+      pass.hints.push_back({
+          {"type", "lutBuilder"},
+          {"rule", std::format("writes a LUT-shaped {} {}x{}", formatting::StreamToString(lut_target->type), lut_target->width, lut_target->height)},
+      });
+      lut_builder_passes.push_back(pass_index);
+    }
+    const auto lut_input = std::ranges::find_if(pass.inputs, is_lut_shaped);
+    if (lut_input != pass.inputs.end()) {
+      pass.hints.push_back({
+          {"type", "lutReader"},
+          {"rule", std::format(
+                       "reads a LUT-shaped {} {} {}x{}",
+                       formatting::StreamToString(lut_input->type),
+                       formatting::StreamToString(rendered_format(*lut_input)),
+                       lut_input->width,
+                       lut_input->height)},
+      });
+      lut_reader_passes.push_back(pass_index);
+    }
+
+    if (pass.blend_known && pass.blend_enabled) continue;
+    const auto& target = pass.targets.front();
+    if (!is_large(target)) continue;
+    const auto float_input = std::ranges::find_if(pass.inputs, [&](const TextureInfo& texture) {
+      return is_float_format(rendered_format(texture)) && texture.width == target.width && texture.height == target.height;
+    });
+    if (float_input == pass.inputs.end()) continue;
+    std::string rule;
+    if (is_sdr_format(rendered_format(target))) {
+      rule = std::format(
+          "reads {} and writes SDR {} of the same size",
+          formatting::StreamToString(rendered_format(*float_input)),
+          formatting::StreamToString(rendered_format(target)));
+    } else if (is_sdr_format(target.original_format)) {
+      rule = std::format(
+          "reads {} and writes a target of the same size the game created as SDR {} (rendered as {} by the mod)",
+          formatting::StreamToString(rendered_format(*float_input)),
+          formatting::StreamToString(target.original_format),
+          formatting::StreamToString(rendered_format(target)));
+    } else {
+      continue;
+    }
+    if (pass.kind == CommandKind::DISPATCH) {
+      rule += " (compute)";
+    } else if (pass.blend_known) {
+      rule += " without blending";
+    } else {
+      rule += " (blend state not recorded on this API)";
+    }
+    pass.hints.push_back({{"type", "tonemap"}, {"rule", std::move(rule)}});
+    tonemap_passes.push_back(pass_index);
+  }
+
+  // UI: blended draws onto large SDR (as the game created them) or swap-chain targets after the last tonemap candidate.
+  std::vector<std::size_t> ui_passes;
+  if (!tonemap_passes.empty()) {
+    for (auto pass_index = tonemap_passes.back() + 1u; pass_index < passes.size(); ++pass_index) {
+      auto& pass = passes[pass_index];
+      if (pass.kind != CommandKind::DRAW || !pass.blend_known || !pass.blend_enabled || pass.order_unknown || pass.targets.empty()) continue;
+      const auto& target = pass.targets.front();
+      if (!is_large(target) || !(target.is_swapchain || is_sdr_format(target.original_format))) continue;
+      pass.hints.push_back({{"type", "ui"}, {"rule", "blended draws onto a large SDR or swap-chain target after the last tonemap candidate"}});
+      ui_passes.push_back(pass_index);
+    }
+  }
+
+  // Output: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.
+  std::optional<std::size_t> output_pass = std::nullopt;
+  for (auto pass_index = passes.size(); pass_index-- > 0u;) {
+    auto& pass = passes[pass_index];
+    if (pass.order_unknown || std::ranges::none_of(pass.targets, [](const TextureInfo& texture) { return texture.is_swapchain; })) continue;
+    output_pass = pass_index;
+    pass.hints.push_back({{"type", "output"}, {"rule", "last pass of the frame that writes a swap-chain back buffer"}});
+    break;
+  }
+
+  // The listing budget goes to candidates first (tonemap, output, UI, LUT builders, LUT readers), then to the latest
+  // passes, where HDR work happens.
+  std::vector<bool> listed(passes.size(), false);
+  std::size_t listed_count = 0u;
+  const auto list_pass = [&](std::size_t pass_index) {
+    if (listed_count < max_passes && !listed[pass_index]) {
+      listed[pass_index] = true;
+      ++listed_count;
+    }
+  };
+  for (const auto pass_index : tonemap_passes) {
+    list_pass(pass_index);
+  }
+  if (output_pass.has_value()) {
+    list_pass(output_pass.value());
+  }
+  for (const auto* candidate_passes : {&ui_passes, &lut_builder_passes, &lut_reader_passes}) {
+    for (const auto pass_index : *candidate_passes) {
+      list_pass(pass_index);
+    }
+  }
+  for (auto pass_index = passes.size(); pass_index-- > 0u;) {
+    list_pass(pass_index);
+  }
+  std::size_t hinted_count = 0u;
+  std::size_t hinted_listed_count = 0u;
+  json pass_list = json::array();
+  for (std::size_t pass_index = 0u; pass_index < passes.size(); ++pass_index) {
+    const auto& pass = passes[pass_index];
+    if (!pass.hints.empty()) {
+      ++hinted_count;
+    }
+    if (!listed[pass_index]) continue;
+    if (!pass.hints.empty()) {
+      ++hinted_listed_count;
+    }
+    json entry = {
+        {"pass", pass_index},
+        {"firstDraw", pass.first_draw},
+        {"lastDraw", pass.last_draw},
+        {"commandCount", pass.command_count},
+        {"targets", pass.targets},
+        {"inputCount", pass.inputs.size()},
+    };
+    switch (pass.kind) {
+      case CommandKind::DRAW:
+        entry["kind"] = "draw";
+        entry["blendEnabled"] = (pass.blend_known ? json(pass.blend_enabled) : json(nullptr));
+        break;
+      case CommandKind::DISPATCH:
+        entry["kind"] = "dispatch";
+        break;
+      case CommandKind::COPY:
+        entry["kind"] = "copy";
+        break;
+    }
+    if (pass.order_unknown) {
+      entry["orderUnknown"] = true;
+    }
+    // Inputs are listed for candidates only, to keep the result small.
+    if (!pass.hints.empty()) {
+      entry["inputs"] = std::vector<TextureInfo>(pass.inputs.begin(), pass.inputs.begin() + std::min(pass.inputs.size(), MAX_LISTED));
+      entry["hints"] = pass.hints;
+    }
+    json shader_hashes = json::array();
+    for (const auto shader_hash : pass.shader_hashes | std::views::take(MAX_LISTED)) {
+      shader_hashes.push_back(formatting::FormatShaderHash(shader_hash));
+    }
+    entry["shaderCount"] = pass.shader_hashes.size();
+    entry["shaderHashes"] = std::move(shader_hashes);
+    pass_list.push_back(std::move(entry));
+  }
+
+  json lut_textures = json::array();
+  std::size_t lut_texture_count = 0u;
+  for (const auto& [handle, use] : resources) {
+    if (!is_lut_shaped(use.texture) || use.reader_command_count == 0u) continue;
+    ++lut_texture_count;
+    if (lut_textures.size() < MAX_LUT_TEXTURES) {
+      lut_textures.push_back({
+          {"texture", use.texture},
+          {"readerCommandCount", use.reader_command_count},
+          {"readByDraws", use.reader_draws},
+      });
+    }
+  }
+
+  // Written textures, latest writer first, since the end of the frame matters most.
+  std::vector<const ResourceUse*> written;
+  for (const auto& [handle, use] : resources) {
+    if (!use.writer_passes.empty()) {
+      written.push_back(&use);
+    }
+  }
+  std::ranges::sort(written, [](const ResourceUse* left, const ResourceUse* right) {
+    return left->writer_passes.back() > right->writer_passes.back();
+  });
+  json resource_list = json::array();
+  for (const auto* use : written | std::views::take(max_resources)) {
+    resource_list.push_back({
+        {"texture", use->texture},
+        {"writerPassCount", use->writer_passes.size()},
+        {"lastWrittenByPasses", std::vector<std::size_t>(use->writer_passes.end() - std::min(use->writer_passes.size(), MAX_LISTED), use->writer_passes.end())},
+        {"readerCommandCount", use->reader_command_count},
+        {"readByDraws", use->reader_draws},
+    });
+  }
+
+  json screen = nullptr;
+  if (input.swapchain_back_buffer.has_value()) {
+    screen = {
+        {"width", input.swapchain_back_buffer->texture.width},
+        {"height", input.swapchain_back_buffer->texture.height},
+        {"format", formatting::StreamToString(input.swapchain_back_buffer->texture.format)},
+    };
+  }
+  json output_value = nullptr;
+  if (output_pass.has_value()) {
+    output_value = output_pass.value();
+  }
+
+  std::string text;
+  if (input.snapshot_pending) {
+    text = std::format("Device #{}: a snapshot is queued or still capturing; call again once it has finished.", device_index);
+  } else if (input.commands.empty()) {
+    text = std::format("Device #{} has no snapshot: queue one with devkit_queue_snapshot first.", device_index);
+  } else {
+    std::string output_text = "none";
+    if (output_pass.has_value()) {
+      output_text = std::to_string(output_pass.value());
+    }
+    text = std::format(
+        "Device #{}: {} commands in {} passes ({} listed). Candidates to verify: {} tonemap, {} LUT texture(s), {} LUT "
+        "reader(s), {} LUT builder(s), {} UI, output pass {}.",
+        device_index,
+        input.commands.size(),
+        passes.size(),
+        listed_count,
+        tonemap_passes.size(),
+        lut_texture_count,
+        lut_reader_passes.size(),
+        lut_builder_passes.size(),
+        ui_passes.size(),
+        output_text);
+  }
+
+  return ToolResult{
+      .text = std::move(text),
+      .structured_content = json{
+          {"deviceIndex", device_index},
+          {"snapshotPending", input.snapshot_pending},
+          {"capturedCommands", input.commands.size()},
+          {"screen", screen},
+          {"passCount", passes.size()},
+          {"passesListed", listed_count},
+          {"candidatePassCount", hinted_count},
+          {"candidatePassesListed", hinted_listed_count},
+          {"candidates", {
+              {"tonemapPasses", tonemap_passes},
+              {"outputPass", output_value},
+              {"uiPasses", ui_passes},
+              {"lutBuilderPasses", lut_builder_passes},
+              {"lutReaderPasses", lut_reader_passes},
+              {"lutTextureCount", lut_texture_count},
+              {"lutTextures", std::move(lut_textures)},
+          }},
+          {"passes", std::move(pass_list)},
+          {"writtenTextureCount", written.size()},
+          {"writtenTextures", std::move(resource_list)},
+          {"notes", {
+              "Hints are candidates from formats, sizes, blend state and command order, not proof: confirm with devkit_get_draw, the shader and devkit_watch_region.",
+              "Snapshots record no viewports, vertex counts or depth targets: a large target covers at least a quarter of the swap chain's back buffer, and depth-only passes into different depth targets merge.",
+              "Blend state is only recorded from pipelines that carry one; on D3D9 and OpenGL blendEnabled is null and no UI candidates are found.",
+              "Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and copy sources; reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.",
+              "With a mod loaded, every pass that renders into the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely one.",
+              "orderUnknown passes (D3D12/Vulkan commands without a known submission order) are sorted after all others and are never UI or output candidates.",
+          }},
+      },
+  };
+}
 }  // namespace renodx::addons::devkit::mcp::snapshot_tools
