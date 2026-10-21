@@ -87,6 +87,15 @@ Tone Mapper, Gamma Correction and the grading sliders are shown in the Intermedi
 - Shared code outside this folder (same branch, separate commit, not upstream): `src/utils/device_proxy.hpp` imports
   the proxy's D3D11 shared texture with `GL_EXT_memory_object_win32` (from the New Order branch).
 
+### Bloom and particles (checked, kept as is)
+- Bloom: the bright-pass 0x58CB1B38 clamps its threshold term (`saturate(total - threshold - bias)`) but adds `glare * 4`
+  and `frame` unclamped; vanilla's 8-bit target clamped the sum at 1. With the float 480x270 chain the glow can go
+  slightly above 1 (measured 1.21 in the bloom target, lamp glow about 1.26 / 340 nits in the final image). Kept by
+  decision: it looks right, the lamp itself still carries the HDR range.
+- Smoke: 0x30270368, 0x77B690CD (alpha x4) and 0x4BED1C4E write unclamped alpha into the float scene target. They are
+  drawn in the fireplace smoke (snapshots), which looks correct; the blend state is not readable on OpenGL, so this is
+  a visual check, not a measurement. First suspects if smoke ever looks too bright.
+
 ## Known issues
 - Alpha of the scene target reads 2.0 after the haze passes (UNORM clamped it to 1); no visible effect found.
 - The 1x1 average-luminance target and a 160x120 helper stay 8-bit; their effect on bloom in bright scenes is untested.
