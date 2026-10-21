@@ -99,7 +99,11 @@ Tone Mapper, Gamma Correction and the grading sliders are shown in the Intermedi
 ## Known issues
 - Alpha of the scene target reads 2.0 after the haze passes (UNORM clamped it to 1); no visible effect found.
 - The 1x1 average-luminance target and a 160x120 helper stay 8-bit; their effect on bloom in bright scenes is untested.
-- Untested: windowed mode at non-native sizes, Bink cutscenes, without id5Tweaker.
+- Untested: Bink cutscenes, without id5Tweaker.
+
+Tested windowed (2026-10-21): 3818x2104 (maximised window) and 2560x1440. The upgrade rules follow the window
+(`full/half/eighth upgrade follows window` in the log), scene 0xFA1 / 0xFC0 and the bloom target are RGBA16F at the
+window size, the quarter-size map stays 8-bit; picture, HUD and highlights correct.
 
 ## Verification
 1. Build target `wolfensteintob` (Clang x64 preset) -> `renodx-wolfensteintob.addon64`. After adding/removing shader
