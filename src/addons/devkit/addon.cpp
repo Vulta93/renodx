@@ -4651,7 +4651,6 @@ void OnDestroyDevice(reshade::api::device* device) {
   if (device_data_list.empty()) {
     devkit_primary_device_api.store(0u, std::memory_order_release);
   }
-  std::unique_lock device_lock(device_data->mutex);
   // Requests still waiting for a present of this device fail now rather than at their 15 s timeout, so the MCP server
   // stops promptly when ReShade unloads the add-ons after the last device (AddonUninit joins the connection threads).
   const auto fail_pending_requests = [](auto* requests) {
@@ -4670,9 +4669,13 @@ void OnDestroyDevice(reshade::api::device* device) {
     }
     requests->clear();
   };
-  fail_pending_requests(&device_data->pending_resource_analysis_requests);
-  fail_pending_requests(&device_data->pending_frame_end_resource_analysis_requests);
-  fail_pending_requests(&device_data->pending_live_shader_requests);
+  // The lock ends before Delete frees device_data, which holds the mutex.
+  {
+    std::unique_lock device_lock(device_data->mutex);
+    fail_pending_requests(&device_data->pending_resource_analysis_requests);
+    fail_pending_requests(&device_data->pending_frame_end_resource_analysis_requests);
+    fail_pending_requests(&device_data->pending_live_shader_requests);
+  }
   renodx::utils::data::Delete<DeviceData>(device);
 }
 
@@ -5018,10 +5021,16 @@ void OnBindPipeline(
   if (pair != device_data->pipeline_blends.end()) {
     auto& blend_desc = pair->second;
     cmd_list_data->blend_desc = blend_desc;
-  } else if (pipeline.handle == 0u && renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::output_merger)) {
-    // D3D10/11 OMSetBlendState(nullptr) and ClearState (bound as stage 'all') restore the default state, in which
-    // blending is off; keeping the previous state would report the next draws as blended.
-    cmd_list_data->blend_desc = reshade::api::blend_desc{};
+  } else if (renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::output_merger)) {
+    if (pipeline.handle == 0u) {
+      // D3D10/11 OMSetBlendState(nullptr) and ClearState (bound as stage 'all') restore the default state, in which
+      // blending is off; keeping the previous state would report the next draws as blended.
+      cmd_list_data->blend_desc = reshade::api::blend_desc{};
+    } else {
+      // A pipeline whose blend state was never recorded (created before the Devkit loaded, or without a blend
+      // subobject): its state is unknown, not the previous pipeline's.
+      cmd_list_data->blend_desc = std::nullopt;
+    }
   }
 }
 

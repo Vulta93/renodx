@@ -217,7 +217,7 @@ thousands of draws:
 - `passes`: consecutive commands of the same kind that write the same targets with the same blend state form one pass
   (render targets for draws, UAVs for dispatches); each copy is its own pass, with its destination as target and its
   source as input. Each pass has its draw range (`firstDraw`/`lastDraw`, the indexes `devkit_get_draw` takes), `targets`,
-  `blendEnabled` (draws; `null` when the API recorded no blend state), `inputCount`, up to 8 shader hashes and, for
+  `blendEnabled` (draws; `null` when no blend state was recorded for the bound pipeline), `inputCount`, up to 8 shader hashes and, for
   candidates, its `inputs` and `hints`. `orderUnknown` marks D3D12/Vulkan commands without a known submission order, which
   are sorted after every ordered command (other APIs record commands in issue order and never set it).
 - Textures are described by the resource the game created: `upgradedFrom` gives the game's format when a RenoDX mod
@@ -258,9 +258,12 @@ Limits: hints are candidates from formats, sizes, blend state and command order,
 the signal (`devkit_get_draw`, the shader, `devkit_watch_region`) before calling a pass the tonemap. Snapshots record no
 viewports, vertex counts or depth targets: a "large" target covers at least a quarter of the swap chain's back buffer
 (without a swap chain, of the largest target written), so passes at a lower render resolution still count, and depth-only
-passes into different depth targets merge into one pass. Blend state is only recorded from pipelines that carry one, so on
-D3D9 and OpenGL (and for a D3D11 draw that never bound a blend state) `blendEnabled` is `null` and those draws are never
-UI candidates. With a mod loaded, every pass that renders into
+passes into different depth targets merge into one pass. Blend state is only recorded from pipelines that carry one, so
+`blendEnabled` is `null`, and those draws are never UI candidates, on D3D9 and OpenGL, for a D3D11 draw that never bound
+a blend state, and for any pipeline whose blend state the Devkit did not record: D3D10/11 blend states and D3D12/Vulkan
+pipelines created before the Devkit loaded, and D3D12 pipeline states with a root signature embedded in the shader (they
+are created with a null layout, which the Devkit's pipeline tracking skips). A draw never reports the previous
+pipeline's blend state instead. With a mod loaded, every pass that renders into
 the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely
 one. Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and
 copy sources: reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.

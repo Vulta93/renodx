@@ -1260,7 +1260,7 @@ inline void EncodePreviewPixel(
               directory_error.message());
         } else if (!TryBuildRawPngPixels(intermediate_format, mapped_data, width, height, raw_png_pixels)) {
           output_error = std::format(
-              "Hash-named dumping currently supports only RGBA8/BGRA8-style resource formats. The current resource format is {}.",
+              "Hash-named dumping supports only RGBA8/BGRA8-style resource formats, the formats texture replacement loads back (8-bit PNG). The current resource format is {}; for an HDR copy use devkit_analyze_resource with an outputPath ending in .exr.",
               resource_format_name);
         } else {
           std::string chosen_prefix = name_prefix.value_or("");

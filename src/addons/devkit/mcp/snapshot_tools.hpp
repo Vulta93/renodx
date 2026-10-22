@@ -743,7 +743,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     } else if (pass.blend_known) {
       rule += " without blending";
     } else {
-      rule += " (blend state not recorded on this API)";
+      rule += " (blend state not recorded for this pipeline)";
     }
     // Swap-chain writers stay candidates (games often tonemap straight into the back buffer), labelled: an r10g10b10a2
     // swap chain can also be an HDR10 output. A swap-chain writer whose float input the game created as non-float (float only

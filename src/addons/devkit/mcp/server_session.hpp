@@ -42,6 +42,10 @@ inline void EnsureStarted(
     const std::function<void(renodx::utils::mcp::Server&)>& register_tools,
     const std::function<std::string()>& get_pipe_name) {
   if (session.server.IsRunning()) return;
+  // The listener can stop on its own (a failed CreateNamedPipeW) while a connection thread still runs a tool call, which
+  // may be waiting for the next present. Start would join that thread here, on the presenting thread, stalling the game
+  // until the call times out; the restart waits for a later present instead.
+  if (session.server.IsConnected()) return;
 
   std::scoped_lock lock(session.start_mutex);
   if (session.server.IsRunning() || session.start_failed) return;
