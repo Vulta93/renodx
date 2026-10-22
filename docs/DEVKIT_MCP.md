@@ -226,12 +226,24 @@ thousands of draws:
   - `tonemap`: a draw (not blended) or dispatch whose first target is large and that reads a float texture of the same
     size (RGBA16F, R11G11B10F, RGBA32F, RGB32F, RG16F, RGB9E5, as rendered, so a mod's float clone counts) and writes an
     SDR target (RGBA8/BGRA8/BGRX8, sRGB or not, RGB10A2/BGR10A2), either as rendered or as the game created it before a
-    mod's upgrade or clone.
+    mod's upgrade or clone. Passes that write the swap chain stay candidates (vanilla games often tonemap straight into
+    the back buffer, and an RGB10A2 swap chain can also be an HDR10 output), but their rule says so. The rule also notes
+    when the float input is float only through a mod's active clone. A swap-chain writer with such an input is the game's
+    own final pass (AA, upscale, composite) reading an SDR intermediate the mod cloned to float, often the pass a mod's
+    output work targets. A mod's swap-chain proxy pass itself is never in a snapshot: passes an add-on draws through the
+    ReShade API raise no add-on events.
   - `lutTextures`, `lutReaderPasses`, `lutBuilderPasses`: textures with the geometry `src/shaders/lut.hlsl` samples (a 3D
-    cube of 16 to 65, or a 2D strip N*N x N with the usual sizes N = 16/32/33/48/64), the large passes that read them
-    (scene draws also sample LUT-shaped volumes) and the passes that write them. Noise volumes and ramp strips of the same shape match too.
-  - `uiPasses`: blended draws onto a large swap-chain target or one the game created as SDR, after the last tonemap
-    candidate, in known order.
+    cube of 16 to 65, or a 2D strip N*N x N with the usual sizes N = 16/32/33/48/64), the passes that read them and the
+    passes that write them. Only post-processing passes count as readers: a large target that is not square (width and
+    height more than 5% apart, unless the screen itself is square), because scene, shadow and probe draws into square
+    targets also sample LUT-shaped noise and lighting volumes. Pillarboxed and letterboxed post chains still count. Without
+    a swap chain the screen size is a guess (the largest target written), so only the size is checked there. Non-square
+    shadow atlases (e.g. 4096x2048) that sample such a volume still match. Noise volumes and ramp strips of the same shape
+    still match as LUT textures.
+  - `uiPasses`: blended draws onto a large swap-chain target or one the game created as SDR, in known order, after the last
+    tonemap candidate that is not a final pass from a mod-cloned intermediate (UI can be drawn onto that intermediate before
+    the final pass; a vanilla game's tonemap into the back buffer stays the anchor). When every candidate is such a final
+    pass, no UI candidates are given.
   - `outputPass`: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.
 
 Limits: hints are candidates from formats, sizes, blend state and command order, never proof; the skills require proving
@@ -246,7 +258,9 @@ one. Readers come from the shader resource views recorded per command (pixel sta
 copy sources: reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.
 Copies are described from the resource tracker's current entry for each handle, after the snapshot: a texture destroyed
 since then is left out, and a handle reused since then (for example after a resize) describes the new resource. `maxPasses` (default 40) and `maxResources` (default 32) cap the output; the budget goes to tonemap candidates,
-the output pass, UI, LUT builders and LUT readers first, then to the latest passes. Not yet tested in a game.
+the output pass, UI, LUT builders and LUT readers first, then to the latest passes. Tested in Sleeping Dogs DE (D3D11,
+2026-10-22) with the first version of the tool; the later fixes to `orderUnknown`, the LUT readers, the UI start and the
+final-pass note are not tested yet, and nothing has run on D3D12, Vulkan or OpenGL.
 
 ## 7. Shader inspection and dumping
 

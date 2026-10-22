@@ -4424,8 +4424,7 @@ void ProcessPendingLiveShaderRequests(
         };
         std::vector<CopyRow> copy_rows;
         // Only D3D12/Vulkan record a submission order; on the other APIs the list is in issue order already.
-        const auto device_api = device_data->device->get_api();
-        const auto records_submission_order = (device_api == reshade::api::device_api::d3d12 || device_api == reshade::api::device_api::vulkan);
+        const auto records_submission_order = SupportsSnapshotSubmissionOrder(device_data->device->get_api());
         input.commands.reserve(device_data->draw_details_list.size());
         for (size_t draw_index = 0; draw_index < device_data->draw_details_list.size(); ++draw_index) {
           const auto& draw_details = device_data->draw_details_list[draw_index];

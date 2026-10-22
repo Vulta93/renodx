@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -584,16 +585,22 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
 
   // Snapshots record no viewports or vertex counts. A "large" target covers at least a quarter of the swap chain's back
   // buffer (without a swap chain, of the largest target written), so passes at a lower render resolution still count.
-  std::uint64_t screen_area = 0u;
+  std::uint32_t screen_width = 0u;
+  std::uint32_t screen_height = 0u;
   if (input.swapchain_back_buffer.has_value()) {
-    screen_area = static_cast<std::uint64_t>(input.swapchain_back_buffer->texture.width) * input.swapchain_back_buffer->texture.height;
+    screen_width = input.swapchain_back_buffer->texture.width;
+    screen_height = input.swapchain_back_buffer->texture.height;
   } else {
     for (const auto& command : input.commands) {
       for (const auto& target : command.targets) {
-        screen_area = std::max<std::uint64_t>(screen_area, static_cast<std::uint64_t>(target.width) * target.height);
+        if (static_cast<std::uint64_t>(target.width) * target.height > static_cast<std::uint64_t>(screen_width) * screen_height) {
+          screen_width = target.width;
+          screen_height = target.height;
+        }
       }
     }
   }
+  const auto screen_area = static_cast<std::uint64_t>(screen_width) * screen_height;
   const auto is_large = [&](const TextureInfo& texture) {
     return screen_area != 0u && static_cast<std::uint64_t>(texture.width) * texture.height * 4u >= screen_area;
   };
@@ -666,6 +673,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
 
   // Candidates, in frame order.
   std::vector<std::size_t> tonemap_passes;
+  std::vector<std::size_t> final_passes_from_clone;
   std::vector<std::size_t> lut_builder_passes;
   std::vector<std::size_t> lut_reader_passes;
   for (std::size_t pass_index = 0u; pass_index < passes.size(); ++pass_index) {
@@ -680,9 +688,16 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       });
       lut_builder_passes.push_back(pass_index);
     }
-    // Only large passes count as LUT readers: scene draws also sample LUT-shaped volumes (noise, lighting).
+    // Only post-processing passes count as LUT readers: scene, shadow and probe draws also sample LUT-shaped volumes
+    // (noise, lighting), and their targets are square. A large target that is not square passes, so pillarboxed and
+    // letterboxed post chains still count. Without a swap chain the screen size is a guess, so only the size is checked.
+    // Non-square shadow atlases (e.g. 4096x2048) still pass.
     const auto lut_input = std::ranges::find_if(pass.inputs, is_lut_shaped);
-    if (lut_input != pass.inputs.end() && is_large(pass.targets.front())) {
+    const auto& target = pass.targets.front();
+    const bool square_target = input.swapchain_back_buffer.has_value()
+                               && screen_width != screen_height
+                               && std::abs(static_cast<double>(target.width) - target.height) <= target.height * 0.05;
+    if (lut_input != pass.inputs.end() && is_large(target) && !square_target) {
       pass.hints.push_back({
           {"type", "lutReader"},
           {"rule", std::format(
@@ -696,7 +711,6 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     }
 
     if (pass.blend_known && pass.blend_enabled) continue;
-    const auto& target = pass.targets.front();
     if (!is_large(target)) continue;
     const auto float_input = std::ranges::find_if(pass.inputs, [&](const TextureInfo& texture) {
       return is_float_format(rendered_format(texture)) && texture.width == target.width && texture.height == target.height;
@@ -724,19 +738,39 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     } else {
       rule += " (blend state not recorded on this API)";
     }
+    // Swap-chain writers stay candidates (games often tonemap straight into the back buffer), labelled: an r10g10b10a2
+    // swap chain can also be an HDR10 output. A swap-chain writer whose float input is float only through a mod's clone is
+    // the game's final pass (AA, upscale, composite) reading an SDR intermediate the mod upgraded; the snapshot never
+    // records passes an add-on draws through the ReShade API.
+    const bool float_only_through_clone = float_input->clone_active && !is_float_format(float_input->format);
+    if (target.is_swapchain) {
+      rule += "; writes the swap chain, so it may be the output pass instead";
+      if (float_only_through_clone) {
+        rule += "; its float input is an SDR texture a mod cloned to float, so this is likely the game's final AA/upscale/composite pass after the mod's upgrade";
+        final_passes_from_clone.push_back(pass_index);
+      }
+    } else if (float_only_through_clone) {
+      rule += "; its float input is float only through a mod clone";
+    }
     pass.hints.push_back({{"type", "tonemap"}, {"rule", std::move(rule)}});
     tonemap_passes.push_back(pass_index);
   }
 
-  // UI: blended draws onto large SDR (as the game created them) or swap-chain targets after the last tonemap candidate.
+  // UI: blended draws onto large SDR (as the game created them) or swap-chain targets after the tonemap. The scan starts
+  // after the last tonemap candidate that is not such a final pass from a cloned intermediate: UI can be drawn onto the
+  // intermediate before that pass, while a vanilla game's tonemap into the back buffer stays the anchor.
   std::vector<std::size_t> ui_passes;
-  if (!tonemap_passes.empty()) {
-    for (auto pass_index = tonemap_passes.back() + 1u; pass_index < passes.size(); ++pass_index) {
+  if (const auto ui_anchor = std::ranges::find_if(
+          tonemap_passes.rbegin(),
+          tonemap_passes.rend(),
+          [&](std::size_t pass_index) { return std::ranges::find(final_passes_from_clone, pass_index) == final_passes_from_clone.end(); });
+      ui_anchor != tonemap_passes.rend()) {
+    for (auto pass_index = *ui_anchor + 1u; pass_index < passes.size(); ++pass_index) {
       auto& pass = passes[pass_index];
       if (pass.kind != CommandKind::DRAW || !pass.blend_known || !pass.blend_enabled || pass.order_unknown || pass.targets.empty()) continue;
       const auto& target = pass.targets.front();
       if (!is_large(target) || !(target.is_swapchain || is_sdr_format(target.original_format))) continue;
-      pass.hints.push_back({{"type", "ui"}, {"rule", "blended draws onto a large SDR or swap-chain target after the last tonemap candidate"}});
+      pass.hints.push_back({{"type", "ui"}, {"rule", "blended draws onto a large SDR or swap-chain target after the last tonemap candidate that is not a final pass from a mod-cloned intermediate"}});
       ui_passes.push_back(pass_index);
     }
   }
