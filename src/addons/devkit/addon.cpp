@@ -5016,6 +5016,10 @@ void OnBindPipeline(
   if (pair != device_data->pipeline_blends.end()) {
     auto& blend_desc = pair->second;
     cmd_list_data->blend_desc = blend_desc;
+  } else if (pipeline.handle == 0u && renodx::utils::bitwise::HasFlag(stage, reshade::api::pipeline_stage::output_merger)) {
+    // D3D10/11 OMSetBlendState(nullptr) and ClearState (bound as stage 'all') restore the default state, in which
+    // blending is off; keeping the previous state would report the next draws as blended.
+    cmd_list_data->blend_desc = reshade::api::blend_desc{};
   }
 }
 
