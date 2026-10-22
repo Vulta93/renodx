@@ -61,7 +61,15 @@ The exact MCP schema can evolve, but the current workflow is built around these 
 long before it queues the request. Use it when the game is paused while you talk to the agent: start the call, unpause,
 and the capture lands on gameplay instead of the pause menu. The wait happens before queueing, so it does not count
 against the tools' own 15 s wait for the next present. It runs on the MCP connection's thread: other Devkit tool calls wait
-until it ends, and the arguments other than `delaySeconds` are only checked after it.
+until it ends, and the arguments other than `delaySeconds` and `waitForKey` are only checked after it.
+
+The same three tools take `waitForKey` (`"F1"` to `"F12"`): the call waits, at most 60 s, until the person presses that key
+in the game, then applies `delaySeconds` if given, then captures. The person decides the moment, for example after
+walking to a spot, without the agent guessing a delay. The key is read in `reshade_present` through ReShade's input
+(`effect_runtime::is_key_pressed`), so the game window needs focus (ReShade very likely still sees the key with its overlay
+open, while the game does not; not checked in a game). If the key is not pressed in time, the call fails and nothing is captured. The game still receives the
+key, so pick one it does not use. Like the delay, the wait blocks other Devkit tool calls and a Devkit unload until it
+ends.
 
 ### Resource inspection
 
@@ -207,7 +215,10 @@ not change these counts; take a new snapshot. `snapshotPending` is true while a 
 - `snapshotDraws` above `snapshotDrawsReplaced`: the original shader still drew for some draws, for example a pipeline created
   before the mod loaded or a replacement that failed to compile.
 
-It answers "is my shader live and drawing here?" without reading `ReShade.log`. Queue a snapshot first.
+It answers "is my shader live and drawing here?" without reading `ReShade.log`. Queue a snapshot first. The list is paged
+(`limit`, default 100, max 5000, and `offset`, in hash order): a generic mod such as `renodx-ue-extended` registers hundreds
+of replacements (418 in Gears of War: E-Day). `drawnOnly: true` keeps only the hashes the snapshot drew; `totalRegistered`,
+`totalDrawn` and `totalFiltered` give the counts before paging.
 
 ### Frame overview (`devkit_frame_overview`)
 
@@ -261,9 +272,8 @@ viewports, vertex counts or depth targets: a "large" target covers at least a qu
 passes into different depth targets merge into one pass. Blend state is only recorded from pipelines that carry one, so
 `blendEnabled` is `null`, and those draws are never UI candidates, on D3D9 and OpenGL, for a D3D11 draw that never bound
 a blend state, and for any pipeline whose blend state the Devkit did not record: D3D10/11 blend states and D3D12/Vulkan
-pipelines created before the Devkit loaded, and D3D12 pipeline states with a root signature embedded in the shader (they
-are created with a null layout, which the Devkit's pipeline tracking skips). A draw never reports the previous
-pipeline's blend state instead. With a mod loaded, every pass that renders into
+pipelines created before the Devkit loaded. D3D12 pipeline states with a root signature embedded in the shader (created
+with a null layout) do get their blend state recorded. A draw never reports the previous pipeline's blend state instead. With a mod loaded, every pass that renders into
 the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely
 one. Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and
 copy sources: reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.
@@ -397,9 +407,12 @@ The PNG is for quick visual inspection, not for HDR truth.
   active effect such as Lilium: disable them for clean numbers. A back buffer is read at the frame end of its own swap chain
   (as the watch does). Needs a swap chain with a ReShade effect runtime on the game's device (otherwise the call times out
   after 15 s; so does a D3D9 present that ReShade skips). Not verified with a RenoDX DX9 proxy mod, where the effect
-  runtime runs on the proxy device: expect the timeout there and use `present`. Refused on Vulkan for now: the analysis flushes ReShade's immediate command list and waits
-  for the queue, and inside `reshade_present` that would submit ReShade's effect commands without the present's wait
-  semaphores.
+  runtime runs on the proxy device: expect the timeout there and use `present`. On Vulkan the analysis cannot flush
+  ReShade's immediate command list and wait inside `reshade_present` (that would submit ReShade's effect commands without
+  the present's wait semaphores). There a back buffer of the presenting swap chain is copied into a Devkit-owned texture on
+  that list, which ReShade submits with the semaphores at present, and the analysis reads the copy in `finish_present`
+  (the same split the watch uses for its stats signal). Any other texture asked for with `frame_end` on Vulkan is read
+  after the present as it is, which is the same as `present` for it.
 
 ### Colour statistics (saturation and hue)
 
@@ -761,7 +774,7 @@ writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that 
   measurement.
 - `devkit_analyze_resource` reads by default inside the Devkit's own `present` handler, so on a back buffer it can miss
   what add-ons loaded after the Devkit draw at present. `measurePoint: "frame_end"` reads in `reshade_present` instead (see
-  "Measure point" in section 10); it is refused on Vulkan for now.
+  "Measure point" in section 10).
 - Cross-queue points are reduced at the second frame end after their execution at the earliest (later when the GPU
   runs behind), so they hold scratch textures longer (on busy targets the pool can reach the budget: use a region or
   `shaderHash`), and a 1-frame watch on such a game closes a few frames later.

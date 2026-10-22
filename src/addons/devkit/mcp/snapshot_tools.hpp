@@ -465,11 +465,33 @@ inline ToolResult HandleListReplacementsTool(const json& arguments, const ToolCo
     throw std::runtime_error("The snapshot tool context is not configured.");
   }
 
+  const auto drawn_only = mcp_arguments::GetOptional<bool>(arguments, "drawnOnly").value_or(false);
+  const auto limit = mcp_arguments::ValidateRange(
+      "limit",
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "limit").value_or(100u),
+      1u,
+      5000u);
+  const auto offset = mcp_arguments::ValidateRange(
+      "offset",
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "offset").value_or(0u),
+      0u,
+      (std::numeric_limits<std::uint32_t>::max)());
   const auto device_index = internal::ResolveDeviceIndex(arguments, context);
   const auto list = context.list_replacements(device_index);
   const auto drawn_count = std::ranges::count_if(list.replacements, [](const shader_summary::ReplacementSummary& replacement) {
     return replacement.snapshot_draws != 0u;
   });
+  // A generic mod registers hundreds of replacements, so the list is paged; drawnOnly keeps the ones the snapshot drew.
+  std::vector<shader_summary::ReplacementSummary> filtered_replacements;
+  for (const auto& replacement : list.replacements) {
+    if (drawn_only && replacement.snapshot_draws == 0u) continue;
+    filtered_replacements.push_back(replacement);
+  }
+  const auto clamped_offset = std::min<std::size_t>(offset, filtered_replacements.size());
+  const auto end_index = std::min<std::size_t>(clamped_offset + limit, filtered_replacements.size());
+  const std::vector<shader_summary::ReplacementSummary> paged_replacements(
+      filtered_replacements.begin() + clamped_offset,
+      filtered_replacements.begin() + end_index);
   const auto fully_replaced_count = std::ranges::count_if(list.replacements, [](const shader_summary::ReplacementSummary& replacement) {
     return replacement.snapshot_draws != 0u && replacement.snapshot_draws_replaced == replacement.snapshot_draws;
   });
@@ -494,13 +516,26 @@ inline ToolResult HandleListReplacementsTool(const json& arguments, const ToolCo
         list.captured_draws,
         fully_replaced_count);
   }
+  text += std::format(
+      " Returned {} of {} ({}offset {}).",
+      paged_replacements.size(),
+      filtered_replacements.size(),
+      (drawn_only ? "drawn only, " : ""),
+      clamped_offset);
   return ToolResult{
       .text = std::move(text),
       .structured_content = json{
           {"deviceIndex", device_index},
           {"capturedDraws", list.captured_draws},
           {"snapshotPending", list.snapshot_pending},
-          {"replacements", list.replacements},
+          {"totalRegistered", list.replacements.size()},
+          {"totalDrawn", drawn_count},
+          {"totalFiltered", filtered_replacements.size()},
+          {"drawnOnly", drawn_only},
+          {"offset", clamped_offset},
+          {"limit", limit},
+          {"returned", paged_replacements.size()},
+          {"replacements", paged_replacements},
       },
   };
 }

@@ -36,6 +36,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <variant>
@@ -144,6 +145,15 @@ std::atomic_bool shaders_pane_show_pixel_shaders = true;
 std::atomic_bool shaders_pane_show_compute_shaders = true;
 // Opt-in: adds copy-source usage to the game's Vulkan images at creation, so devkit_watch_region can copy them.
 std::atomic_bool watch_region_copy_source_usage = false;
+
+// MCP waitForKey: the virtual key the one waiting tool call waits for (0 when none), and the presses OnReShadePresent saw
+// for it.
+struct CaptureKeyState {
+  std::shared_mutex mutex;
+  uint32_t armed_key = 0u;
+  uint32_t presses = 0u;
+};
+CaptureKeyState capture_key_state;
 
 uint32_t skip_draw_count = 0;
 
@@ -446,6 +456,8 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_resource_analysis_requests;
   // measurePoint 'frame_end' requests, processed in reshade_present.
   std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_frame_end_resource_analysis_requests;
+  // Vulkan frame_end requests whose back-buffer copy was recorded in reshade_present, analyzed in finish_present.
+  std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_vulkan_frame_end_analyses;
   std::deque<std::shared_ptr<PendingLiveShaderRequest>> pending_live_shader_requests;
 
   std::unordered_map<uint32_t, std::set<uint32_t>> shader_draw_indexes;
@@ -2913,24 +2925,6 @@ std::vector<DeviceData*> device_data_list;
   }
   auto* device_data = device_data_list[device_index];
 
-  if (request->at_frame_end && device_data->device->get_api() == reshade::api::device_api::vulkan) {
-    // The analysis flushes ReShade's immediate command list and waits for the queue. Inside reshade_present on Vulkan
-    // that list already holds ReShade's effect commands, which would then be submitted without the present's wait
-    // semaphores (the watch defers its own signal to finish_present for the same reason).
-    const std::string error = "measurePoint 'frame_end' is not supported on Vulkan yet; use 'present', or devkit_watch_region, whose end-of-frame measurement is taken there.";
-    {
-      std::scoped_lock request_lock(request->mutex);
-      request->result = devkit_resource_analysis::ToolResult{
-          .text = error,
-          .structured_content = devkit_resource_analysis::json{{"error", error}},
-          .is_error = true,
-      };
-      request->completed = true;
-    }
-    request->cv.notify_all();
-    return true;
-  }
-
   std::unique_lock device_lock(device_data->mutex);
   if (request->at_frame_end) {
     device_data->pending_frame_end_resource_analysis_requests.push_back(request);
@@ -4552,6 +4546,29 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                        .dump_observation = DumpTextureReplaceObservationForMcp,
                                                    }; },
       .set_tools_path = devkit_tools_path::SetToolsPath,
+      .wait_for_capture_key = [](uint32_t virtual_key, std::chrono::seconds timeout) {
+        uint32_t presses_before = 0u;
+        {
+          std::unique_lock key_lock(capture_key_state.mutex);
+          // Up to four MCP connections can call at once; one armed key keeps a press from serving two captures.
+          if (capture_key_state.armed_key != 0u) {
+            throw std::runtime_error("Another Devkit tool call is already waiting for a key press; try again after it ends.");
+          }
+          capture_key_state.armed_key = virtual_key;
+          presses_before = capture_key_state.presses;
+        }
+        // Polled on the MCP connection thread; OnReShadePresent counts presses of the armed key once per frame.
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        bool pressed = false;
+        while (!pressed && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+          std::shared_lock key_lock(capture_key_state.mutex);
+          pressed = (capture_key_state.presses != presses_before);
+        }
+        std::unique_lock key_lock(capture_key_state.mutex);
+        capture_key_state.armed_key = 0u;
+        return pressed;
+      },
   };
   devkit_mcp_runtime::RegisterTools(server, context);
 }
@@ -4674,6 +4691,13 @@ void OnDestroyDevice(reshade::api::device* device) {
     std::unique_lock device_lock(device_data->mutex);
     fail_pending_requests(&device_data->pending_resource_analysis_requests);
     fail_pending_requests(&device_data->pending_frame_end_resource_analysis_requests);
+    // The device is idle when it is destroyed, so the Vulkan frame-end copies can be freed here.
+    for (const auto& request : device_data->pending_vulkan_frame_end_analyses) {
+      if (request->frame_end_copy.handle != 0u) {
+        device->destroy_resource(request->frame_end_copy);
+      }
+    }
+    fail_pending_requests(&device_data->pending_vulkan_frame_end_analyses);
     fail_pending_requests(&device_data->pending_live_shader_requests);
   }
   renodx::utils::data::Delete<DeviceData>(device);
@@ -4910,19 +4934,23 @@ void OnInitPipeline(
     const reshade::api::pipeline_subobject* subobjects,
     reshade::api::pipeline pipeline) {
   if (pipeline.handle == 0u) return;
-  if (layout.handle == 0u) return;
 
   auto* data = renodx::utils::data::Get<DeviceData>(device);
   if (data == nullptr) return;
   const std::unique_lock lock(data->mutex);
-  data->live_pipelines.emplace(pipeline.handle);
 
+  // Blend states are recorded whatever the layout: D3D12 pipeline states whose root signature is embedded in the shader
+  // are created with a null layout. OnDestroyPipeline erases the entry either way.
   for (const auto& subobject : std::span<const reshade::api::pipeline_subobject>(subobjects, subobject_count)) {
     if (subobject.type == reshade::api::pipeline_subobject_type::blend_state) {
       const auto* blend_desc = reinterpret_cast<const reshade::api::blend_desc*>(subobject.data);
       data->pipeline_blends[pipeline.handle] = *blend_desc;
     }
   }
+
+  // Live-pipeline tracking still skips null-layout pipelines, as it did before blend states were recorded for them.
+  if (layout.handle == 0u) return;
+  data->live_pipelines.emplace(pipeline.handle);
 }
 
 void OnDestroyPipeline(
@@ -9785,23 +9813,37 @@ void OnExecuteCommandList(
   device_data->draw_detail_indexes_by_cmd_list.erase(index_pair);
 }
 
+// The index tools use for the device (its position in device_data_list); 0 when it is not listed.
+[[nodiscard]] uint32_t GetDeviceIndex(const DeviceData* device_data) {
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (const auto iterator = std::ranges::find(device_data_list, device_data); iterator != device_data_list.end()) {
+    return static_cast<uint32_t>(std::distance(device_data_list.begin(), iterator));
+  }
+  return 0u;
+}
+
 // The watch's end-of-frame work runs here rather than in OnPresent: ReShade raises reshade_present after every add-on's
 // present handler, so writes made by other add-ons during present are included whatever the add-on load order.
 void OnReShadePresent(reshade::api::effect_runtime* runtime) {
+  // Checked before the proxy-device return: with a display proxy the runtime that receives input is the proxy's. The
+  // shared lock keeps the common case (no key armed) cheap on the presenting thread.
+  bool armed_key_pressed = false;
+  {
+    std::shared_lock key_lock(capture_key_state.mutex);
+    armed_key_pressed = capture_key_state.armed_key != 0u && runtime->is_key_pressed(capture_key_state.armed_key);
+  }
+  if (armed_key_pressed) {
+    std::unique_lock key_lock(capture_key_state.mutex);
+    ++capture_key_state.presses;
+  }
+
   auto* device = runtime->get_device();
   if (renodx::utils::device_proxy::IsProxyDevice(device)) return;
 
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
 
-  uint32_t device_index = 0u;
-  {
-    std::shared_lock list_lock(device_data_list_mutex);
-    if (auto iterator = std::find(device_data_list.begin(), device_data_list.end(), device_data);
-        iterator != device_data_list.end()) {
-      device_index = static_cast<uint32_t>(std::distance(device_data_list.begin(), iterator));
-    }
-  }
+  const auto device_index = GetDeviceIndex(device_data);
 
   // measurePoint 'frame_end' analyses run before the watch records its frame-end reductions, so that their flush and
   // wait for the queue do not split the watch's work.
@@ -9825,12 +9867,74 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
     }
     return is_other_back_buffer;
   });
-  devkit_resource_analysis::ProcessPendingRequests(
-      pending_frame_end_requests,
-      device_index,
-      device,
-      runtime->get_command_queue(),
-      BuildResourceAnalysisProcessingContext());
+  if (device->get_api() == reshade::api::device_api::vulkan) {
+    // Flushing ReShade's immediate command list here would submit ReShade's effect commands without the present's wait
+    // semaphores. The back buffer is copied on that list instead, which ReShade submits with the semaphores at present,
+    // and OnFinishPresent analyzes the copies on this runtime's queue (a game can present from another queue). Other
+    // textures are read there as they are, like measurePoint 'present'.
+    auto* runtime_queue = runtime->get_command_queue();
+    auto* cmd_list = runtime_queue->get_immediate_command_list();
+    for (const auto& request : pending_frame_end_requests) {
+      request->frame_end_queue = runtime_queue;
+      const auto resource = renodx::utils::resource::GetResourceFromView(device, request->resource_view);
+      if (std::ranges::find(own_back_buffer_handles, resource.handle) == own_back_buffer_handles.end()) continue;
+      const auto back_buffer_desc = device->get_resource_desc(resource);
+      // An image without TRANSFER_SRC is left uncopied; the analysis refuses it before any copy.
+      if (!renodx::utils::bitwise::HasAnyFlag(back_buffer_desc.usage, reshade::api::resource_usage::copy_source)) continue;
+      reshade::api::resource frame_end_copy = {0u};
+      if (!device->create_resource(
+              reshade::api::resource_desc(
+                  back_buffer_desc.texture.width,
+                  back_buffer_desc.texture.height,
+                  1,
+                  1,
+                  back_buffer_desc.texture.format,
+                  1,
+                  reshade::api::memory_heap::gpu_only,
+                  reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source),
+              nullptr,
+              // Any other initial state makes ReShade record the transition on the immediate command list and flush it
+              // at once (vulkan_impl_device.cpp create_resource), without the semaphores; the transition is recorded below.
+              reshade::api::resource_usage::undefined,
+              &frame_end_copy)) {
+        const std::string error = "Failed to create the texture to copy the back buffer into at the frame end.";
+        {
+          std::scoped_lock request_lock(request->mutex);
+          request->result = devkit_resource_analysis::ToolResult{
+              .text = error,
+              .structured_content = devkit_resource_analysis::json{{"error", error}},
+              .is_error = true,
+          };
+          request->completed = true;
+        }
+        request->cv.notify_all();
+        continue;
+      }
+      // At reshade_present ReShade has returned the back buffer to its present state (runtime.cpp on_present).
+      cmd_list->barrier(frame_end_copy, reshade::api::resource_usage::undefined, reshade::api::resource_usage::copy_dest);
+      cmd_list->barrier(resource, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_source);
+      cmd_list->copy_texture_region(resource, 0u, nullptr, frame_end_copy, 0u, nullptr);
+      cmd_list->barrier(resource, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::present);
+      cmd_list->barrier(frame_end_copy, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::copy_source);
+      request->frame_end_copy = frame_end_copy;
+    }
+    std::erase_if(pending_frame_end_requests, [](const std::shared_ptr<devkit_resource_analysis::PendingRequest>& request) {
+      std::scoped_lock request_lock(request->mutex);
+      return request->completed;
+    });
+    std::unique_lock device_lock(device_data->mutex);
+    device_data->pending_vulkan_frame_end_analyses.insert(
+        device_data->pending_vulkan_frame_end_analyses.end(),
+        pending_frame_end_requests.begin(),
+        pending_frame_end_requests.end());
+  } else {
+    devkit_resource_analysis::ProcessPendingRequests(
+        pending_frame_end_requests,
+        device_index,
+        device,
+        runtime->get_command_queue(),
+        BuildResourceAnalysisProcessingContext());
+  }
   if (!other_swap_chain_requests.empty()) {
     std::unique_lock device_lock(device_data->mutex);
     device_data->pending_frame_end_resource_analysis_requests.insert(
@@ -9863,6 +9967,39 @@ void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain
   auto* device_data = renodx::utils::data::Get<DeviceData>(swapchain->get_device());
   if (device_data == nullptr) return;
   devkit_watch_region::OnFinishPresent(&device_data->watch_region_watcher, queue);
+
+  // Vulkan measurePoint 'frame_end': ReShade submitted the immediate command lists with the back-buffer copies at
+  // present, so the analysis can flush and wait now. Each request is analyzed on the effect runtime's queue its copy
+  // was recorded on, where the analysis's own copy follows it in queue order; the presenting queue can be another one.
+  std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> frame_end_analyses;
+  {
+    std::unique_lock device_lock(device_data->mutex);
+    frame_end_analyses.swap(device_data->pending_vulkan_frame_end_analyses);
+  }
+  const auto device_index = GetDeviceIndex(device_data);
+  while (!frame_end_analyses.empty()) {
+    auto* analysis_queue = frame_end_analyses.front()->frame_end_queue;
+    std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> queue_analyses;
+    std::erase_if(frame_end_analyses, [&](const std::shared_ptr<devkit_resource_analysis::PendingRequest>& request) {
+      if (request->frame_end_queue != analysis_queue) return false;
+      queue_analyses.push_back(request);
+      return true;
+    });
+    devkit_resource_analysis::ProcessPendingRequests(
+        queue_analyses,
+        device_index,
+        device_data->device,
+        analysis_queue,
+        BuildResourceAnalysisProcessingContext());
+    // An analysis that failed before its own wait (a region that does not fit, a canceled request) leaves the copy
+    // possibly still in flight: wait once before the copies are destroyed.
+    analysis_queue->wait_idle();
+    for (const auto& request : queue_analyses) {
+      if (request->frame_end_copy.handle != 0u) {
+        device_data->device->destroy_resource(request->frame_end_copy);
+      }
+    }
+  }
 }
 
 void OnDestroyCommandQueue(reshade::api::command_queue* queue) {
@@ -9922,14 +10059,7 @@ void OnPresent(
   PumpDeviceProxyOutputWindowMessages();
 
   if (auto* device_data = get_data(); device_data != nullptr) {
-    uint32_t device_index = 0u;
-    {
-      std::shared_lock list_lock(device_data_list_mutex);
-      if (auto iterator = std::find(device_data_list.begin(), device_data_list.end(), device_data);
-          iterator != device_data_list.end()) {
-        device_index = static_cast<uint32_t>(std::distance(device_data_list.begin(), iterator));
-      }
-    }
+    const auto device_index = GetDeviceIndex(device_data);
     std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_requests;
     {
       std::unique_lock device_lock(device_data->mutex);

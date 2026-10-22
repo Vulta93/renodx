@@ -75,6 +75,11 @@ struct PendingRequest {
   // measurePoint 'frame_end': read in reshade_present, after every add-on's present handler and ReShade's effects and
   // overlay, instead of in the Devkit's own present handler.
   bool at_frame_end = false;
+  // Vulkan frame_end: a Devkit-owned copy of the back buffer recorded in reshade_present, read after finish_present
+  // instead of the swap-chain image (0 otherwise), and the effect runtime's queue it was recorded on, which the analysis
+  // uses (the presenting queue can be another one).
+  reshade::api::resource frame_end_copy = {0u};
+  reshade::api::command_queue* frame_end_queue = nullptr;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -741,7 +746,8 @@ inline void EncodePreviewPixel(
     std::string_view preview_mode_name,
     bool prefer_clone,
     const std::optional<reshade::api::subresource_box>& region,
-    Signal signal) {
+    Signal signal,
+    reshade::api::resource frame_end_copy) {
   AnalysisTarget target = {};
   try {
     target = ResolveAnalysisTarget(resource_view, device, prefer_clone);
@@ -895,6 +901,12 @@ inline void EncodePreviewPixel(
   // resolve a box, and an OpenGL multisample blit must keep identical bounds), then the region is copied out of it.
   reshade::api::resource copy_source = target.resolved_resource;
   uint32_t copy_source_subresource = subresource;
+  if (frame_end_copy.handle != 0u && !target.used_clone) {
+    // Vulkan frame_end: the subresource was copied at reshade_present; the swap-chain image itself is presented by now.
+    // A resolved clone is read as it is: the copy holds the original back buffer, possibly in another format.
+    copy_source = frame_end_copy;
+    copy_source_subresource = 0u;
+  }
   reshade::api::resource resolved_multisample = {0u};
   if (sample_count != 1u) {
     if (!device->create_resource(
@@ -1743,7 +1755,8 @@ inline void ProcessPendingRequests(
           request->preview_mode_name,
           request->prefer_clone,
           request->region,
-          request->signal);
+          request->signal,
+          request->frame_end_copy);
     } catch (const std::exception& exception) {
       result = ToolResult{
           .text = exception.what(),

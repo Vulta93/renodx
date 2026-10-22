@@ -5,13 +5,16 @@
 
 #pragma once
 
+#include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 
 #include "../../../utils/mcp/server.hpp"
@@ -36,6 +39,8 @@ struct RegistrationContext {
   std::function<resource_clone::ToolContext()> build_resource_clone_tool_context;
   std::function<texture_replace::ToolContext()> build_texture_replace_tool_context;
   std::function<renodx::utils::mcp::ToolResult(const std::optional<std::string>&)> set_tools_path;
+  // Waits until the person presses the virtual key in the game, at most timeout; false on timeout.
+  std::function<bool(std::uint32_t virtual_key, std::chrono::seconds timeout)> wait_for_capture_key;
 };
 
 inline void RegisterTools(renodx::utils::mcp::Server& server, const RegistrationContext& context) {
@@ -58,16 +63,49 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
     });
   };
 
-  // delaySeconds lets a capture land on gameplay after the game is unpaused. The wait happens before the request is
-  // queued, so it does not count against the tool's own wait for the next present.
-  const auto wait_requested_delay = [](const renodx::utils::mcp::json& arguments) {
-    const auto delay_seconds = renodx::utils::mcp::arguments::GetOptional<std::uint32_t>(arguments, "delaySeconds");
-    if (!delay_seconds.has_value()) return;
-    std::this_thread::sleep_for(std::chrono::seconds(renodx::utils::mcp::arguments::ValidateRange<std::uint32_t>(
-        "delaySeconds",
-        delay_seconds.value(),
-        0u,
-        tool_catalog::MAX_CAPTURE_DELAY_SECONDS)));
+  // waitForKey and delaySeconds let a capture land on gameplay after the game is unpaused: first the wait for the key
+  // the person presses in the game, then the delay. Both happen before the request is queued, so they do not count
+  // against the tool's own wait for the next present. Returns the error result when the key was not pressed in time.
+  const auto wait_for_capture_trigger = [wait_for_capture_key = context.wait_for_capture_key](
+                                            const renodx::utils::mcp::json& arguments)
+      -> std::optional<renodx::utils::mcp::ToolResult> {
+    // Checked before the key wait, so a bad delay fails at once.
+    auto delay_seconds = renodx::utils::mcp::arguments::GetOptional<std::uint32_t>(arguments, "delaySeconds");
+    if (delay_seconds.has_value()) {
+      delay_seconds = renodx::utils::mcp::arguments::ValidateRange<std::uint32_t>("delaySeconds", delay_seconds.value(), 0u, tool_catalog::MAX_CAPTURE_DELAY_SECONDS);
+    }
+    if (const auto key_name = renodx::utils::mcp::arguments::GetOptional<std::string>(arguments, "waitForKey"); key_name.has_value()) {
+      // F1-F12 only: function keys are rarely game bindings that also change what is on screen.
+      std::uint32_t function_key_number = 0u;
+      if (key_name->size() >= 2u && (key_name->front() == 'F' || key_name->front() == 'f')) {
+        const auto [end, error] = std::from_chars(key_name->data() + 1, key_name->data() + key_name->size(), function_key_number);
+        if (error != std::errc() || end != key_name->data() + key_name->size()) {
+          function_key_number = 0u;
+        }
+      }
+      if (function_key_number < 1u || function_key_number > 12u) {
+        throw std::runtime_error("waitForKey must be one of F1 to F12.");
+      }
+      if (!wait_for_capture_key) {
+        throw std::runtime_error("waitForKey is not available in this build.");
+      }
+      constexpr std::uint32_t VIRTUAL_KEY_F1 = 0x70u;
+      if (!wait_for_capture_key(VIRTUAL_KEY_F1 + function_key_number - 1u, std::chrono::seconds(tool_catalog::MAX_CAPTURE_KEY_WAIT_SECONDS))) {
+        const auto error = std::format(
+            "{} was not pressed in the game within {} s; nothing was captured. Press it with the game window focused.",
+            key_name.value(),
+            tool_catalog::MAX_CAPTURE_KEY_WAIT_SECONDS);
+        return renodx::utils::mcp::ToolResult{
+            .text = error,
+            .structured_content = renodx::utils::mcp::json{{"error", error}},
+            .is_error = true,
+        };
+      }
+    }
+    if (delay_seconds.has_value()) {
+      std::this_thread::sleep_for(std::chrono::seconds(delay_seconds.value()));
+    }
+    return std::nullopt;
   };
 
   register_tool("devkit_status", [build_snapshot_tools_context = context.build_snapshot_tools_context](
@@ -122,14 +160,14 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                         const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleGetDrawTool(arguments, build_snapshot_tools_context());
   });
-  register_tool("devkit_analyze_resource", [wait_requested_delay, build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
+  register_tool("devkit_analyze_resource", [wait_for_capture_trigger, build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                const renodx::utils::mcp::json& arguments) {
-    wait_requested_delay(arguments);
+    if (auto trigger_error = wait_for_capture_trigger(arguments)) return *trigger_error;
     return resource_analysis::HandleAnalyzeResourceTool(arguments, build_analyze_resource_tool_context());
   });
-  register_tool("devkit_watch_region", [wait_requested_delay, build_watch_region_tool_context = context.build_watch_region_tool_context](
+  register_tool("devkit_watch_region", [wait_for_capture_trigger, build_watch_region_tool_context = context.build_watch_region_tool_context](
                                            const renodx::utils::mcp::json& arguments) {
-    wait_requested_delay(arguments);
+    if (auto trigger_error = wait_for_capture_trigger(arguments)) return *trigger_error;
     return watch_region::HandleWatchRegionTool(arguments, build_watch_region_tool_context());
   });
   register_tool("devkit_dump_resource_with_hash", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
@@ -176,9 +214,9 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                                const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleSnapshotSummaryTool(arguments, build_snapshot_tools_context());
   });
-  register_tool("devkit_queue_snapshot", [wait_requested_delay, build_snapshot_tools_context = context.build_snapshot_tools_context](
+  register_tool("devkit_queue_snapshot", [wait_for_capture_trigger, build_snapshot_tools_context = context.build_snapshot_tools_context](
                                              const renodx::utils::mcp::json& arguments) {
-    wait_requested_delay(arguments);
+    if (auto trigger_error = wait_for_capture_trigger(arguments)) return *trigger_error;
     return snapshot_tools::HandleQueueSnapshotTool(arguments, build_snapshot_tools_context());
   });
 }
