@@ -673,7 +673,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
 
   // Candidates, in frame order.
   std::vector<std::size_t> tonemap_passes;
-  std::vector<std::size_t> final_passes_from_clone;
+  std::vector<std::size_t> final_passes_from_mod_upgrade;
   std::vector<std::size_t> lut_builder_passes;
   std::vector<std::size_t> lut_reader_passes;
   for (std::size_t pass_index = 0u; pass_index < passes.size(); ++pass_index) {
@@ -728,6 +728,13 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           formatting::StreamToString(rendered_format(*float_input)),
           formatting::StreamToString(target.original_format),
           formatting::StreamToString(rendered_format(target)));
+    } else if (target.is_swapchain && is_float_format(rendered_format(target))) {
+      // A mod that upgrades the swap chain when the game creates it leaves no SDR format to compare with, and an
+      // HDR-native game presents a float swap chain too; the pass that fills it from the scene is still the candidate.
+      rule = std::format(
+          "reads {} and writes a target of the same size that is float ({}) from its creation, as after a mod's swap-chain upgrade or in an HDR-native game",
+          formatting::StreamToString(rendered_format(*float_input)),
+          formatting::StreamToString(rendered_format(target)));
     } else {
       continue;
     }
@@ -739,38 +746,38 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       rule += " (blend state not recorded on this API)";
     }
     // Swap-chain writers stay candidates (games often tonemap straight into the back buffer), labelled: an r10g10b10a2
-    // swap chain can also be an HDR10 output. A swap-chain writer whose float input is float only through a mod's clone is
-    // the game's final pass (AA, upscale, composite) reading an SDR intermediate the mod upgraded; the snapshot never
-    // records passes an add-on draws through the ReShade API.
-    const bool float_only_through_clone = float_input->clone_active && !is_float_format(float_input->format);
+    // swap chain can also be an HDR10 output. A swap-chain writer whose float input the game created as non-float (float only
+    // through a mod's clone or in-place upgrade) is the game's final pass (AA, upscale, composite) reading an intermediate
+    // the mod upgraded; the snapshot never records passes an add-on draws through the ReShade API.
+    const bool float_only_through_mod = !is_float_format(float_input->original_format);
     if (target.is_swapchain) {
       rule += "; writes the swap chain, so it may be the output pass instead";
-      if (float_only_through_clone) {
-        rule += "; its float input is an SDR texture a mod cloned to float, so this is likely the game's final AA/upscale/composite pass after the mod's upgrade";
-        final_passes_from_clone.push_back(pass_index);
+      if (float_only_through_mod) {
+        rule += "; its float input is a non-float texture a mod upgraded to float, so this is likely the game's final AA/upscale/composite pass after the mod's upgrade";
+        final_passes_from_mod_upgrade.push_back(pass_index);
       }
-    } else if (float_only_through_clone) {
-      rule += "; its float input is float only through a mod clone";
+    } else if (float_only_through_mod) {
+      rule += "; its float input is float only through a mod's upgrade or clone";
     }
     pass.hints.push_back({{"type", "tonemap"}, {"rule", std::move(rule)}});
     tonemap_passes.push_back(pass_index);
   }
 
   // UI: blended draws onto large SDR (as the game created them) or swap-chain targets after the tonemap. The scan starts
-  // after the last tonemap candidate that is not such a final pass from a cloned intermediate: UI can be drawn onto the
+  // after the last tonemap candidate that is not such a final pass from a mod-upgraded intermediate: UI can be drawn onto the
   // intermediate before that pass, while a vanilla game's tonemap into the back buffer stays the anchor.
   std::vector<std::size_t> ui_passes;
   if (const auto ui_anchor = std::ranges::find_if(
           tonemap_passes.rbegin(),
           tonemap_passes.rend(),
-          [&](std::size_t pass_index) { return std::ranges::find(final_passes_from_clone, pass_index) == final_passes_from_clone.end(); });
+          [&](std::size_t pass_index) { return std::ranges::find(final_passes_from_mod_upgrade, pass_index) == final_passes_from_mod_upgrade.end(); });
       ui_anchor != tonemap_passes.rend()) {
     for (auto pass_index = *ui_anchor + 1u; pass_index < passes.size(); ++pass_index) {
       auto& pass = passes[pass_index];
       if (pass.kind != CommandKind::DRAW || !pass.blend_known || !pass.blend_enabled || pass.order_unknown || pass.targets.empty()) continue;
       const auto& target = pass.targets.front();
       if (!is_large(target) || !(target.is_swapchain || is_sdr_format(target.original_format))) continue;
-      pass.hints.push_back({{"type", "ui"}, {"rule", "blended draws onto a large SDR or swap-chain target after the last tonemap candidate that is not a final pass from a mod-cloned intermediate"}});
+      pass.hints.push_back({{"type", "ui"}, {"rule", "blended draws onto a large SDR or swap-chain target after the last tonemap candidate that is not a final pass from a mod-upgraded intermediate"}});
       ui_passes.push_back(pass_index);
     }
   }

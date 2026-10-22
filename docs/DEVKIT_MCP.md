@@ -187,7 +187,11 @@ constants are not included. Reflection names for the words are not resolved: rea
 cbuffer layout.
 
 Constant buffer binds in snapshot draws (`constantBuffers`, with or without values) are the pixel or compute stage's, like
-SRVs and UAVs: before this change a vertex shader bind on D3D11 could overwrite the pixel shader's slot.
+SRVs and UAVs: before this change a vertex shader bind on D3D11 could overwrite the pixel shader's slot. Vulkan dynamic
+uniform and storage buffers (`VK_DESCRIPTOR_TYPE_*_BUFFER_DYNAMIC`) are never listed: ReShade (API version 18) forwards no
+descriptors for them (`vkUpdateDescriptorSets` hook, `vulkan_hooks_device.cpp`, `default: update.count = 0`), so the
+Devkit never sees those bindings. A Vulkan draw whose shader reads constant buffers but shows none (DOOM 2016's output
+draw) most likely uses them. Listing them would need a change in ReShade.
 
 ### Replacement status (`devkit_list_replacements`)
 
@@ -226,12 +230,16 @@ thousands of draws:
   - `tonemap`: a draw (not blended) or dispatch whose first target is large and that reads a float texture of the same
     size (RGBA16F, R11G11B10F, RGBA32F, RGB32F, RG16F, RGB9E5, as rendered, so a mod's float clone counts) and writes an
     SDR target (RGBA8/BGRA8/BGRX8, sRGB or not, RGB10A2/BGR10A2), either as rendered or as the game created it before a
-    mod's upgrade or clone. Passes that write the swap chain stay candidates (vanilla games often tonemap straight into
-    the back buffer, and an RGB10A2 swap chain can also be an HDR10 output), but their rule says so. The rule also notes
-    when the float input is float only through a mod's active clone. A swap-chain writer with such an input is the game's
-    own final pass (AA, upscale, composite) reading an SDR intermediate the mod cloned to float, often the pass a mod's
-    output work targets. A mod's swap-chain proxy pass itself is never in a snapshot: passes an add-on draws through the
-    ReShade API raise no add-on events.
+    mod's upgrade or clone. A pass that fills a float swap chain from a same-size float texture is a candidate too: a mod
+    that upgrades the swap chain when the game creates it (DOOM 2016's mod) leaves no SDR format to compare with, and an
+    HDR-native game presents a float swap chain as well (there, several post passes into the back buffer can all
+    match, and the last one anchors the UI search). Passes that write the swap chain stay candidates (vanilla games often
+    tonemap straight into the back buffer, and an RGB10A2 swap chain can also be an HDR10 output), but their rule says so.
+    The rule also notes when the float input is float only through a mod, i.e. the game created it in a non-float format
+    and the mod cloned or upgraded it in place. A swap-chain writer with such an input is the game's own final pass (AA,
+    upscale, composite) reading an intermediate the mod upgraded, often the pass a mod's output work targets. A mod's
+    swap-chain proxy pass itself is never in a snapshot: passes an add-on draws through the ReShade API raise no add-on
+    events.
   - `lutTextures`, `lutReaderPasses`, `lutBuilderPasses`: textures with the geometry `src/shaders/lut.hlsl` samples (a 3D
     cube of 16 to 65, or a 2D strip N*N x N with the usual sizes N = 16/32/33/48/64), the passes that read them and the
     passes that write them. Only post-processing passes count as readers: a large target that is not square (width and
@@ -241,7 +249,7 @@ thousands of draws:
     shadow atlases (e.g. 4096x2048) that sample such a volume still match. Noise volumes and ramp strips of the same shape
     still match as LUT textures.
   - `uiPasses`: blended draws onto a large swap-chain target or one the game created as SDR, in known order, after the last
-    tonemap candidate that is not a final pass from a mod-cloned intermediate (UI can be drawn onto that intermediate before
+    tonemap candidate that is not a final pass from a mod-upgraded intermediate (UI can be drawn onto that intermediate before
     the final pass; a vanilla game's tonemap into the back buffer stays the anchor). When every candidate is such a final
     pass, no UI candidates are given.
   - `outputPass`: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.
