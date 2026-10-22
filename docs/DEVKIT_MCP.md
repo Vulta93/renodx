@@ -215,7 +215,7 @@ thousands of draws:
   source as input. Each pass has its draw range (`firstDraw`/`lastDraw`, the indexes `devkit_get_draw` takes), `targets`,
   `blendEnabled` (draws; `null` when the API recorded no blend state), `inputCount`, up to 8 shader hashes and, for
   candidates, its `inputs` and `hints`. `orderUnknown` marks D3D12/Vulkan commands without a known submission order, which
-  are sorted after every ordered command.
+  are sorted after every ordered command (other APIs record commands in issue order and never set it).
 - Textures are described by the resource the game created: `upgradedFrom` gives the game's format when a RenoDX mod
   upgraded the resource in place, `cloneFormat`/`cloneActive` the clone a mod renders into instead.
 - `writtenTextures`: every texture a pass writes, latest writer first, with up to its last 8 writer passes and the first 8
@@ -228,8 +228,8 @@ thousands of draws:
     SDR target (RGBA8/BGRA8/BGRX8, sRGB or not, RGB10A2/BGR10A2), either as rendered or as the game created it before a
     mod's upgrade or clone.
   - `lutTextures`, `lutReaderPasses`, `lutBuilderPasses`: textures with the geometry `src/shaders/lut.hlsl` samples (a 3D
-    cube of 16 to 65, or a 2D strip N*N x N with the usual sizes N = 16/32/33/48/64), the passes that read them and those
-    that write them. Noise volumes and ramp strips of the same shape match too.
+    cube of 16 to 65, or a 2D strip N*N x N with the usual sizes N = 16/32/33/48/64), the large passes that read them
+    (scene draws also sample LUT-shaped volumes) and the passes that write them. Noise volumes and ramp strips of the same shape match too.
   - `uiPasses`: blended draws onto a large swap-chain target or one the game created as SDR, after the last tonemap
     candidate, in known order.
   - `outputPass`: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.

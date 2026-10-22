@@ -680,8 +680,9 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       });
       lut_builder_passes.push_back(pass_index);
     }
+    // Only large passes count as LUT readers: scene draws also sample LUT-shaped volumes (noise, lighting).
     const auto lut_input = std::ranges::find_if(pass.inputs, is_lut_shaped);
-    if (lut_input != pass.inputs.end()) {
+    if (lut_input != pass.inputs.end() && is_large(pass.targets.front())) {
       pass.hints.push_back({
           {"type", "lutReader"},
           {"rule", std::format(
