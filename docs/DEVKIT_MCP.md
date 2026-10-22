@@ -262,18 +262,27 @@ thousands of draws:
   - `uiPasses`: blended draws onto a large swap-chain target or one the game created as SDR, in known order, after the last
     tonemap candidate that is not a final pass from a mod-upgraded intermediate (UI can be drawn onto that intermediate before
     the final pass; a vanilla game's tonemap into the back buffer stays the anchor). When every candidate is such a final
-    pass, no UI candidates are given.
+    pass (e.g. the mod tonemaps in its swap-chain proxy pass, which an add-on draws through the ReShade API and a snapshot
+    never records), the scan starts after the last one, so UI drawn onto the intermediate before it is not found. A UI
+    candidate whose every input was written earlier in the frame (copies count) is noted as a possible composite: of
+    post-processing (bloom, glow, blur), or of UI drawn into an earlier target. UI drawn from its own art (atlases, fonts
+    loaded before the frame) gets no note. In Prince of Persia T2T (D3D9) the HUD pass (122 fixed-function draws, BC3 art,
+    source-alpha blending) was found next to two bloom/glow composites that got this note.
   - `outputPass`: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.
 
 Limits: hints are candidates from formats, sizes, blend state and command order, never proof; the skills require proving
 the signal (`devkit_get_draw`, the shader, `devkit_watch_region`) before calling a pass the tonemap. Snapshots record no
 viewports, vertex counts or depth targets: a "large" target covers at least a quarter of the swap chain's back buffer
 (without a swap chain, of the largest target written), so passes at a lower render resolution still count, and depth-only
-passes into different depth targets merge into one pass. Blend state is only recorded from pipelines that carry one, so
-`blendEnabled` is `null`, and those draws are never UI candidates, on D3D9 and OpenGL, for a D3D11 draw that never bound
-a blend state, and for any pipeline whose blend state the Devkit did not record: D3D10/11 blend states and D3D12/Vulkan
-pipelines created before the Devkit loaded. D3D12 pipeline states with a root signature embedded in the shader (created
-with a null layout) do get their blend state recorded. A draw never reports the previous pipeline's blend state instead. With a mod loaded, every pass that renders into
+passes into different depth targets merge into one pass. On D3D9 the blend state is read from the device's render states
+(`GetRenderState`) at each recorded draw, since D3D9 blending is not part of a pipeline and state blocks and `Reset` change
+it without a ReShade event; a failed read or the obsolete `D3DBLEND_BOTHSRCALPHA`/`BOTHINVSRCALPHA` factors leave it
+`null`. D3D9 UI drawn with alpha test and no blending is not a UI candidate. Otherwise blend state is only recorded from
+pipelines that carry one, so `blendEnabled` is `null`, and those draws are never UI candidates, on OpenGL, for a D3D11
+draw that never bound a blend state, and for any pipeline whose blend state the Devkit did not record: D3D10/11 blend
+states and D3D12/Vulkan pipelines created before the Devkit loaded. D3D12 pipeline states with a root signature embedded
+in the shader (created with a null layout) do get their blend state recorded. A draw never reports the previous
+pipeline's blend state instead. With a mod loaded, every pass that renders into
 the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely
 one. Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and
 copy sources: reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.

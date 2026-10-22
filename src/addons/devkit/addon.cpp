@@ -7,6 +7,7 @@
 
 #include <d3d11.h>
 #include <d3d12.h>
+#include <d3d9.h>
 #include <Windows.h>
 
 #include <algorithm>
@@ -5602,7 +5603,94 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       draw_details.srv_binds = command_list_data->pixel_srv_binds;
       draw_details.uav_binds = command_list_data->pixel_uav_binds;
     }
-    draw_details.blend_desc = command_list_data->blend_desc;
+    if (device->get_api() == reshade::api::device_api::d3d9) {
+      // D3D9 blending is render state, not part of a pipeline, and state blocks (Apply) and Reset change it without a
+      // ReShade event, so read it from the device at each recorded draw. A failed read or a factor without a ReShade
+      // equivalent leaves it unknown. Factor and op values follow reshade::d3d9::convert_blend_factor/convert_blend_op.
+      auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(cmd_list->get_native()));
+      bool render_states_known = true;
+      const auto read_render_state = [&](D3DRENDERSTATETYPE state) -> DWORD {
+        DWORD value = 0u;
+        if (FAILED(native_device->GetRenderState(state, &value))) {
+          render_states_known = false;
+        }
+        return value;
+      };
+      const auto to_blend_factor = [&](DWORD value) -> reshade::api::blend_factor {
+        switch (value) {
+          case D3DBLEND_ZERO:           return reshade::api::blend_factor::zero;
+          case D3DBLEND_ONE:            return reshade::api::blend_factor::one;
+          case D3DBLEND_SRCCOLOR:       return reshade::api::blend_factor::source_color;
+          case D3DBLEND_INVSRCCOLOR:    return reshade::api::blend_factor::one_minus_source_color;
+          case D3DBLEND_DESTCOLOR:      return reshade::api::blend_factor::dest_color;
+          case D3DBLEND_INVDESTCOLOR:   return reshade::api::blend_factor::one_minus_dest_color;
+          case D3DBLEND_SRCALPHA:       return reshade::api::blend_factor::source_alpha;
+          case D3DBLEND_INVSRCALPHA:    return reshade::api::blend_factor::one_minus_source_alpha;
+          case D3DBLEND_DESTALPHA:      return reshade::api::blend_factor::dest_alpha;
+          case D3DBLEND_INVDESTALPHA:   return reshade::api::blend_factor::one_minus_dest_alpha;
+          case D3DBLEND_BLENDFACTOR:    return reshade::api::blend_factor::constant_color;
+          case D3DBLEND_INVBLENDFACTOR: return reshade::api::blend_factor::one_minus_constant_color;
+          case D3DBLEND_SRCALPHASAT:    return reshade::api::blend_factor::source_alpha_saturate;
+          case D3DBLEND_SRCCOLOR2:      return reshade::api::blend_factor::source1_color;
+          case D3DBLEND_INVSRCCOLOR2:   return reshade::api::blend_factor::one_minus_source1_color;
+          default:
+            // D3DBLEND_BOTHSRCALPHA / BOTHINVSRCALPHA (obsolete, set source and destination at once) and invalid values.
+            render_states_known = false;
+            return reshade::api::blend_factor::zero;
+        }
+      };
+      const auto to_blend_op = [&](DWORD value) -> reshade::api::blend_op {
+        if (value < D3DBLENDOP_ADD || value > D3DBLENDOP_MAX) {
+          render_states_known = false;
+          return reshade::api::blend_op::add;
+        }
+        return static_cast<reshade::api::blend_op>(value - D3DBLENDOP_ADD);
+      };
+
+      const bool blend_enable = read_render_state(D3DRS_ALPHABLENDENABLE) != FALSE;
+      const auto source_color_blend_factor = to_blend_factor(read_render_state(D3DRS_SRCBLEND));
+      const auto dest_color_blend_factor = to_blend_factor(read_render_state(D3DRS_DESTBLEND));
+      const auto color_blend_op = to_blend_op(read_render_state(D3DRS_BLENDOP));
+      // Without separate alpha blending, alpha uses the color factors and op.
+      auto source_alpha_blend_factor = source_color_blend_factor;
+      auto dest_alpha_blend_factor = dest_color_blend_factor;
+      auto alpha_blend_op = color_blend_op;
+      if (read_render_state(D3DRS_SEPARATEALPHABLENDENABLE) != FALSE) {
+        source_alpha_blend_factor = to_blend_factor(read_render_state(D3DRS_SRCBLENDALPHA));
+        dest_alpha_blend_factor = to_blend_factor(read_render_state(D3DRS_DESTBLENDALPHA));
+        alpha_blend_op = to_blend_op(read_render_state(D3DRS_BLENDOPALPHA));
+      }
+      const DWORD blend_factor_argb = read_render_state(D3DRS_BLENDFACTOR);
+      const std::array<DWORD, 4> render_target_write_masks = {
+          read_render_state(D3DRS_COLORWRITEENABLE),
+          read_render_state(D3DRS_COLORWRITEENABLE1),
+          read_render_state(D3DRS_COLORWRITEENABLE2),
+          read_render_state(D3DRS_COLORWRITEENABLE3),
+      };
+
+      if (render_states_known) {
+        reshade::api::blend_desc blend_desc = {};
+        // D3DRS_BLENDFACTOR is a D3DCOLOR (ARGB, 8 bits per channel).
+        blend_desc.blend_constant[0] = static_cast<float>((blend_factor_argb >> 16u) & 0xFFu) / 255.f;
+        blend_desc.blend_constant[1] = static_cast<float>((blend_factor_argb >> 8u) & 0xFFu) / 255.f;
+        blend_desc.blend_constant[2] = static_cast<float>(blend_factor_argb & 0xFFu) / 255.f;
+        blend_desc.blend_constant[3] = static_cast<float>((blend_factor_argb >> 24u) & 0xFFu) / 255.f;
+        // One blend state for every render target; D3D9 has four.
+        for (std::size_t rtv_index = 0u; rtv_index < render_target_write_masks.size(); ++rtv_index) {
+          blend_desc.blend_enable[rtv_index] = blend_enable;
+          blend_desc.source_color_blend_factor[rtv_index] = source_color_blend_factor;
+          blend_desc.dest_color_blend_factor[rtv_index] = dest_color_blend_factor;
+          blend_desc.color_blend_op[rtv_index] = color_blend_op;
+          blend_desc.source_alpha_blend_factor[rtv_index] = source_alpha_blend_factor;
+          blend_desc.dest_alpha_blend_factor[rtv_index] = dest_alpha_blend_factor;
+          blend_desc.alpha_blend_op[rtv_index] = alpha_blend_op;
+          blend_desc.render_target_write_mask[rtv_index] = static_cast<uint8_t>(render_target_write_masks[rtv_index] & 0xFu);
+        }
+        draw_details.blend_desc = blend_desc;
+      }
+    } else {
+      draw_details.blend_desc = command_list_data->blend_desc;
+    }
 
     std::unique_lock lock(device_data->mutex);
     struct CachedResourceViewDetails {

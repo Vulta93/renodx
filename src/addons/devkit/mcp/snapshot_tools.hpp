@@ -800,19 +800,36 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
 
   // UI: blended draws onto large SDR (as the game created them) or swap-chain targets after the tonemap. The scan starts
   // after the last tonemap candidate that is not such a final pass from a mod-upgraded intermediate: UI can be drawn onto the
-  // intermediate before that pass, while a vanilla game's tonemap into the back buffer stays the anchor.
-  std::vector<std::size_t> ui_passes;
-  if (const auto ui_anchor = std::ranges::find_if(
+  // intermediate before that pass, while a vanilla game's tonemap into the back buffer stays the anchor. When every
+  // candidate is such a final pass (e.g. the mod tonemaps in its swap-chain proxy pass, which an add-on draws through the
+  // ReShade API and a snapshot never records), the scan starts after the last one, so only UI drawn after it is found.
+  std::optional<std::size_t> ui_anchor = std::nullopt;
+  if (const auto non_final_tonemap = std::ranges::find_if(
           tonemap_passes.rbegin(),
           tonemap_passes.rend(),
           [&](std::size_t pass_index) { return std::ranges::find(final_passes_from_mod_upgrade, pass_index) == final_passes_from_mod_upgrade.end(); });
-      ui_anchor != tonemap_passes.rend()) {
+      non_final_tonemap != tonemap_passes.rend()) {
+    ui_anchor = *non_final_tonemap;
+  } else if (!tonemap_passes.empty()) {
+    ui_anchor = tonemap_passes.back();
+  }
+  std::vector<std::size_t> ui_passes;
+  if (ui_anchor.has_value()) {
     for (auto pass_index = *ui_anchor + 1u; pass_index < passes.size(); ++pass_index) {
       auto& pass = passes[pass_index];
       if (pass.kind != CommandKind::DRAW || !pass.blend_known || !pass.blend_enabled || pass.order_unknown || pass.targets.empty()) continue;
       const auto& target = pass.targets.front();
       if (!is_large(target) || !(target.is_swapchain || is_sdr_format(target.original_format))) continue;
-      pass.hints.push_back({{"type", "ui"}, {"rule", "blended draws onto a large SDR or swap-chain target after the last tonemap candidate that is not a final pass from a mod-upgraded intermediate"}});
+      std::string rule = "blended draws onto a large SDR or swap-chain target after the last tonemap candidate that is not a final pass from a mod-upgraded intermediate (or after the last candidate when all are)";
+      // UI samples its own art (atlases, fonts); a blended pass that only reads what the frame wrote before it is more
+      // likely a composite. Copies count as writes.
+      if (!pass.inputs.empty() && std::ranges::all_of(pass.inputs, [&](const TextureInfo& texture) {
+            const auto found = resources.find(texture.resource_handle);
+            return found != resources.end() && !found->second.writer_passes.empty() && found->second.writer_passes.front() < pass_index;
+          })) {
+        rule += "; every input was written earlier in this frame, so this may be a post-processing composite (bloom, glow, blur) or a composite of UI drawn into an earlier target, rather than UI drawn from its own art";
+      }
+      pass.hints.push_back({{"type", "ui"}, {"rule", std::move(rule)}});
       ui_passes.push_back(pass_index);
     }
   }
@@ -999,7 +1016,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           {"notes", {
               "Hints are candidates from formats, sizes, blend state and command order, not proof: confirm with devkit_get_draw, the shader and devkit_watch_region.",
               "Snapshots record no viewports, vertex counts or depth targets: a large target covers at least a quarter of the swap chain's back buffer, and depth-only passes into different depth targets merge.",
-              "Blend state is only recorded from pipelines that carry one; on D3D9 and OpenGL blendEnabled is null and no UI candidates are found.",
+              "Blend state is recorded from pipelines that carry one and, on D3D9, read from the device's render states at each draw; on OpenGL blendEnabled is null and no UI candidates are found.",
               "Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and copy sources; reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.",
               "With a mod loaded, every pass that renders into the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely one.",
               "orderUnknown passes (D3D12/Vulkan commands without a known submission order) are sorted after all others and are never UI or output candidates.",
