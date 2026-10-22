@@ -72,7 +72,7 @@ struct Command {
   CommandKind kind = CommandKind::DRAW;
   std::vector<TextureInfo> targets;
   std::vector<TextureInfo> inputs;
-  // Blend state is only recorded from pipelines that carry one (not D3D9 or OpenGL dynamic state).
+  // Blend state from the pipeline, or on D3D9 and OpenGL read from the device or context at the draw.
   bool blend_known = false;
   bool blend_enabled = false;
   // D3D12/Vulkan commands whose submission order is unknown are sorted after every ordered command.

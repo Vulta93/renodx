@@ -1016,7 +1016,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           {"notes", {
               "Hints are candidates from formats, sizes, blend state and command order, not proof: confirm with devkit_get_draw, the shader and devkit_watch_region.",
               "Snapshots record no viewports, vertex counts or depth targets: a large target covers at least a quarter of the swap chain's back buffer, and depth-only passes into different depth targets merge.",
-              "Blend state is recorded from pipelines that carry one and, on D3D9, read from the device's render states at each draw; on OpenGL blendEnabled is null and no UI candidates are found.",
+              "Blend state is recorded from pipelines that carry one and, on D3D9 and OpenGL, read from the device or context state at each draw; blendEnabled is null where none could be recorded.",
               "Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and copy sources; reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.",
               "With a mod loaded, every pass that renders into the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely one.",
               "orderUnknown passes (D3D12/Vulkan commands without a known submission order) are sorted after all others and are never UI or output candidates.",

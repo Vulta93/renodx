@@ -17,7 +17,8 @@
 
 #include <include/reshade.hpp>
 
-// devkit_watch_region on OpenGL: the GL entry points the watch calls itself, and the state it keeps per session.
+// devkit_watch_region on OpenGL: the GL entry points the watch calls itself (snapshots also read the blend state through
+// them), and the state the watch keeps per session.
 //
 // ReShade needs OpenGL 4.3 (its wglMakeCurrent hook refuses to initialise below), so compute shaders, image load/store
 // and atomics are available whenever the Devkit runs. The watch copies the region into a grid atlas through ReShade's API
@@ -79,6 +80,47 @@ constexpr unsigned int CONDITION_SATISFIED = 0x911Cu;
 constexpr unsigned int SYNC_WAIT_FAILED = 0x911Du;
 // Target part of ReShade's resource handle ((target << 40) | name) for the swap chain's framebuffer 0.
 constexpr unsigned int FRAMEBUFFER_DEFAULT = 0x8218u;
+// Blend state, read per draw buffer by devkit snapshots.
+constexpr unsigned int FRONT_LEFT = 0x0400u;
+constexpr unsigned int COLOR_ATTACHMENT0 = 0x8CE0u;
+constexpr unsigned int BLEND = 0x0BE2u;
+constexpr unsigned int BLEND_SRC_RGB = 0x80C9u;
+constexpr unsigned int BLEND_DST_RGB = 0x80C8u;
+constexpr unsigned int BLEND_SRC_ALPHA = 0x80CBu;
+constexpr unsigned int BLEND_DST_ALPHA = 0x80CAu;
+constexpr unsigned int BLEND_EQUATION_RGB = 0x8009u;
+constexpr unsigned int BLEND_EQUATION_ALPHA = 0x883Du;
+constexpr unsigned int BLEND_COLOR = 0x8005u;
+constexpr unsigned int SAMPLE_ALPHA_TO_COVERAGE = 0x809Eu;
+constexpr unsigned int COLOR_WRITEMASK = 0x0C23u;
+constexpr unsigned int COLOR_LOGIC_OP = 0x0BF2u;
+constexpr unsigned int LOGIC_OP_MODE = 0x0BF0u;
+constexpr unsigned int CLEAR = 0x1500u;
+constexpr unsigned int SET = 0x150Fu;
+constexpr unsigned int ZERO = 0u;
+constexpr unsigned int ONE = 1u;
+constexpr unsigned int SRC_COLOR = 0x0300u;
+constexpr unsigned int ONE_MINUS_SRC_COLOR = 0x0301u;
+constexpr unsigned int SRC_ALPHA = 0x0302u;
+constexpr unsigned int ONE_MINUS_SRC_ALPHA = 0x0303u;
+constexpr unsigned int DST_ALPHA = 0x0304u;
+constexpr unsigned int ONE_MINUS_DST_ALPHA = 0x0305u;
+constexpr unsigned int DST_COLOR = 0x0306u;
+constexpr unsigned int ONE_MINUS_DST_COLOR = 0x0307u;
+constexpr unsigned int SRC_ALPHA_SATURATE = 0x0308u;
+constexpr unsigned int CONSTANT_COLOR = 0x8001u;
+constexpr unsigned int ONE_MINUS_CONSTANT_COLOR = 0x8002u;
+constexpr unsigned int CONSTANT_ALPHA = 0x8003u;
+constexpr unsigned int ONE_MINUS_CONSTANT_ALPHA = 0x8004u;
+constexpr unsigned int SRC1_ALPHA = 0x8589u;
+constexpr unsigned int SRC1_COLOR = 0x88F9u;
+constexpr unsigned int ONE_MINUS_SRC1_COLOR = 0x88FAu;
+constexpr unsigned int ONE_MINUS_SRC1_ALPHA = 0x88FBu;
+constexpr unsigned int FUNC_ADD = 0x8006u;
+constexpr unsigned int MIN = 0x8007u;
+constexpr unsigned int MAX = 0x8008u;
+constexpr unsigned int FUNC_SUBTRACT = 0x800Au;
+constexpr unsigned int FUNC_REVERSE_SUBTRACT = 0x800Bu;
 
 }  // namespace gl_enum
 
@@ -87,6 +129,9 @@ struct OpenGLFunctions {
   void(APIENTRY* get_integerv)(unsigned int, int*) = nullptr;
   void(APIENTRY* get_integeri_v)(unsigned int, unsigned int, int*) = nullptr;
   unsigned char(APIENTRY* is_enabled)(unsigned int) = nullptr;
+  unsigned char(APIENTRY* is_enabledi)(unsigned int, unsigned int) = nullptr;
+  void(APIENTRY* get_booleani_v)(unsigned int, unsigned int, unsigned char*) = nullptr;
+  void(APIENTRY* get_floatv)(unsigned int, float*) = nullptr;
   void(APIENTRY* enable)(unsigned int) = nullptr;
   unsigned int(APIENTRY* get_error)() = nullptr;
   void(APIENTRY* get_framebuffer_attachment_parameteriv)(unsigned int, unsigned int, unsigned int, int*) = nullptr;
@@ -135,10 +180,13 @@ struct OpenGLFunctions {
       load(&loaded.get_current_context, "wglGetCurrentContext", true)
       && load(&loaded.get_integerv, "glGetIntegerv", true)
       && load(&loaded.is_enabled, "glIsEnabled", true)
+      && load(&loaded.get_floatv, "glGetFloatv", true)
       && load(&loaded.enable, "glEnable", true)
       && load(&loaded.get_error, "glGetError", true)
       && load(&loaded.read_buffer, "glReadBuffer", true)
       && load(&loaded.get_integeri_v, "glGetIntegeri_v", false)
+      && load(&loaded.is_enabledi, "glIsEnabledi", false)
+      && load(&loaded.get_booleani_v, "glGetBooleani_v", false)
       && load(&loaded.get_stringi, "glGetStringi", false)
       && load(&loaded.get_framebuffer_attachment_parameteriv, "glGetFramebufferAttachmentParameteriv", false)
       && load(&loaded.bind_framebuffer, "glBindFramebuffer", false)

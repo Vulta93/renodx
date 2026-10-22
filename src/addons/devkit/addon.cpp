@@ -91,6 +91,7 @@
 #include "./mcp/snapshot_tools.hpp"
 #include "./mcp/texture_replace.hpp"
 #include "./mcp/watch_region.hpp"
+#include "./mcp/watch_region_opengl.hpp"
 #include "./tools_path.hpp"
 
 namespace {
@@ -5687,6 +5688,111 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           blend_desc.render_target_write_mask[rtv_index] = static_cast<uint8_t>(render_target_write_masks[rtv_index] & 0xFu);
         }
         draw_details.blend_desc = blend_desc;
+      }
+    } else if (device->get_api() == reshade::api::device_api::opengl && draw_method != DrawDetails::DrawMethods::DISPATCH) {
+      // OpenGL blending is context state, not part of a pipeline, so read it from the current context at each recorded
+      // draw (the draw event runs on the thread that issued the draw, with its context current). Without a current context
+      // or the entry points it stays unknown. Factor, op and logic-op values follow
+      // reshade::opengl::convert_blend_factor/convert_blend_op/convert_logic_op.
+      namespace gl_enum = renodx::addons::devkit::mcp::watch_region::gl_enum;
+      const auto* gl = renodx::addons::devkit::mcp::watch_region::GetOpenGLFunctions();
+      int max_draw_buffers = 0;
+      if (gl != nullptr && gl->get_current_context() != nullptr) {
+        gl->get_integerv(gl_enum::MAX_DRAW_BUFFERS, &max_draw_buffers);
+      }
+      if (max_draw_buffers > 0) {
+        bool blend_state_known = true;
+        const auto read_indexed = [&](unsigned int name, unsigned int index) -> unsigned int {
+          int value = 0;
+          gl->get_integeri_v(name, index, &value);
+          return static_cast<unsigned int>(value);
+        };
+        const auto to_blend_factor = [&](unsigned int value) -> reshade::api::blend_factor {
+          switch (value) {
+            case gl_enum::ZERO:                     return reshade::api::blend_factor::zero;
+            case gl_enum::ONE:                      return reshade::api::blend_factor::one;
+            case gl_enum::SRC_COLOR:                return reshade::api::blend_factor::source_color;
+            case gl_enum::ONE_MINUS_SRC_COLOR:      return reshade::api::blend_factor::one_minus_source_color;
+            case gl_enum::DST_COLOR:                return reshade::api::blend_factor::dest_color;
+            case gl_enum::ONE_MINUS_DST_COLOR:      return reshade::api::blend_factor::one_minus_dest_color;
+            case gl_enum::SRC_ALPHA:                return reshade::api::blend_factor::source_alpha;
+            case gl_enum::ONE_MINUS_SRC_ALPHA:      return reshade::api::blend_factor::one_minus_source_alpha;
+            case gl_enum::DST_ALPHA:                return reshade::api::blend_factor::dest_alpha;
+            case gl_enum::ONE_MINUS_DST_ALPHA:      return reshade::api::blend_factor::one_minus_dest_alpha;
+            case gl_enum::CONSTANT_COLOR:           return reshade::api::blend_factor::constant_color;
+            case gl_enum::ONE_MINUS_CONSTANT_COLOR: return reshade::api::blend_factor::one_minus_constant_color;
+            case gl_enum::CONSTANT_ALPHA:           return reshade::api::blend_factor::constant_alpha;
+            case gl_enum::ONE_MINUS_CONSTANT_ALPHA: return reshade::api::blend_factor::one_minus_constant_alpha;
+            case gl_enum::SRC_ALPHA_SATURATE:       return reshade::api::blend_factor::source_alpha_saturate;
+            case gl_enum::SRC1_COLOR:               return reshade::api::blend_factor::source1_color;
+            case gl_enum::ONE_MINUS_SRC1_COLOR:     return reshade::api::blend_factor::one_minus_source1_color;
+            case gl_enum::SRC1_ALPHA:               return reshade::api::blend_factor::source1_alpha;
+            case gl_enum::ONE_MINUS_SRC1_ALPHA:     return reshade::api::blend_factor::one_minus_source1_alpha;
+            default:
+              blend_state_known = false;
+              return reshade::api::blend_factor::zero;
+          }
+        };
+        const auto to_blend_op = [&](unsigned int value) -> reshade::api::blend_op {
+          switch (value) {
+            case gl_enum::FUNC_ADD:              return reshade::api::blend_op::add;
+            case gl_enum::FUNC_SUBTRACT:         return reshade::api::blend_op::subtract;
+            case gl_enum::FUNC_REVERSE_SUBTRACT: return reshade::api::blend_op::reverse_subtract;
+            case gl_enum::MIN:                   return reshade::api::blend_op::min;
+            case gl_enum::MAX:                   return reshade::api::blend_op::max;
+            default:
+              blend_state_known = false;
+              return reshade::api::blend_op::add;
+          }
+        };
+
+        reshade::api::blend_desc blend_desc = {};
+        blend_desc.alpha_to_coverage_enable = gl->is_enabled(gl_enum::SAMPLE_ALPHA_TO_COVERAGE) != 0u;
+        gl->get_floatv(gl_enum::BLEND_COLOR, blend_desc.blend_constant);
+        // The logic op is one context-wide setting.
+        const bool logic_op_enable = gl->is_enabled(gl_enum::COLOR_LOGIC_OP) != 0u;
+        int logic_op_mode = 0;
+        gl->get_integerv(gl_enum::LOGIC_OP_MODE, &logic_op_mode);
+        if (logic_op_mode < static_cast<int>(gl_enum::CLEAR) || logic_op_mode > static_cast<int>(gl_enum::SET)) {
+          blend_state_known = false;
+        }
+        const auto logic_op = static_cast<reshade::api::logic_op>(logic_op_mode - static_cast<int>(gl_enum::CLEAR));
+        // GL indexes blend state by draw buffer slot (glDrawBuffers), while ReShade reports render targets by color
+        // attachment, so each slot's state goes to the attachment it writes; the default framebuffer has only index 0.
+        // Attachments no slot writes keep blending off and get an empty write mask. Two slots on one index are only possible
+        // on a stereo default framebuffer; the last slot wins.
+        std::ranges::fill(blend_desc.render_target_write_mask, uint8_t{0u});
+        constexpr unsigned int MAX_RTV_COUNT = std::size(reshade::api::blend_desc{}.blend_enable);
+        const auto draw_buffer_count = std::min<unsigned int>(MAX_RTV_COUNT, max_draw_buffers);
+        for (unsigned int draw_buffer = 0u; draw_buffer < draw_buffer_count; ++draw_buffer) {
+          int written_buffer = 0;
+          gl->get_integerv(gl_enum::DRAW_BUFFER0 + draw_buffer, &written_buffer);
+          const auto written = static_cast<unsigned int>(written_buffer);
+          unsigned int rtv_index = 0u;
+          if (written >= gl_enum::COLOR_ATTACHMENT0 && written < gl_enum::COLOR_ATTACHMENT0 + MAX_RTV_COUNT) {
+            rtv_index = written - gl_enum::COLOR_ATTACHMENT0;
+          } else if (written < gl_enum::FRONT_LEFT || written > gl_enum::FRONT_AND_BACK) {
+            // GL_NONE, or an attachment beyond the eight ReShade reports.
+            continue;
+          }
+          blend_desc.blend_enable[rtv_index] = gl->is_enabledi(gl_enum::BLEND, draw_buffer) != 0u;
+          blend_desc.source_color_blend_factor[rtv_index] = to_blend_factor(read_indexed(gl_enum::BLEND_SRC_RGB, draw_buffer));
+          blend_desc.dest_color_blend_factor[rtv_index] = to_blend_factor(read_indexed(gl_enum::BLEND_DST_RGB, draw_buffer));
+          blend_desc.color_blend_op[rtv_index] = to_blend_op(read_indexed(gl_enum::BLEND_EQUATION_RGB, draw_buffer));
+          blend_desc.source_alpha_blend_factor[rtv_index] = to_blend_factor(read_indexed(gl_enum::BLEND_SRC_ALPHA, draw_buffer));
+          blend_desc.dest_alpha_blend_factor[rtv_index] = to_blend_factor(read_indexed(gl_enum::BLEND_DST_ALPHA, draw_buffer));
+          blend_desc.alpha_blend_op[rtv_index] = to_blend_op(read_indexed(gl_enum::BLEND_EQUATION_ALPHA, draw_buffer));
+          blend_desc.logic_op_enable[rtv_index] = logic_op_enable;
+          blend_desc.logic_op[rtv_index] = logic_op;
+          std::array<unsigned char, 4> write_mask = {};
+          gl->get_booleani_v(gl_enum::COLOR_WRITEMASK, draw_buffer, write_mask.data());
+          blend_desc.render_target_write_mask[rtv_index] = static_cast<uint8_t>(
+              (write_mask[0] != 0u ? 0x1u : 0u) | (write_mask[1] != 0u ? 0x2u : 0u)
+              | (write_mask[2] != 0u ? 0x4u : 0u) | (write_mask[3] != 0u ? 0x8u : 0u));
+        }
+        if (blend_state_known) {
+          draw_details.blend_desc = blend_desc;
+        }
       }
     } else {
       draw_details.blend_desc = command_list_data->blend_desc;

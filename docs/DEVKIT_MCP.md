@@ -277,8 +277,13 @@ viewports, vertex counts or depth targets: a "large" target covers at least a qu
 passes into different depth targets merge into one pass. On D3D9 the blend state is read from the device's render states
 (`GetRenderState`) at each recorded draw, since D3D9 blending is not part of a pipeline and state blocks and `Reset` change
 it without a ReShade event; a failed read or the obsolete `D3DBLEND_BOTHSRCALPHA`/`BOTHINVSRCALPHA` factors leave it
-`null`. D3D9 UI drawn with alpha test and no blending is not a UI candidate. Otherwise blend state is only recorded from
-pipelines that carry one, so `blendEnabled` is `null`, and those draws are never UI candidates, on OpenGL, for a D3D11
+`null`. On OpenGL it is read from the current context per draw buffer (`glIsEnabledi(GL_BLEND)`, `glGetIntegeri_v`
+blend factors and equations, `glGetBooleani_v(GL_COLOR_WRITEMASK)`, blend color, logic op) at each recorded draw, since
+GL blending is context state; each draw buffer's state is stored at the color attachment it writes (from
+`GL_DRAW_BUFFERi`), and attachments no draw buffer writes report blending off with an empty write mask. Without a current
+context or the GL entry points, or with a value ReShade cannot express, it stays `null`. UI drawn
+with alpha test and no blending (D3D9, legacy GL) is not a UI candidate. Otherwise blend state is only recorded from
+pipelines that carry one, so `blendEnabled` is `null`, and those draws are never UI candidates, for a D3D11
 draw that never bound a blend state, and for any pipeline whose blend state the Devkit did not record: D3D10/11 blend
 states and D3D12/Vulkan pipelines created before the Devkit loaded. D3D12 pipeline states with a root signature embedded
 in the shader (created with a null layout) do get their blend state recorded. A draw never reports the previous
