@@ -53,6 +53,7 @@
 #include "../../../utils/state.hpp"
 #include "../../../utils/swapchain.hpp"
 #include "../formatting.hpp"
+#include "./frame_overview.hpp"
 #include "./resource_analysis.hpp"
 #include "./resource_handle.hpp"
 #include "./shader_hash.hpp"
@@ -213,24 +214,43 @@ struct Request {
   bool include_unchanged = false;
   bool verify = false;
   std::uint32_t scratch_budget_mb = DEFAULT_SCRATCH_BUDGET_MB;
+  // withSnapshot: a snapshot is captured in the watched frame and each traced writer is linked to its snapshot command.
+  bool with_snapshot = false;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
   bool canceled = false;
   bool completed = false;
   std::optional<ToolResult> result = std::nullopt;
+  // Why the writers could not be linked to a snapshot (empty when they were).
+  std::string snapshot_link_error;
+  // The snapshot begin_linked_snapshot started for this watch.
+  std::optional<std::uint64_t> linked_snapshot_id = std::nullopt;
 };
 
 struct ToolContext {
   std::function<std::uint32_t(const json& arguments)> resolve_device_index;
   std::function<bool(std::uint32_t device_index, const std::shared_ptr<Request>& request)> enqueue_request;
   std::function<void(std::uint32_t device_index, const std::shared_ptr<Request>& request)> cancel_request;
+  // The snapshot's commands as devkit_frame_overview sees them (withSnapshot).
+  std::function<frame_overview::Input(std::uint32_t device_index)> collect_snapshot_commands;
+};
+
+// A snapshot command by the key the snapshot gives it while recording: the command list, its recording and the command
+// number in it.
+// The snapshot's draw index is only known once the snapshot frame ended and its list was sorted.
+struct SnapshotCommandKey {
+  std::uint64_t cmd_list_handle = 0u;
+  std::uint32_t cmd_list_draw_index = 0u;
+  // Which recording of the command list: D3D12/Vulkan lists restart their numbers when reset within one frame.
+  std::uint64_t cmd_list_recording = 0u;
 };
 
 struct DrawMember {
   std::uint32_t command_index = 0u;
   std::uint32_t pixel_shader_hash = 0u;
   std::uint32_t vertex_shader_hash = 0u;
+  std::optional<SnapshotCommandKey> snapshot_command = std::nullopt;
 };
 
 struct WriterInfo {
@@ -242,6 +262,7 @@ struct WriterInfo {
   std::uint32_t compute_shader_hash = 0u;
   std::vector<DrawMember> members = {};
   std::uint32_t member_count = 0u;
+  std::optional<SnapshotCommandKey> snapshot_command = std::nullopt;
 };
 
 // One command that writes the watched subresource, or a pure measurement point (no writer), in command order.
@@ -525,6 +546,7 @@ struct Session {
   std::uint32_t frames = 1u;
   std::optional<std::uint32_t> shader_hash = std::nullopt;
   bool include_unchanged = false;
+  bool with_snapshot = false;
   bool used_clone = false;
   reshade::api::format scratch_format = reshade::api::format::unknown;
   std::string resource_format_name;
@@ -671,6 +693,12 @@ struct Watcher {
   // Shared with hooks that record a region copy after releasing the lock, so the session outlives them.
   std::shared_ptr<Session> session;
   std::deque<std::shared_ptr<Request>> pending_requests;
+  // Set by the Devkit for withSnapshot. begin_linked_snapshot starts a snapshot of the device's next frame and returns its id (nullopt when
+  // another snapshot is queued or running); called without the watcher lock. peek_snapshot_command returns the key the
+  // running snapshot gives the command a hook is about to see (nullopt when no snapshot records `cmd_list`); the watch
+  // hooks run before the snapshot's, so it is called under the lock and must not take other locks.
+  std::function<std::optional<std::uint64_t>()> begin_linked_snapshot;
+  std::function<std::optional<SnapshotCommandKey>(reshade::api::command_list* cmd_list)> peek_snapshot_command;
   std::vector<RetiredScratch> retired_scratch;
   // D3D12: lifetime fences by queue handle, and the number of frame ends so far (see GpuSubmission).
   std::unordered_map<std::uint64_t, QueueLifetimeFence> queue_fences;
@@ -1001,6 +1029,14 @@ inline void AddSubmission(std::vector<GpuSubmission>* submissions, const GpuSubm
   const auto covers_layer = session.array_layer >= texture.first_layer
                             && (layer_count == UINT32_MAX || session.array_layer < texture.first_layer + layer_count);
   return (covers_level && covers_layer ? image : 0u);
+}
+
+// withSnapshot: the key of the snapshot command the hook is about to see. Only draws, dispatches and copies are snapshot
+// commands, so clears, resolves and updates never ask.
+[[nodiscard]] inline std::optional<SnapshotCommandKey> PeekSnapshotCommand(
+    const Watcher& watcher, const Session& session, reshade::api::command_list* cmd_list) {
+  if (!session.with_snapshot || cmd_list == nullptr || !watcher.peek_snapshot_command) return std::nullopt;
+  return watcher.peek_snapshot_command(cmd_list);
 }
 
 [[nodiscard]] inline bool MatchesFilter(const Session& session, const WriterInfo& writer) {
@@ -1710,6 +1746,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
               .kind = WriterKind::DISPATCH,
               .command_index = command_index,
               .compute_shader_hash = renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::compute_shader),
+              .snapshot_command = internal::PeekSnapshotCommand(*watcher, *session, cmd_list),
           },
           dispatch_state,
           UnmeasuredReason::DESCRIPTOR_TABLE);
@@ -1730,6 +1767,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
             .command_index = command_index,
             .pixel_shader_hash = renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::pixel_shader),
             .vertex_shader_hash = renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::vertex_shader),
+            .snapshot_command = internal::PeekSnapshotCommand(*watcher, *session, cmd_list),
         });
       }
       return;
@@ -1756,6 +1794,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
             .command_index = command_index,
             .pixel_shader_hash = renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::pixel_shader),
             .vertex_shader_hash = renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::vertex_shader),
+            .snapshot_command = internal::PeekSnapshotCommand(*watcher, *session, cmd_list),
         },
         draw_state,
         UnmeasuredReason::STATE_UNKNOWN);
@@ -1779,6 +1818,7 @@ inline void OnDrawOrDispatch(Watcher* watcher, reshade::api::command_list* cmd_l
         .pixel_shader_hash = (is_dispatch ? 0u : renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::pixel_shader)),
         .vertex_shader_hash = (is_dispatch ? 0u : renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::vertex_shader)),
         .compute_shader_hash = (is_dispatch ? renodx::utils::state::GetCurrentShaderHash(cmd_list, reshade::api::pipeline_stage::compute_shader) : 0u),
+        .snapshot_command = internal::PeekSnapshotCommand(*watcher, *session, cmd_list),
     };
   };
 
@@ -1932,7 +1972,13 @@ inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_li
     if (session->device_api == reshade::api::device_api::vulkan && !session->single_subresource) {
       state.reset();
     }
-    auto pending = internal::RecordExplicit(watcher->session, cmd_list, written_image, WriterInfo{.kind = kind, .command_index = command_index}, state, UnmeasuredReason::STATE_UNKNOWN);
+    // Only copies are snapshot commands.
+    const auto writer = WriterInfo{
+        .kind = kind,
+        .command_index = command_index,
+        .snapshot_command = (kind == WriterKind::COPY ? internal::PeekSnapshotCommand(*watcher, *session, cmd_list) : std::nullopt),
+    };
+    auto pending = internal::RecordExplicit(watcher->session, cmd_list, written_image, writer, state, UnmeasuredReason::STATE_UNKNOWN);
     lock.Unlock();
     if (pending.has_value()) {
       internal::RecordRegionCopy(*pending->session, cmd_list, pending->image, pending->texture, pending->state);
@@ -1952,8 +1998,13 @@ inline void OnResourceWrite(Watcher* watcher, reshade::api::command_list* cmd_li
   if (session->device_api == reshade::api::device_api::opengl && target.view.handle == 0u && target.subresource.has_value()
       && target.subresource.value() != session->subresource) return;
 
+  const auto writer = WriterInfo{
+      .kind = kind,
+      .command_index = command_index,
+      .snapshot_command = (kind == WriterKind::COPY ? internal::PeekSnapshotCommand(*watcher, *session, cmd_list) : std::nullopt),
+  };
   // A filter by shader hash never matches a non-shader writer; it is still measured when it closes an open event.
-  internal::RecordImmediateWriter(session, recording_cmd_list, WriterInfo{.kind = kind, .command_index = command_index}, !session->shader_hash.has_value());
+  internal::RecordImmediateWriter(session, recording_cmd_list, writer, !session->shader_hash.has_value());
 }
 
 // D3D12/Vulkan begin_render_pass hook. A render pass (Vulkan: each subpass) with the watched texture as attachment is
@@ -2677,6 +2728,20 @@ inline void ProcessAtFrameEnd(
     }
     request->cv.notify_all();
   };
+  // withSnapshot: the snapshot must record the first counted frame, so it starts at the frame end before it (the watch's
+  // start on D3D9/D3D11/OpenGL, the end of the warm-up frame on D3D12/Vulkan). Called without the watcher lock.
+  const auto begin_linked_snapshot = [&](const std::shared_ptr<Request>& request) {
+    std::optional<std::uint64_t> snapshot_id = std::nullopt;
+    if (watcher->begin_linked_snapshot) {
+      snapshot_id = watcher->begin_linked_snapshot();
+    }
+    std::scoped_lock request_lock(request->mutex);
+    if (snapshot_id.has_value()) {
+      request->linked_snapshot_id = snapshot_id;
+      return;
+    }
+    request->snapshot_link_error = "Another snapshot was queued or running when the watched frame began, so the writers are not linked to a snapshot.";
+  };
 
   // D3D12 scratch texture lifetimes, with or without a running watch (see GpuSubmission).
   ProcessLifetimes(watcher, device, true);
@@ -2873,6 +2938,13 @@ inline void ProcessAtFrameEnd(
           if (writer.compute_shader_hash != 0u) {
             entry["computeShaderHash"] = formatting::FormatShaderHash(writer.compute_shader_hash);
           }
+          // Replaced by snapshotDraw and the command's textures once the watch completed (see LinkSnapshotCommands).
+          const auto snapshot_command_json = [](const SnapshotCommandKey& key) {
+            return json{{"commandList", key.cmd_list_handle}, {"recording", key.cmd_list_recording}, {"index", key.cmd_list_draw_index}};
+          };
+          if (writer.snapshot_command.has_value()) {
+            entry["snapshotCommand"] = snapshot_command_json(writer.snapshot_command.value());
+          }
           if (writer.kind == WriterKind::RENDER_PASS) {
             auto members = json::array();
             for (const auto& member : writer.members) {
@@ -2882,6 +2954,9 @@ inline void ProcessAtFrameEnd(
               }
               if (member.vertex_shader_hash != 0u) {
                 member_json["vertexShaderHash"] = formatting::FormatShaderHash(member.vertex_shader_hash);
+              }
+              if (member.snapshot_command.has_value()) {
+                member_json["snapshotCommand"] = snapshot_command_json(member.snapshot_command.value());
               }
               members.push_back(std::move(member_json));
             }
@@ -3086,6 +3161,7 @@ inline void ProcessAtFrameEnd(
     std::uint32_t opengl_slots_to_reduce = 0u;
     bool frame_planned = false;
     bool request_canceled = false;
+    bool warm_up_ended_with_snapshot = false;
     std::uint32_t scratch_growth = 0u;
     {
       WatcherLock lock(watcher, "ProcessAtFrameEnd: planning the frame end");
@@ -3239,6 +3315,7 @@ inline void ProcessAtFrameEnd(
         session->frame_command_base = 0u;
         if (session->warming_up) {
           session->warming_up = false;
+          warm_up_ended_with_snapshot = session->with_snapshot;
         } else if (session->closing) {
           ++session->closing_frames;
         } else {
@@ -3279,6 +3356,9 @@ inline void ProcessAtFrameEnd(
       }
       session->scratch_pool_misses = 0u;
       session->scratch_frame_demand = 0u;
+    }
+    if (warm_up_ended_with_snapshot) {
+      begin_linked_snapshot(session->request);
     }
 
     // Stage 2 (unlocked): GPU work on the plan.
@@ -4358,6 +4438,7 @@ inline void ProcessAtFrameEnd(
     new_session->frames = request->frames;
     new_session->shader_hash = request->shader_hash;
     new_session->include_unchanged = request->include_unchanged;
+    new_session->with_snapshot = request->with_snapshot;
     new_session->verify = request->verify;
     new_session->scratch_format = scratch_format;
     new_session->used_clone = target.used_clone;
@@ -4592,6 +4673,9 @@ inline void ProcessAtFrameEnd(
     watcher->opengl_context.store(watcher->session->opengl.context, std::memory_order_release);
     watcher->watched_resource_handle.store(watched_resource_handle, std::memory_order_release);
     lock.Unlock();
+    if (request->with_snapshot && !internal::IsExplicitApi(device_api)) {
+      begin_linked_snapshot(request);
+    }
     reshade::log::message(reshade::log::level::info, start_message.c_str());
   }
 }
@@ -4751,6 +4835,10 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
   request->frames = frames;
   request->include_unchanged = mcp_arguments::GetOptional<bool>(arguments, "includeUnchanged").value_or(false);
   request->verify = mcp_arguments::GetOptional<bool>(arguments, "verify").value_or(false);
+  request->with_snapshot = mcp_arguments::GetOptional<bool>(arguments, "withSnapshot").value_or(false);
+  if (request->with_snapshot && frames != 1u) {
+    throw std::runtime_error("withSnapshot needs frames: 1 (a snapshot records one frame).");
+  }
   request->scratch_budget_mb = scratch_budget_mb;
   const auto* shader_hash_value = mcp_arguments::FindValue(arguments, "shaderHash");
   if (shader_hash_value != nullptr && !shader_hash_value->is_null()) {
@@ -4778,7 +4866,10 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
     };
   }
 
-  const auto watch_timeout = std::chrono::seconds(30) + std::chrono::milliseconds(static_cast<std::int64_t>(frames + MAX_CLOSING_FRAMES) * 250);
+  // A snapshot frame records every command and can take a minute in a busy game.
+  const auto snapshot_allowance = (request->with_snapshot ? std::chrono::seconds(120) : std::chrono::seconds(0));
+  const auto watch_timeout = std::chrono::seconds(30) + snapshot_allowance
+                             + std::chrono::milliseconds(static_cast<std::int64_t>(frames + MAX_CLOSING_FRAMES) * 250);
   if (!request->cv.wait_for(request_lock, watch_timeout, [&request] { return request->completed; })) {
     request->canceled = true;
     request_lock.unlock();
@@ -4798,7 +4889,65 @@ inline void Shutdown(Watcher* watcher, reshade::api::device* device) {
         .is_error = true,
     };
   }
-  return request->result.value();
+  auto result = request->result.value();
+  auto snapshot_link_error = request->snapshot_link_error;
+  const auto linked_snapshot_id = request->linked_snapshot_id;
+  request_lock.unlock();
+  if (!request->with_snapshot || result.is_error || !result.structured_content.is_object()) return result;
+
+  // Each traced writer's snapshotCommand key becomes its snapshot draw index with the textures the snapshot recorded for
+  // that command (as devkit_frame_overview describes them). The snapshot ended at the present after the watched frame,
+  // before this watch completed.
+  std::optional<frame_overview::Input> snapshot = std::nullopt;
+  if (snapshot_link_error.empty() && !linked_snapshot_id.has_value()) {
+    snapshot_link_error = "The watch ended before its snapshot was started.";
+  }
+  if (snapshot_link_error.empty()) {
+    snapshot = context.collect_snapshot_commands(device_index);
+    if (snapshot->snapshot_id != linked_snapshot_id.value()) {
+      snapshot_link_error = "Another snapshot replaced the linked one before the watch completed.";
+    } else if (snapshot->snapshot_pending) {
+      snapshot_link_error = "The linked snapshot had not finished when the watch completed.";
+    }
+  }
+  std::size_t linked_commands = 0u;
+  const auto link = [&](json* entry) {
+    const auto key = entry->find("snapshotCommand");
+    if (key == entry->end()) return;
+    const auto cmd_list_handle = (*key)["commandList"].get<std::uint64_t>();
+    const auto cmd_list_recording = (*key)["recording"].get<std::uint64_t>();
+    const auto cmd_list_draw_index = (*key)["index"].get<std::uint32_t>();
+    entry->erase(key);
+    if (!snapshot_link_error.empty()) return;
+    const auto command = std::ranges::find_if(snapshot->commands, [&](const frame_overview::Command& candidate) {
+      return candidate.cmd_list_handle == cmd_list_handle && candidate.cmd_list_recording == cmd_list_recording
+             && candidate.cmd_list_draw_index == cmd_list_draw_index;
+    });
+    if (command == snapshot->commands.end()) return;
+    (*entry)["snapshotDraw"] = command->draw_index;
+    (*entry)["targets"] = command->targets;
+    (*entry)["inputs"] = command->inputs;
+    ++linked_commands;
+  };
+  auto& content = result.structured_content;
+  if (const auto trace = content.find("trace"); trace != content.end() && trace->is_array()) {
+    for (auto& entry : *trace) {
+      link(&entry);
+      if (const auto draws = entry.find("draws"); draws != entry.end() && draws->is_array()) {
+        for (auto& member : *draws) {
+          link(&member);
+        }
+      }
+    }
+  }
+  if (snapshot_link_error.empty()) {
+    content["snapshotLinkedCommands"] = linked_commands;
+    result.text += std::format("\nSnapshot: {} traced command(s) linked to snapshot draws (snapshotDraw, targets, inputs).", linked_commands);
+  } else {
+    content["snapshotLinkError"] = snapshot_link_error;
+    result.text += "\nSnapshot: not linked. " + snapshot_link_error;
+  }
+  return result;
 }
 
 }  // namespace renodx::addons::devkit::mcp::watch_region

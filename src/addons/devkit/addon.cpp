@@ -129,6 +129,10 @@ inline constexpr std::wstring_view DEVKIT_MCP_PIPE_PREFIX = L"renodx-devkit-mcp"
 std::atomic<reshade::api::device*> snapshot_device = nullptr;
 std::atomic<reshade::api::device*> snapshot_queued_device = nullptr;
 std::atomic<uint32_t> snapshot_submission_counter = 0u;
+// Numbers each command list recording (reset) and each snapshot started, so that a key or id names one of them only:
+// D3D12/Vulkan lists can be reset and re-recorded within one frame, restarting their command numbers.
+std::atomic<uint64_t> command_list_recordings = 0u;
+std::atomic<uint64_t> snapshots_started = 0u;
 // Never destroyed: on process termination the CRT would run its destructor, whose Stop touches locks and threads the
 // terminated process left in any state. AddonUninit and DllMain stop it explicitly instead.
 auto& devkit_mcp_session = *new devkit_mcp_server_session::Session(devkit_mcp_server_session::Create(DEVKIT_MCP_PIPE_PREFIX));
@@ -282,6 +286,7 @@ struct DrawDetails {
   std::chrono::time_point<std::chrono::system_clock> timestamp;
   uint64_t cmd_list_handle = 0u;
   uint32_t cmd_list_draw_index = 0u;
+  uint64_t cmd_list_recording = 0u;
   uint32_t submission_order = 0u;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> uav_binds;
@@ -386,6 +391,8 @@ struct __declspec(uuid("3224946b-5c5f-478a-8691-83fbb9f88f1b")) CommandListData 
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
   uint32_t draw_counter = 0u;
+  // Which recording of the command list this is (see command_list_recordings).
+  uint64_t recording = 0u;
 
   // std::vector<PipelineBindDetails> pipeline_binds;
 };
@@ -447,6 +454,8 @@ ResourceViewDetails GetResourceViewDetails(reshade::api::resource_view resource_
 
 struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   reshade::api::device* device;
+  // The latest snapshot started on this device (see snapshots_started).
+  uint64_t snapshot_id = 0u;
   std::unordered_map<uint32_t, ShaderDetails> shader_details;
   // std::vector<CommandListData> command_list_data;
   std::vector<DrawDetails> draw_details_list;
@@ -4158,6 +4167,143 @@ void ProcessPendingLiveShaderRequests(
   }
 }
 
+devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (device_index >= device_data_list.size()) {
+    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
+  }
+  auto* device_data = device_data_list[device_index];
+
+  std::shared_lock device_lock(device_data->mutex);
+  devkit_frame_overview::Input input = {
+      .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device),
+      .snapshot_id = device_data->snapshot_id,
+  };
+  if (device_data->primary_swapchain_desc.has_value()) {
+    input.swapchain_back_buffer = device_data->primary_swapchain_desc->back_buffer;
+  }
+  // Buffers and views without a tracked resource are left out: the overview follows textures from pass to pass.
+  const auto is_texture = [](const ResourceViewDetails& details) {
+    return details.resource.handle != 0u
+           && details.resource_desc.type != reshade::api::resource_type::buffer
+           && details.resource_desc.type != reshade::api::resource_type::unknown;
+  };
+  const auto add_textures = [&](const auto& binds, std::vector<devkit_frame_overview::TextureInfo>* textures) {
+    for (const auto& [slot, details] : binds) {
+      if (!is_texture(details)) continue;
+      textures->push_back(devkit_frame_overview::TextureInfo{
+          .resource_handle = details.resource.handle,
+          .type = details.resource_desc.type,
+          .format = details.resource_desc.texture.format,
+          .original_format = details.original_format,
+          .width = details.resource_desc.texture.width,
+          .height = details.resource_desc.texture.height,
+          .depth_or_layers = details.resource_desc.texture.depth_or_layers,
+          .is_swapchain = details.is_swapchain,
+          .is_upgraded = details.is_res_upgraded,
+          .clone_active = details.is_res_cloned,
+          .clone_format = (details.clone_resource.handle != 0u
+                               ? std::optional<reshade::api::format>(details.clone_resource_desc.texture.format)
+                               : std::nullopt),
+      });
+    }
+  };
+  // Copy rows only record resource handles; they are described after the locks are released.
+  struct CopyRow {
+    size_t command_index = 0u;
+    reshade::api::resource source = {0u};
+    reshade::api::resource destination = {0u};
+  };
+  std::vector<CopyRow> copy_rows;
+  // Only D3D12/Vulkan record a submission order; on the other APIs the list is in issue order already.
+  const auto records_submission_order = SupportsSnapshotSubmissionOrder(device_data->device->get_api());
+  input.commands.reserve(device_data->draw_details_list.size());
+  for (size_t draw_index = 0; draw_index < device_data->draw_details_list.size(); ++draw_index) {
+    const auto& draw_details = device_data->draw_details_list[draw_index];
+    devkit_frame_overview::Command command = {
+        .draw_index = draw_index,
+        .cmd_list_handle = draw_details.cmd_list_handle,
+        .cmd_list_draw_index = draw_details.cmd_list_draw_index,
+        .cmd_list_recording = draw_details.cmd_list_recording,
+        .order_unknown = (records_submission_order && draw_details.HasUnknownSubmissionOrder()),
+    };
+    auto shader_stage = reshade::api::pipeline_stage::pixel_shader;
+    if (draw_details.IsDraw()) {
+      add_textures(draw_details.render_targets, &command.targets);
+      add_textures(draw_details.srv_binds, &command.inputs);
+      command.blend_known = draw_details.blend_desc.has_value();
+      if (command.blend_known) {
+        for (const auto& [rtv_index, details] : draw_details.render_targets) {
+          if (rtv_index < 8u && is_texture(details) && draw_details.blend_desc->blend_enable[rtv_index]) {
+            command.blend_enabled = true;
+          }
+        }
+      }
+    } else if (draw_details.IsDispatch()) {
+      command.kind = devkit_frame_overview::CommandKind::DISPATCH;
+      shader_stage = reshade::api::pipeline_stage::compute_shader;
+      add_textures(draw_details.uav_binds, &command.targets);
+      add_textures(draw_details.srv_binds, &command.inputs);
+    } else if (draw_details.draw_method == DrawDetails::DrawMethods::COPY) {
+      command.kind = devkit_frame_overview::CommandKind::COPY;
+      copy_rows.push_back(CopyRow{
+          .command_index = input.commands.size(),
+          .source = draw_details.copy_source,
+          .destination = draw_details.copy_destination,
+      });
+    } else {
+      continue;
+    }
+    // A pipeline bind records the first stage it was found at (a combined D3D12/Vulkan/OpenGL pipeline is recorded
+    // as its vertex stage), so the stage of each hash comes from the tracked shader itself. Copies have no shaders.
+    for (const auto& pipeline_bind : draw_details.pipeline_binds) {
+      const auto stage_hash = std::ranges::find_if(pipeline_bind.shader_hashes, [&](uint32_t shader_hash) {
+        const auto shader_details = device_data->shader_details.find(shader_hash);
+        return shader_details != device_data->shader_details.end()
+               && renodx::utils::bitwise::HasAnyFlag(shader_details->second.shader_type, shader_stage);
+      });
+      if (stage_hash != pipeline_bind.shader_hashes.end()) {
+        command.shader_hash = *stage_hash;
+        break;
+      }
+    }
+    input.commands.push_back(std::move(command));
+  }
+  device_lock.unlock();
+  list_lock.unlock();
+
+  // Described from the tracker's current entry for the handle: a texture destroyed since the snapshot is left out,
+  // and a handle reused since then describes the new resource.
+  const auto describe_resource = [](reshade::api::resource resource, std::vector<devkit_frame_overview::TextureInfo>* textures) {
+    if (resource.handle == 0u) return;
+    renodx::utils::resource::GetLiveResourceInfo(resource, [&](const renodx::utils::resource::ResourceInfo& resource_info) {
+      if (resource_info.desc.type == reshade::api::resource_type::buffer
+          || resource_info.desc.type == reshade::api::resource_type::unknown) return;
+      textures->push_back(devkit_frame_overview::TextureInfo{
+          .resource_handle = resource.handle,
+          .type = resource_info.desc.type,
+          .format = resource_info.desc.texture.format,
+          .original_format = (resource_info.upgraded ? resource_info.fallback_desc.texture.format : resource_info.desc.texture.format),
+          .width = resource_info.desc.texture.width,
+          .height = resource_info.desc.texture.height,
+          .depth_or_layers = resource_info.desc.texture.depth_or_layers,
+          .is_swapchain = resource_info.is_swap_chain,
+          .is_upgraded = resource_info.upgraded,
+          .clone_active = resource_info.clone_enabled,
+          .clone_format = (resource_info.clone.handle != 0u
+                               ? std::optional<reshade::api::format>(resource_info.clone_desc.texture.format)
+                               : std::nullopt),
+      });
+    });
+  };
+  for (const auto& copy_row : copy_rows) {
+    auto& command = input.commands[copy_row.command_index];
+    describe_resource(copy_row.destination, &command.targets);
+    describe_resource(copy_row.source, &command.inputs);
+  }
+  return input;
+}
+
 [[nodiscard]] devkit_snapshot_tools::ToolContext BuildSnapshotToolsContext() {
   return devkit_snapshot_tools::ToolContext{
       .get_device_count = []() {
@@ -4374,137 +4520,7 @@ void ProcessPendingLiveShaderRequests(
           result.replacements.push_back(std::move(replacement));
         }
         return result; },
-      .collect_frame_overview = [](uint32_t device_index) {
-        std::shared_lock list_lock(device_data_list_mutex);
-        if (device_index >= device_data_list.size()) {
-          throw std::runtime_error(std::format("Device #{} is not available.", device_index));
-        }
-        auto* device_data = device_data_list[device_index];
-
-        std::shared_lock device_lock(device_data->mutex);
-        devkit_frame_overview::Input input = {
-            .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device),
-        };
-        if (device_data->primary_swapchain_desc.has_value()) {
-          input.swapchain_back_buffer = device_data->primary_swapchain_desc->back_buffer;
-        }
-        // Buffers and views without a tracked resource are left out: the overview follows textures from pass to pass.
-        const auto is_texture = [](const ResourceViewDetails& details) {
-          return details.resource.handle != 0u
-                 && details.resource_desc.type != reshade::api::resource_type::buffer
-                 && details.resource_desc.type != reshade::api::resource_type::unknown;
-        };
-        const auto add_textures = [&](const auto& binds, std::vector<devkit_frame_overview::TextureInfo>* textures) {
-          for (const auto& [slot, details] : binds) {
-            if (!is_texture(details)) continue;
-            textures->push_back(devkit_frame_overview::TextureInfo{
-                .resource_handle = details.resource.handle,
-                .type = details.resource_desc.type,
-                .format = details.resource_desc.texture.format,
-                .original_format = details.original_format,
-                .width = details.resource_desc.texture.width,
-                .height = details.resource_desc.texture.height,
-                .depth_or_layers = details.resource_desc.texture.depth_or_layers,
-                .is_swapchain = details.is_swapchain,
-                .is_upgraded = details.is_res_upgraded,
-                .clone_active = details.is_res_cloned,
-                .clone_format = (details.clone_resource.handle != 0u
-                                     ? std::optional<reshade::api::format>(details.clone_resource_desc.texture.format)
-                                     : std::nullopt),
-            });
-          }
-        };
-        // Copy rows only record resource handles; they are described after the locks are released.
-        struct CopyRow {
-          size_t command_index = 0u;
-          reshade::api::resource source = {0u};
-          reshade::api::resource destination = {0u};
-        };
-        std::vector<CopyRow> copy_rows;
-        // Only D3D12/Vulkan record a submission order; on the other APIs the list is in issue order already.
-        const auto records_submission_order = SupportsSnapshotSubmissionOrder(device_data->device->get_api());
-        input.commands.reserve(device_data->draw_details_list.size());
-        for (size_t draw_index = 0; draw_index < device_data->draw_details_list.size(); ++draw_index) {
-          const auto& draw_details = device_data->draw_details_list[draw_index];
-          devkit_frame_overview::Command command = {
-              .draw_index = draw_index,
-              .order_unknown = (records_submission_order && draw_details.HasUnknownSubmissionOrder()),
-          };
-          auto shader_stage = reshade::api::pipeline_stage::pixel_shader;
-          if (draw_details.IsDraw()) {
-            add_textures(draw_details.render_targets, &command.targets);
-            add_textures(draw_details.srv_binds, &command.inputs);
-            command.blend_known = draw_details.blend_desc.has_value();
-            if (command.blend_known) {
-              for (const auto& [rtv_index, details] : draw_details.render_targets) {
-                if (rtv_index < 8u && is_texture(details) && draw_details.blend_desc->blend_enable[rtv_index]) {
-                  command.blend_enabled = true;
-                }
-              }
-            }
-          } else if (draw_details.IsDispatch()) {
-            command.kind = devkit_frame_overview::CommandKind::DISPATCH;
-            shader_stage = reshade::api::pipeline_stage::compute_shader;
-            add_textures(draw_details.uav_binds, &command.targets);
-            add_textures(draw_details.srv_binds, &command.inputs);
-          } else if (draw_details.draw_method == DrawDetails::DrawMethods::COPY) {
-            command.kind = devkit_frame_overview::CommandKind::COPY;
-            copy_rows.push_back(CopyRow{
-                .command_index = input.commands.size(),
-                .source = draw_details.copy_source,
-                .destination = draw_details.copy_destination,
-            });
-          } else {
-            continue;
-          }
-          // A pipeline bind records the first stage it was found at (a combined D3D12/Vulkan/OpenGL pipeline is recorded
-          // as its vertex stage), so the stage of each hash comes from the tracked shader itself. Copies have no shaders.
-          for (const auto& pipeline_bind : draw_details.pipeline_binds) {
-            const auto stage_hash = std::ranges::find_if(pipeline_bind.shader_hashes, [&](uint32_t shader_hash) {
-              const auto shader_details = device_data->shader_details.find(shader_hash);
-              return shader_details != device_data->shader_details.end()
-                     && renodx::utils::bitwise::HasAnyFlag(shader_details->second.shader_type, shader_stage);
-            });
-            if (stage_hash != pipeline_bind.shader_hashes.end()) {
-              command.shader_hash = *stage_hash;
-              break;
-            }
-          }
-          input.commands.push_back(std::move(command));
-        }
-        device_lock.unlock();
-        list_lock.unlock();
-
-        // Described from the tracker's current entry for the handle: a texture destroyed since the snapshot is left out,
-        // and a handle reused since then describes the new resource.
-        const auto describe_resource = [](reshade::api::resource resource, std::vector<devkit_frame_overview::TextureInfo>* textures) {
-          if (resource.handle == 0u) return;
-          renodx::utils::resource::GetLiveResourceInfo(resource, [&](const renodx::utils::resource::ResourceInfo& resource_info) {
-            if (resource_info.desc.type == reshade::api::resource_type::buffer
-                || resource_info.desc.type == reshade::api::resource_type::unknown) return;
-            textures->push_back(devkit_frame_overview::TextureInfo{
-                .resource_handle = resource.handle,
-                .type = resource_info.desc.type,
-                .format = resource_info.desc.texture.format,
-                .original_format = (resource_info.upgraded ? resource_info.fallback_desc.texture.format : resource_info.desc.texture.format),
-                .width = resource_info.desc.texture.width,
-                .height = resource_info.desc.texture.height,
-                .depth_or_layers = resource_info.desc.texture.depth_or_layers,
-                .is_swapchain = resource_info.is_swap_chain,
-                .is_upgraded = resource_info.upgraded,
-                .clone_active = resource_info.clone_enabled,
-                .clone_format = (resource_info.clone.handle != 0u
-                                     ? std::optional<reshade::api::format>(resource_info.clone_desc.texture.format)
-                                     : std::nullopt),
-            });
-          });
-        };
-        for (const auto& copy_row : copy_rows) {
-          auto& command = input.commands[copy_row.command_index];
-          describe_resource(copy_row.destination, &command.targets);
-          describe_resource(copy_row.source, &command.inputs);
-        }
-        return input; },
+      .collect_frame_overview = CollectFrameOverview,
   };
 }
 
@@ -4533,6 +4549,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .resolve_device_index = BuildResolveDeviceIndexCallback(),
                                                     .enqueue_request = EnqueuePendingWatchRegionRequest,
                                                     .cancel_request = CancelPendingWatchRegionRequest,
+                                                    .collect_snapshot_commands = CollectFrameOverview,
                                                 }; },
       .build_resource_clone_tool_context = []() { return devkit_resource_clone::ToolContext{
                                                       .resolve_device_index = BuildResolveDeviceIndexCallback(),
@@ -4584,6 +4601,23 @@ void EnsureDevkitMcpServerStarted() {
       []() { return NarrowAscii(devkit_mcp_session.server.GetPipeName()); });
 }
 
+// Starts recording a snapshot of the device's next frame. Called between two frames: by the device's present for a
+// queued snapshot, and by a watch's frame end for withSnapshot.
+uint64_t StartSnapshotFrame(DeviceData* device_data) {
+  std::unique_lock lock(device_data->mutex);
+  device_data->draw_details_list.clear();
+  device_data->draw_detail_indexes_by_cmd_list.clear();
+  device_data->resource_usage_by_handle.clear();
+  device_data->snapshot_rows.clear();
+  device_data->snapshot_row_layout_key = 0u;
+  ++device_data->snapshot_rows_generation;
+  device_data->snapshot_rows_valid = false;
+  device_data->snapshot_id = ++snapshots_started;
+  snapshot_submission_counter.store(0u, std::memory_order_relaxed);
+  snapshot_device = device_data->device;
+  return device_data->snapshot_id;
+}
+
 void OnInitDevice(reshade::api::device* device) {
   if (renodx::utils::device_proxy::IsCreatingProxyDevice()
       || renodx::utils::device_proxy::IsProxyDevice(device)) {
@@ -4616,6 +4650,25 @@ void OnInitDevice(reshade::api::device* device) {
       std::memory_order_acquire);
   device_data->device = device;
   device_data->is_d3d9_ex = renodx::utils::device::IsD3D9ExDevice(device);
+  device_data->watch_region_watcher.begin_linked_snapshot = [device_data]() -> std::optional<uint64_t> {
+    if (snapshot_queued_device != nullptr) return std::nullopt;
+    // Claimed first, so a snapshot started meanwhile from the overlay or MCP cannot interleave with this one.
+    reshade::api::device* no_snapshot = nullptr;
+    if (!snapshot_device.compare_exchange_strong(no_snapshot, device_data->device)) return std::nullopt;
+    return StartSnapshotFrame(device_data);
+  };
+  // The watch hooks run before the snapshot numbers the command, so the snapshot's next number is the command's.
+  device_data->watch_region_watcher.peek_snapshot_command =
+      [device](reshade::api::command_list* cmd_list) -> std::optional<devkit_watch_region::SnapshotCommandKey> {
+    if (snapshot_device != device || cmd_list->get_device() != device) return std::nullopt;
+    const auto* command_list_data = renodx::utils::data::Get<CommandListData>(cmd_list);
+    if (command_list_data == nullptr) return std::nullopt;
+    return devkit_watch_region::SnapshotCommandKey{
+        .cmd_list_handle = reinterpret_cast<uint64_t>(cmd_list),
+        .cmd_list_draw_index = command_list_data->draw_counter,
+        .cmd_list_recording = command_list_data->recording,
+    };
+  };
   device_data_list.emplace_back(device_data);
 
   if (g_device_proxy_dx9ex_bootstrap_pending && device->get_api() == reshade::api::device_api::d3d9) {
@@ -4869,7 +4922,7 @@ void OnInitCommandList(reshade::api::command_list* cmd_list) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(cmd_list->get_device());
   if (device_data == nullptr) return;
   devkit_watch_region::OnCommandListReset(&device_data->watch_region_watcher, cmd_list, false);
-  renodx::utils::data::Create<CommandListData>(cmd_list);
+  renodx::utils::data::Create<CommandListData>(cmd_list)->recording = ++command_list_recordings;
 }
 
 void OnDestroyCommandList(reshade::api::command_list* cmd_list) {
@@ -4904,7 +4957,7 @@ void OnResetCommandList(reshade::api::command_list* cmd_list) {
   auto* data = renodx::utils::data::Get<CommandListData>(cmd_list);
   if (data == nullptr) return;
   renodx::utils::data::Delete<CommandListData>(cmd_list);
-  renodx::utils::data::Create<CommandListData>(cmd_list);
+  renodx::utils::data::Create<CommandListData>(cmd_list)->recording = ++command_list_recordings;
 }
 
 void OnInitPipelineTrackAddons(
@@ -5096,6 +5149,7 @@ bool OnCopyResource(
     if (auto* command_list_data = renodx::utils::data::Get<CommandListData>(cmd_list);
         command_list_data != nullptr) {
       draw_details.cmd_list_draw_index = command_list_data->draw_counter++;
+      draw_details.cmd_list_recording = command_list_data->recording;
     }
 
     auto* device_data = renodx::utils::data::Get<DeviceData>(device);
@@ -5143,6 +5197,7 @@ bool OnCopyTextureRegion(
     if (auto* command_list_data = renodx::utils::data::Get<CommandListData>(cmd_list);
         command_list_data != nullptr) {
       draw_details.cmd_list_draw_index = command_list_data->draw_counter++;
+      draw_details.cmd_list_recording = command_list_data->recording;
     }
 
     auto* device_data = renodx::utils::data::Get<DeviceData>(device);
@@ -5407,7 +5462,11 @@ void OnPushDescriptors(
 
         auto slot = std::pair<uint32_t, uint32_t>(pair_a, pair_b);
 
-        if (view.handle == 0u) {
+        // OpenGL view handles are (target << 40) | name and keep the target when a unit is unbound (name 0), for example
+        // after glBindMultiTextureEXT(unit, GL_TEXTURE_2D, 0) or glBindTextures with null names.
+        const bool unbound = (view.handle == 0u
+                              || (device->get_api() == reshade::api::device_api::opengl && (view.handle & 0xFFFFFFFFu) == 0u));
+        if (unbound) {
           destination->erase(slot);
         } else {
           auto detail_item = GetResourceViewDetails(view, device);
@@ -5594,6 +5653,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     draw_details.draw_method = draw_method;
     draw_details.cmd_list_handle = reinterpret_cast<uint64_t>(cmd_list);
     draw_details.cmd_list_draw_index = command_list_data->draw_counter++;
+    draw_details.cmd_list_recording = command_list_data->recording;
     // draw_details.pipeline_binds = command_list_data->pipeline_binds;
     if (draw_method == DrawDetails::DrawMethods::DISPATCH) {
       draw_details.constants = command_list_data->compute_constants;
@@ -5603,6 +5663,50 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       draw_details.constants = command_list_data->pixel_constants;
       draw_details.srv_binds = command_list_data->pixel_srv_binds;
       draw_details.uav_binds = command_list_data->pixel_uav_binds;
+    }
+    if (device->get_api() == reshade::api::device_api::opengl) {
+      // A GL texture can be bound before it has storage (its details were taken at the bind), or get its storage without
+      // a ReShade event (glCopyTexImage2D, entry points ReShade does not hook), so the tracker has nothing for it. Retry
+      // the tracker, then ask ReShade's GL device, which queries the texture on this thread's current context. Such a
+      // texture has no upgrade, clone or upload info; one without storage (width 0) stays unknown.
+      namespace gl_enum = renodx::addons::devkit::mcp::watch_region::gl_enum;
+      const auto* gl = renodx::addons::devkit::mcp::watch_region::GetOpenGLFunctions();
+      const auto resolve_untracked = [&](std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails>* binds) {
+        for (auto& [slot, details] : *binds) {
+          if (details.resource.handle != 0u) continue;
+          details = GetResourceViewDetails(details.resource_view, device);
+          if (details.resource.handle != 0u) continue;
+          // ReShade's queries raise GL errors the game would see for a name that is no texture any more (deleted after
+          // the bind) and for buffer textures without a buffer; a GL_TEXTURE (0x1702) target, from glBindTextures or
+          // glBindTextureUnit without GL 4.5, hides the real target they would need.
+          const auto view_target = static_cast<unsigned int>(details.resource_view.handle >> 40u);
+          const auto texture_name = static_cast<unsigned int>(details.resource_view.handle & 0xFFFFFFFFu);
+          if (gl == nullptr || gl->get_current_context() == nullptr || view_target == gl_enum::TEXTURE
+              || view_target == gl_enum::TEXTURE_BUFFER || gl->is_texture(texture_name) == 0u) {
+            continue;
+          }
+          const auto resource = renodx::utils::resource::GetResourceFromView(device, details.resource_view);
+          const auto resource_desc = renodx::utils::resource::GetResourceDesc(device, resource);
+          if (resource.handle == 0u || resource_desc.type == reshade::api::resource_type::unknown || resource_desc.texture.width == 0u) {
+            continue;
+          }
+          details.resource = resource;
+          details.resource_desc = resource_desc;
+          details.original_format = resource_desc.texture.format;
+          details.resource_view_desc = renodx::utils::resource::GetResourceViewDesc(device, details.resource_view);
+          // Tracked texture, untracked view: the tracker still knows its upgrade and clone.
+          renodx::utils::resource::GetResourceInfo(resource, [&](const renodx::utils::resource::ResourceInfo& resource_info) {
+            details.clone_resource = resource_info.clone;
+            details.clone_resource_desc = resource_info.clone_desc;
+            details.is_res_upgraded = resource_info.upgraded;
+            details.is_res_cloned = resource_info.clone_enabled;
+            details.original_format = (resource_info.upgraded ? resource_info.fallback_desc.texture.format : resource_info.desc.texture.format);
+            details.is_swapchain = resource_info.is_swap_chain;
+          });
+        }
+      };
+      resolve_untracked(&draw_details.srv_binds);
+      resolve_untracked(&draw_details.uav_binds);
     }
     if (device->get_api() == reshade::api::device_api::d3d9) {
       // D3D9 blending is render state, not part of a pipeline, and state blocks (Apply) and Reset change it without a
@@ -10328,17 +10432,7 @@ void OnPresent(
   reshade::api::device* active_snapshot_device = snapshot_device;
   if (active_snapshot_device == nullptr) {
     if (snapshot_queued_device == device) {
-      auto* device_data = get_data();
-      std::unique_lock lock(device_data->mutex);
-      device_data->draw_details_list.clear();
-      device_data->draw_detail_indexes_by_cmd_list.clear();
-      device_data->resource_usage_by_handle.clear();
-      device_data->snapshot_rows.clear();
-      device_data->snapshot_row_layout_key = 0u;
-      ++device_data->snapshot_rows_generation;
-      device_data->snapshot_rows_valid = false;
-      snapshot_submission_counter.store(0u, std::memory_order_relaxed);
-      snapshot_device = device;
+      StartSnapshotFrame(get_data());
       snapshot_queued_device = nullptr;
     }
   } else if (device == active_snapshot_device) {

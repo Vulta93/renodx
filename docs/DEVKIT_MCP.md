@@ -291,6 +291,13 @@ pipeline's blend state instead. With a mod loaded, every pass that renders into
 the mod's float clones or upgrades can match the tonemap rule; the first candidate after the scene passes is the likely
 one. Readers come from the shader resource views recorded per command (pixel stage for draws, compute for dispatches) and
 copy sources: reads through D3D12/Vulkan descriptor tables the snapshot did not walk, and bindless reads, are missing.
+OpenGL: units bound to texture name 0 are not inputs. A texture the resource tracker has no entry for (bound with
+`glBindTextures`/`glBindTextureUnit`/`glBindMultiTextureEXT` before it had storage, or given storage without a ReShade
+event such as `glCopyTexImage2D`) is described at the draw from ReShade's GL device on the drawing thread's context, with
+upgrade and clone info only when the tracker knows the texture; names that are no texture any more (`glIsTexture`),
+buffer textures, `GL_TEXTURE`-targeted binds and textures without storage stay out. ReShade reports no bind for
+`glBindTexture(target, 0)` nor for `glBindTexture` of a texture without storage, so such a unit keeps listing the texture
+bound before.
 Copies are described from the resource tracker's current entry for each handle, after the snapshot: a texture destroyed
 since then is left out, and a handle reused since then (for example after a resize) describes the new resource. `maxPasses` (default 40) and `maxResources` (default 32) cap the output; the budget goes to tonemap candidates,
 the output pass, UI, LUT builders and LUT readers first, then to the latest passes. Tested in Sleeping Dogs DE (D3D11,
@@ -513,6 +520,19 @@ the CPU at one measurement point at the end of the watch and compare it with the
   by shader hash and order), shader hashes and region stats before and after (`maxLuminance`, `minLuminance`, `meanLuminance`,
   `maxChannel`, pixel counts above 1.0, negative, non-finite, black, and above 203/400/1000/4000 nits with a signal). Render
   pass writers (D3D12 render passes, Vulkan render pass instances) also list their `draws`.
+- `withSnapshot: true` (`frames: 1` only) also captures a snapshot of the watched frame and links each traced writer to it:
+  draws, dispatches, copies and the member draws of a render pass get `snapshotDraw` (the index for `devkit_get_draw`) and
+  their `targets` and `inputs` as `devkit_frame_overview` describes them (format, size, upgrade, clone). Clears, resolves
+  and updates are not snapshot commands and get none. `snapshotLinkedCommands` counts the linked commands (writers and render-pass member draws);
+  `snapshotLinkError` says why none could be linked (another snapshot was queued or running, replaced it, or had not
+  finished); the text summary says the same. A key includes the command list's recording number, so a D3D12/Vulkan list
+  reset and re-recorded within the frame does not link to the wrong command.
+  The snapshot starts at the frame end before the watch's first counted frame (the watch's start on D3D9/D3D11/OpenGL,
+  the end of the warm-up frame on D3D12/Vulkan) and ends at the next present, before the watch completes. Each command is
+  linked by the key the snapshot gives it while recording (command list, its recording, command number in it), read by the watch hook,
+  which runs before the snapshot's: D3D12/Vulkan commands recorded before the watched frame and executed in it are not in
+  the snapshot and stay unlinked. The snapshot replaces any earlier one, and a snapshot frame is slow, so the call may
+  take up to two minutes longer.
 - Every call returns `writers`, aggregated per writer (kind + pixel/vertex/compute hash; render passes by the set of their pixel
   shaders): executions, frames seen, how often the region changed, min/mean/max of the region peak and mean before and after,
   how often the peak was lowered or raised, how often values went from above 1.0 to at most 1.0, and `afterPeakMode` (the most

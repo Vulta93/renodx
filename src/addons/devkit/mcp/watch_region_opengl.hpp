@@ -35,6 +35,7 @@ namespace gl_enum {
 
 constexpr unsigned int NONE = 0u;
 constexpr unsigned int TEXTURE = 0x1702u;
+constexpr unsigned int TEXTURE_BUFFER = 0x8C2Au;
 constexpr unsigned int RENDERBUFFER = 0x8D41u;
 constexpr unsigned int READ_FRAMEBUFFER = 0x8CA8u;
 constexpr unsigned int DRAW_FRAMEBUFFER = 0x8CA9u;
@@ -130,6 +131,7 @@ struct OpenGLFunctions {
   void(APIENTRY* get_integeri_v)(unsigned int, unsigned int, int*) = nullptr;
   unsigned char(APIENTRY* is_enabled)(unsigned int) = nullptr;
   unsigned char(APIENTRY* is_enabledi)(unsigned int, unsigned int) = nullptr;
+  unsigned char(APIENTRY* is_texture)(unsigned int) = nullptr;
   void(APIENTRY* get_booleani_v)(unsigned int, unsigned int, unsigned char*) = nullptr;
   void(APIENTRY* get_floatv)(unsigned int, float*) = nullptr;
   void(APIENTRY* enable)(unsigned int) = nullptr;
@@ -181,6 +183,7 @@ struct OpenGLFunctions {
       && load(&loaded.get_integerv, "glGetIntegerv", true)
       && load(&loaded.is_enabled, "glIsEnabled", true)
       && load(&loaded.get_floatv, "glGetFloatv", true)
+      && load(&loaded.is_texture, "glIsTexture", true)
       && load(&loaded.enable, "glEnable", true)
       && load(&loaded.get_error, "glGetError", true)
       && load(&loaded.read_buffer, "glReadBuffer", true)

@@ -69,6 +69,10 @@ enum class CommandKind : std::uint8_t {
 // UAVs, copies their destination (with the source as input).
 struct Command {
   std::size_t draw_index = 0u;
+  // The key the snapshot gave the command while recording (see watch_region::SnapshotCommandKey).
+  std::uint64_t cmd_list_handle = 0u;
+  std::uint32_t cmd_list_draw_index = 0u;
+  std::uint64_t cmd_list_recording = 0u;
   CommandKind kind = CommandKind::DRAW;
   std::vector<TextureInfo> targets;
   std::vector<TextureInfo> inputs;
@@ -83,6 +87,8 @@ struct Command {
 // Read under one lock, so the commands match the captured draw count.
 struct Input {
   bool snapshot_pending = false;
+  // Which snapshot the commands come from (see the Devkit's snapshots_started); 0 before the first one.
+  std::uint64_t snapshot_id = 0u;
   std::optional<reshade::api::resource_desc> swapchain_back_buffer = std::nullopt;
   std::vector<Command> commands;
 };
