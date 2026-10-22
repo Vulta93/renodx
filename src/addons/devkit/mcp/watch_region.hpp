@@ -4170,7 +4170,7 @@ inline void ProcessAtFrameEnd(
     }
     if (device_api == reshade::api::device_api::vulkan) {
       if ((resource_desc.usage & reshade::api::resource_usage::copy_source) == 0) {
-        complete_request(request, make_error("The image was created without VK_IMAGE_USAGE_TRANSFER_SRC_BIT, so its region cannot be copied. Enable the Devkit setting \"Watch Region: Copyable Vulkan Images\" (Settings > Other) and restart the game."));
+        complete_request(request, make_error("The image was created without VK_IMAGE_USAGE_TRANSFER_SRC_BIT, so its region cannot be copied. The Devkit setting \"Watch Region: Copyable Vulkan Images\" (Settings > Other) adds it and is on by default; if it was turned off, turn it on and restart the game. It skips shared and sparse images and formats without copy support, and cannot reach images created before the Devkit loaded or fallback copies a mod creates from a desc recorded before the Devkit's handler ran."));
         continue;
       }
       // Per-subresource barriers need vkCmdPipelineBarrier itself; called through the loader so ReShade sees it too.

@@ -143,8 +143,10 @@ std::atomic_bool snapshot_pane_show_non_executed_command_lists = false;
 std::atomic_bool shaders_pane_show_vertex_shaders = false;
 std::atomic_bool shaders_pane_show_pixel_shaders = true;
 std::atomic_bool shaders_pane_show_compute_shaders = true;
-// Opt-in: adds copy-source usage to the game's Vulkan images at creation, so devkit_watch_region can copy them.
-std::atomic_bool watch_region_copy_source_usage = false;
+// On by default (no GPU cost measured at 0.1 ms resolution: one spot, DOOM 2016, RTX 5070 Ti; side effects in
+// docs/DEVKIT_MCP.md): adds copy-source usage to the game's Vulkan images at creation, so devkit_watch_region can copy
+// them.
+std::atomic_bool watch_region_copy_source_usage = true;
 
 // MCP waitForKey: the virtual key the one waiting tool call waits for (0 when none), and the presses OnReShadePresent saw
 // for it.
@@ -10015,7 +10017,7 @@ void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
 }
 
 // Vulkan images can only be copied with VK_IMAGE_USAGE_TRANSFER_SRC_BIT, and devkit_watch_region measures by copying.
-// With the opt-in setting the flag is added to every image the game creates from then on. Same rules as the Vulkan
+// With the setting (on by default) the flag is added to every image the game creates from then on. Same rules as the Vulkan
 // clone targets in utils/resource_upgrade.hpp OnCreateResource: shared and sparse images, and formats without copy
 // support, are left alone. ReShade hands the same desc to every add-on's handler and RenoDX resource upgrades only add
 // usage bits, so the flag survives whatever the handler order.

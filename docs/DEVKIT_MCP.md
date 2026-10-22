@@ -746,16 +746,23 @@ Refused or limited cases on D3D12/Vulkan, all stated in the output:
   refused. Device-level texture updates are ignored.
 - Many Vulkan games create their render targets without `TRANSFER_SRC` (in DOOM 2016 only the swap chain and RenoDX's clones
   have it). `devkit_analyze_resource` and `devkit_dump_resource_with_hash` refuse such images with the same hint instead of
-  issuing an invalid copy. The opt-in Devkit setting **Watch Region: Copyable Vulkan Images** (Settings > Other, ReShade.ini key
-  `WatchRegionCopySourceUsage` in `[renodx-dev]`, off by default) adds `copy_source` usage to every image the game creates
-  from then on, in the Devkit's `create_resource` handler. It only affects images created after it is enabled: turn it on and
-  restart the game. It follows the rules of the Vulkan clone targets in `utils/resource_upgrade.hpp` (`OnCreateResource`):
+  issuing an invalid copy. The Devkit setting **Watch Region: Copyable Vulkan Images** (Settings > Other, ReShade.ini key
+  `WatchRegionCopySourceUsage` in `[renodx-dev]`, on by default) adds `copy_source` usage to every image the game creates
+  from then on, in the Devkit's `create_resource` handler. A change only affects images created afterwards: restart the
+  game after toggling it. A `WatchRegionCopySourceUsage=0` left in a game's ReShade.ini by an earlier toggle keeps it
+  off there. It follows the rules of the Vulkan clone targets in `utils/resource_upgrade.hpp` (`OnCreateResource`):
   shared and sparse images and formats without copy support are left alone. Interaction with RenoDX mods: ReShade passes the
   same `desc` to every add-on's `create_resource` handler, and resource upgrades only OR in their own usage bits (in-place
   upgrades) or start from the created image's desc (clones), so the flag is kept whatever the add-on order. One exception:
   when the mod's handler runs before the Devkit's, the fallback desc a resource upgrade records for the original format does
-  not have the flag, so fallback copies the mod creates later cannot be watched. The flag can disable some driver
-  compression of those images; compare frame times with the setting on and off.
+  not have the flag, so fallback copies the mod creates later cannot be watched. Side effects, because ReShade rebuilds
+  the `VkImageCreateInfo` of every image an add-on changes: colour and depth attachments also get `TRANSFER_DST` (ReShade
+  adds it for clears), and a game's `TRANSIENT_ATTACHMENT` bit, which the add-on API cannot see, is kept next to the
+  transfer bits, which Vulkan does not allow (RenoDX in-place upgrades already do the same to the images they touch).
+  External-memory (interop) images arrive as `shared` and are left alone. The flag can disable some driver compression
+  (mainly a concern on AMD; not measured). Measured: DOOM 2016, NVIDIA RTX 5070 Ti (driver 621.1), 3840x2160, one spot,
+  GPU 3.5 ms average in the game's performance overlay (0.1 ms resolution) with the setting on and off (2026-10-22).
+  If a Vulkan game crashes, fails to create images, or runs slower only with the Devkit, try the setting off first.
 - The measurement copies and barriers cost GPU time and VRAM; use a region or `shaderHash` for long watches.
 
 Limits on every API: 2D, non-MSAA textures in 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats; up to 1023 measured

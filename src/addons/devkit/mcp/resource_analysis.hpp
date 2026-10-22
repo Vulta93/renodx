@@ -777,9 +777,11 @@ inline void EncodePreviewPixel(
       && !renodx::utils::bitwise::HasAnyFlag(
           target.resolved_resource_desc.usage, reshade::api::resource_usage::copy_source)) {
     const auto error = std::format(
-        "The {} was created without VK_IMAGE_USAGE_TRANSFER_SRC_BIT, so it cannot be copied for analysis. Enable the "
-        "Devkit setting \"Watch Region: Copyable Vulkan Images\" (Settings > Other) and restart the game{}; the setting "
-        "skips shared and sparse images and formats without copy support.",
+        "The {} was created without VK_IMAGE_USAGE_TRANSFER_SRC_BIT, so it cannot be copied for analysis. The Devkit "
+        "setting \"Watch Region: Copyable Vulkan Images\" (Settings > Other) adds it and is on by default; if it was "
+        "turned off, turn it on and restart the game{}. The setting skips shared and sparse images and formats without "
+        "copy support, and cannot reach images created before the Devkit loaded or fallback copies a mod creates from a "
+        "desc recorded before the Devkit's handler ran.",
         (target.used_clone ? "clone" : "image"),
         (target.used_clone ? "" : ", or analyze its clone (preferClone: true) when a mod clones it"));
     return ToolResult{
