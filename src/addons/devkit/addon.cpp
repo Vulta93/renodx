@@ -300,6 +300,10 @@ struct PipelineBindDetails {
 struct PushConstantValues {
   uint32_t first_written = UINT32_MAX;
   std::vector<uint32_t> values;
+  // One flag per word of values: whether a push wrote it (gaps between writes are zero-filled).
+  std::vector<bool> written;
+  // Recorded draws only: values and written were cut at MAX_CAPTURED_PUSH_CONSTANT_VALUES words.
+  bool values_truncated = false;
   // Recorded draws only: the reflected constants that name these values, std::nullopt when nothing does.
   std::optional<ConstantVariableSource> named_by = std::nullopt;
 };
@@ -3150,8 +3154,45 @@ std::vector<DeviceData*> device_data_list;
     for (const auto& [push_constant_key, pushed] : draw_details.push_constants) {
       const auto& [layout_handle, layout_param, stages, gl_program] = push_constant_key;
       std::optional<std::vector<devkit_draw_summary::ValueNameSummary>> value_names = std::nullopt;
+      std::vector<devkit_draw_summary::ValueWordsSummary> names_without_values;
       if (pushed.named_by.has_value()) {
-        value_names = name_values(pushed.named_by.value(), pushed.first_written, pushed.values.size());
+        const auto& source = pushed.named_by.value();
+        value_names = name_values(source, pushed.first_written, pushed.values.size());
+        // Variables of the same register set with no word in the captured span: no recorded call set them, so only their
+        // name and absolute word can be listed. Past the capture cap the game may have set them, so they are left out.
+        if (draw_details.constant_variables != nullptr) {
+          const uint64_t captured_end = static_cast<uint64_t>(pushed.first_written) + pushed.values.size();
+          for (const auto& variable : *draw_details.constant_variables) {
+            if (variable.register_set != source.register_set || variable.slot != source.slot
+                || variable.space != source.space) {
+              continue;
+            }
+            const uint64_t variable_end = (variable.word_count == UINT32_MAX
+                                               ? UINT64_MAX
+                                               : static_cast<uint64_t>(variable.first_word) + variable.word_count);
+            const bool overlaps_capture = variable.first_word < captured_end && variable_end > pushed.first_written;
+            if (overlaps_capture) continue;
+            if (pushed.values_truncated && variable.first_word >= captured_end) continue;
+            names_without_values.push_back(devkit_draw_summary::ValueWordsSummary{
+                .name = variable.name,
+                .word = variable.first_word,
+                .count = (variable.word_count == UINT32_MAX
+                              ? std::nullopt
+                              : std::optional<uint32_t>(variable.word_count)),
+            });
+          }
+        }
+      }
+      // Words inside the captured span that no push wrote read 0; list them so such a 0 is not taken for a written one.
+      std::vector<devkit_draw_summary::ValueRangeSummary> unwritten_ranges;
+      for (uint32_t index = 0u; index < pushed.written.size(); ++index) {
+        if (pushed.written[index]) continue;
+        if (!unwritten_ranges.empty()
+            && unwritten_ranges.back().index + unwritten_ranges.back().count == index) {
+          ++unwritten_ranges.back().count;
+        } else {
+          unwritten_ranges.push_back({.index = index, .count = 1u});
+        }
       }
       push_constants.push_back(devkit_draw_summary::PushConstantSummary{
           .layout_handle = FormatHandle(layout_handle),
@@ -3162,6 +3203,9 @@ std::vector<DeviceData*> device_data_list;
           .uint_values = pushed.values,
           .value_names = std::move(value_names),
           .gl_program = (gl_program == 0u ? std::nullopt : std::optional<std::uint32_t>(gl_program)),
+          .values_truncated = pushed.values_truncated,
+          .unwritten_ranges = std::move(unwritten_ranges),
+          .names_without_values = std::move(names_without_values),
       });
     }
     draw_summary.push_constants = std::move(push_constants);
@@ -5731,8 +5775,10 @@ void OnPushConstants(
   auto& pushed = data->push_constants[{layout.handle, layout_param, stages, static_cast<uint32_t>(gl_program)}];
   if (pushed.values.size() < first + count) {
     pushed.values.resize(first + count, 0u);
+    pushed.written.resize(first + count, false);
   }
   std::copy_n(static_cast<const uint32_t*>(values), count, pushed.values.begin() + first);
+  std::fill_n(pushed.written.begin() + first, count, true);
   pushed.first_written = std::min(pushed.first_written, first);
 }
 
@@ -6709,6 +6755,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           PushConstantValues{
               .first_written = pushed.first_written,
               .values = {pushed.values.begin() + pushed.first_written, pushed.values.begin() + captured_end},
+              .written = {pushed.written.begin() + pushed.first_written, pushed.written.begin() + captured_end},
+              .values_truncated = pushed.values.size() > captured_end,
               .named_by = named_by,
           });
     }

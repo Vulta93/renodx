@@ -65,6 +65,39 @@ inline void to_json(json& j, const ValueNameSummary& value) {
   };
 }
 
+// Words [index, index + count) of floatValues/uintValues.
+struct ValueRangeSummary {
+  std::uint32_t index = 0u;
+  std::uint32_t count = 0u;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const ValueRangeSummary& value) {
+  j = {
+      {"index", value.index},
+      {"count", value.count},
+  };
+}
+
+// A shader variable with no captured value: its absolute first word (in firstValue's numbering) and, when the
+// reflection sizes it, its count in words.
+struct ValueWordsSummary {
+  std::string name;
+  std::uint32_t word = 0u;
+  std::optional<std::uint32_t> count = std::nullopt;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const ValueWordsSummary& value) {
+  j = {
+      {"name", value.name},
+      {"word", value.word},
+  };
+  if (value.count.has_value()) {
+    j["count"] = value.count.value();
+  }
+}
+
 struct ConstantBufferSummary {
   std::uint32_t slot = 0u;
   std::uint32_t space = 0u;
@@ -120,6 +153,12 @@ struct PushConstantSummary {
   std::optional<std::vector<ValueNameSummary>> value_names = std::nullopt;
   // OpenGL: the program that was current when these uniforms were set (the draw's own program).
   std::optional<std::uint32_t> gl_program = std::nullopt;
+  // The values were cut at the capture cap; words past it may have been set.
+  bool values_truncated = false;
+  // Words in the captured span that no push wrote; they read 0.
+  std::vector<ValueRangeSummary> unwritten_ranges;
+  // Named variables with no word in the captured span (variables past a truncated range are left out).
+  std::vector<ValueWordsSummary> names_without_values;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -137,6 +176,15 @@ inline void to_json(json& j, const PushConstantSummary& value) {
   }
   if (value.gl_program.has_value()) {
     j["glProgram"] = value.gl_program.value();
+  }
+  if (value.values_truncated) {
+    j["valuesTruncated"] = true;
+  }
+  if (!value.unwritten_ranges.empty()) {
+    j["unwrittenRanges"] = value.unwritten_ranges;
+  }
+  if (!value.names_without_values.empty()) {
+    j["namesWithoutValues"] = value.names_without_values;
   }
 }
 

@@ -177,7 +177,8 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     CPU-side cache never sees, so it would only report zeros. Use the root/push constants below, or read the buffer's
     layout from the decompiled shader.
 - `pushConstants` for the active stage (pixel for draws, compute for dispatches), at most 1024 words each (longer ranges
-  are cut without a flag), `firstValue` being the word index of `floatValues[0]`. They do not need Trace Constant Buffers.
+  are cut and flagged with `valuesTruncated`), `firstValue` being the word index of `floatValues[0]`. They do not need
+  Trace Constant Buffers.
   - D3D12 root constants and Vulkan push constants, only for the root signature / pipeline layout bound for the draw's bind
     point (the one its descriptor tables are bound with). When no descriptor table was bound since the last root signature
     change, that layout is unknown and the values of every layout pushed during the snapshot are listed (check
@@ -220,12 +221,28 @@ in its disassembly (on OpenGL, the linked program's active uniforms, all stages)
   while that program was current are listed; its active uniforms (`glGetActiveUniform`, `glGetUniformLocation`) name
   them at word 4 * location, counting components times array elements, as one whole-array call packs them. A game
   that sets an array per element puts element i at word 4 * (location + i): inside the name's span for vec4 and
-  matrix arrays, past it (over the next locations' words) for float, vec2 and vec3 arrays. Words inside the captured
-  span that the game did not write in the snapshot frame read 0, like a written 0, and a uniform past the highest
-  written word gets no name. Names are read once per program per snapshot; double uniforms are not seen. Uniform
-  block members and `glProgramUniform*` values are never seen. Draws through program pipelines (`glUseProgramStages`)
-  have no current program and list only values set without one; a program whose last link failed gets no names.
+  matrix arrays, past it (over the next locations' words) for float, vec2 and vec3 arrays. Unwritten words and
+  uniforms without a value are listed in `unwrittenRanges` and `namesWithoutValues` (below). Names are read once per
+  program per snapshot; double uniforms are not seen. Uniform block members and `glProgramUniform*` values are never
+  seen. Draws through program pipelines (`glUseProgramStages`) have no current program and list only values set
+  without one; a program whose last link failed gets no names.
 - An empty list means the game stripped the reflection, or no named variable starts inside the captured words.
+
+Each `pushConstants` entry also carries (all omitted when empty or false):
+- `valuesTruncated`: the range was longer than the 1024-word cap; words past it are not listed and may have been set.
+- `unwrittenRanges`: `index`/`count` ranges of words inside the captured span that no recorded call wrote (calls are
+  recorded in snapshot frames; on D3D9 and immediate contexts earlier snapshots count too). They read 0, so a 0 there
+  is not a value the game set.
+- `namesWithoutValues`: named variables of the same register set with no word inside the captured span: `name`,
+  `word` (absolute, in `firstValue`'s numbering, so OpenGL location L is word 4 * L) and `count` when the reflection
+  sizes it. No call recorded for this entry set them (the game set them earlier, never, or through another entry), so
+  the value is unknown. A variable that only partly overlaps the span is neither here nor in `valueNames` when it
+  starts before `firstValue`; variables past a truncated range are left out.
+
+`unwrittenRanges` and `namesWithoutValues` are per entry: a register set with no push recorded has no entry, so it
+lists no names at all (for example an OpenGL program whose sampler units were all set at load), and when several
+entries share a register set (Vulkan ranges with different stage flags, layouts listed because the bound one is
+unknown) each reports the others' words and variables as missing.
 
 Constant buffer binds in snapshot draws (`constantBuffers`, with or without values) are the pixel or compute stage's, like
 SRVs and UAVs: before this change a vertex shader bind on D3D11 could overwrite the pixel shader's slot. Vulkan dynamic
