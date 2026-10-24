@@ -710,6 +710,8 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     std::vector<TextureInfo> targets;
     std::vector<TextureInfo> inputs;
     std::vector<std::uint32_t> shader_hashes;
+    // The first draw of each of shader_hashes, at the same index.
+    std::vector<std::size_t> shader_first_draws;
     bool blend_known = false;
     bool blend_enabled = false;
     bool order_unknown = false;
@@ -755,6 +757,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     ++pass.command_count;
     if (command.shader_hash != 0u && std::ranges::find(pass.shader_hashes, command.shader_hash) == pass.shader_hashes.end()) {
       pass.shader_hashes.push_back(command.shader_hash);
+      pass.shader_first_draws.push_back(command.draw_index);
     }
     for (const auto& texture : command.inputs) {
       if (std::ranges::none_of(pass.inputs, [&](const TextureInfo& known) { return known.resource_handle == texture.resource_handle; })) {
@@ -906,6 +909,61 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     break;
   }
 
+  // Shared shaders: a candidate pass's shader that also draws in a pass of another role (for example UI and scene or
+  // post-processing). A replacement of that hash changes every one of those passes, so its callback has to tell them apart.
+  const auto pass_role = [&](std::size_t pass_index) -> std::string_view {
+    if (std::ranges::find(ui_passes, pass_index) != ui_passes.end()) return "ui";
+    if (std::ranges::find(tonemap_passes, pass_index) != tonemap_passes.end()) return "tonemap";
+    if (output_pass == pass_index) return "output";
+    return "other";
+  };
+  struct ShaderPassUse {
+    std::size_t pass_index = 0u;
+    std::size_t first_draw = 0u;
+  };
+  std::map<std::uint32_t, std::vector<ShaderPassUse>> uses_by_shader;
+  for (std::size_t pass_index = 0u; pass_index < passes.size(); ++pass_index) {
+    const auto& pass = passes[pass_index];
+    for (std::size_t shader_index = 0u; shader_index < pass.shader_hashes.size(); ++shader_index) {
+      uses_by_shader[pass.shader_hashes[shader_index]].push_back({
+          .pass_index = pass_index,
+          .first_draw = pass.shader_first_draws[shader_index],
+      });
+    }
+  }
+  constexpr std::size_t MAX_SHARED_SHADERS = 16u;
+  std::vector<std::pair<std::uint32_t, std::vector<ShaderPassUse>*>> shared_shader_uses;
+  for (auto& [shader_hash, uses] : uses_by_shader) {
+    const auto first_role = pass_role(uses.front().pass_index);
+    if (std::ranges::none_of(uses, [&](const ShaderPassUse& use) { return pass_role(use.pass_index) != first_role; })) continue;
+    // Candidate passes first, so the passes that made the shader a candidate are among the listed ones.
+    std::ranges::stable_partition(uses, [&](const ShaderPassUse& use) { return pass_role(use.pass_index) != "other"; });
+    if (pass_role(uses.front().pass_index) == "other") continue;
+    shared_shader_uses.emplace_back(shader_hash, &uses);
+  }
+  // Latest first candidate pass first, since the end of the frame (output, UI) matters most when the list is cut.
+  std::ranges::sort(shared_shader_uses, [](const auto& left, const auto& right) {
+    return left.second->front().pass_index > right.second->front().pass_index;
+  });
+  const auto shared_shader_count = shared_shader_uses.size();
+  json shared_shaders = json::array();
+  for (const auto& [shader_hash, uses_pointer] : shared_shader_uses | std::views::take(MAX_SHARED_SHADERS)) {
+    const auto& uses = *uses_pointer;
+    json pass_entries = json::array();
+    for (const auto& use : uses | std::views::take(MAX_LISTED)) {
+      pass_entries.push_back({
+          {"pass", use.pass_index},
+          {"firstDrawOfShader", use.first_draw},
+          {"role", pass_role(use.pass_index)},
+      });
+    }
+    shared_shaders.push_back({
+        {"shaderHash", formatting::FormatShaderHash(shader_hash)},
+        {"passCount", uses.size()},
+        {"passes", std::move(pass_entries)},
+    });
+  }
+
   // The listing budget goes to candidates first (tonemap, output, UI, LUT builders, LUT readers), then to the latest
   // passes, where HDR work happens.
   std::vector<bool> listed(passes.size(), false);
@@ -1039,7 +1097,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     }
     text = std::format(
         "Device #{}: {} commands in {} passes ({} listed). Candidates to verify: {} tonemap, {} LUT texture(s), {} LUT "
-        "reader(s), {} LUT builder(s), {} UI, output pass {}.",
+        "reader(s), {} LUT builder(s), {} UI, output pass {}, {} shared shader(s).",
         device_index,
         input.commands.size(),
         passes.size(),
@@ -1049,7 +1107,8 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
         lut_reader_passes.size(),
         lut_builder_passes.size(),
         ui_passes.size(),
-        output_text);
+        output_text,
+        shared_shader_count);
   }
 
   return ToolResult{
@@ -1071,6 +1130,8 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
               {"lutReaderPasses", lut_reader_passes},
               {"lutTextureCount", lut_texture_count},
               {"lutTextures", std::move(lut_textures)},
+              {"sharedShaderCount", shared_shader_count},
+              {"sharedShaders", std::move(shared_shaders)},
           }},
           {"passes", std::move(pass_list)},
           {"writtenTextureCount", written.size()},
