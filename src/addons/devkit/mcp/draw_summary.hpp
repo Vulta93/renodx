@@ -49,6 +49,22 @@ inline void to_json(json& j, const SlotResourceBindingSummary& value) {
   j["usedByActiveShader"] = value.used_by_active_shader;
 }
 
+// A shader variable over values[index, index + count) of the floatValues/uintValues it labels.
+struct ValueNameSummary {
+  std::string name;
+  std::uint32_t index = 0u;
+  std::uint32_t count = 0u;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const ValueNameSummary& value) {
+  j = {
+      {"name", value.name},
+      {"index", value.index},
+      {"count", value.count},
+  };
+}
+
 struct ConstantBufferSummary {
   std::uint32_t slot = 0u;
   std::uint32_t space = 0u;
@@ -62,6 +78,7 @@ struct ConstantBufferSummary {
   std::optional<std::vector<float>> float_values = std::nullopt;
   std::optional<std::vector<std::uint32_t>> uint_values = std::nullopt;
   bool values_truncated = false;
+  std::optional<std::vector<ValueNameSummary>> value_names = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -85,6 +102,9 @@ inline void to_json(json& j, const ConstantBufferSummary& value) {
   if (value.uint_values.has_value()) {
     j["uintValues"] = value.uint_values.value();
   }
+  if (value.value_names.has_value()) {
+    j["valueNames"] = value.value_names.value();
+  }
 }
 
 // Root constants (D3D12), push constants (Vulkan), D3D9 shader constants and OpenGL uniforms, as the snapshot saw them
@@ -97,6 +117,7 @@ struct PushConstantSummary {
   std::uint32_t first_value = 0u;
   std::vector<float> float_values;
   std::vector<std::uint32_t> uint_values;
+  std::optional<std::vector<ValueNameSummary>> value_names = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -109,6 +130,9 @@ inline void to_json(json& j, const PushConstantSummary& value) {
       {"floatValues", value.float_values},
       {"uintValues", value.uint_values},
   };
+  if (value.value_names.has_value()) {
+    j["valueNames"] = value.value_names.value();
+  }
 }
 
 struct PipelineBindSummary {

@@ -191,8 +191,18 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
 Limits: values are recorded only from calls the game makes during snapshot frames (like the other bindings the snapshot
 records). A constant the game set before the snapshot frame and did not set again is missing, or shows a value from an
 earlier snapshot on D3D9 and the D3D11/OpenGL immediate context, whose state is kept between frames. Vertex shader
-constants are not included. Reflection names for the words are not resolved: read them from the decompiled shader's
-cbuffer layout.
+constants are not included.
+
+`valueNames` labels the words with the active pixel (or compute) shader's own variable names, read from the reflection
+in its disassembly: each entry is `name`, `index` (into `floatValues`/`uintValues`) and `count` (words).
+- D3D10/11 constant buffers: the "Buffer Definitions" block (cbuffer members and their byte offsets, struct members as
+  `struct.member`) joined to the slot through "Resource Bindings". Offsets are relative to the bound offset. Members of
+  nested structs have no size in the disassembly; their size is derived from the type (column_major packing unless the
+  line says `row_major`; array elements start on 16-byte boundaries). Arrays of structs are labelled at element 0 only.
+  `$Globals` is included; structured buffer layouts are not.
+- D3D9 pixel shader constants (`layoutParam` 5/6/7): the constant table's "Registers" rows (`c`, `i`, `b`).
+- Absent on D3D12, Vulkan and OpenGL (not resolved yet: GL locations are assigned per program at link time). An empty
+  list means the game stripped the reflection, or no named variable starts inside the captured words.
 
 Constant buffer binds in snapshot draws (`constantBuffers`, with or without values) are the pixel or compute stage's, like
 SRVs and UAVs: before this change a vertex shader bind on D3D11 could overwrite the pixel shader's slot. Vulkan dynamic

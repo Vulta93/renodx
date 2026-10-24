@@ -188,6 +188,21 @@ struct ResourceBind {
   uint32_t space = 0;
 };
 
+// A named constant from the shader's own reflection in its disassembly: an SM4/5 cbuffer member (words from the buffer
+// start) or an SM2/3 constant table entry (float and int register N at word 4 * N, bool register N at word N).
+struct ConstantVariable {
+  enum class RegisterSet : std::uint8_t {
+    CONSTANT_BUFFER = 0,
+    FLOAT4 = 1,
+    INT4 = 2,
+    BOOL = 3,
+  } register_set = RegisterSet::CONSTANT_BUFFER;
+  uint32_t slot = 0;
+  uint32_t first_word = 0;
+  uint32_t word_count = 0;
+  std::string name;
+};
+
 using ShaderTextResult = std::variant<std::nullopt_t, std::exception, std::string>;
 
 struct ShaderDetails {
@@ -200,6 +215,8 @@ struct ShaderDetails {
   std::optional<renodx::utils::shader::compiler::watcher::CustomShader> disk_shader = std::nullopt;
   reshade::api::pipeline_stage shader_type = static_cast<reshade::api::pipeline_stage>(0);
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
+  // Parsed with resource_binds and shared with every recorded draw of the shader; empty when the reflection was stripped.
+  std::shared_ptr<const std::vector<ConstantVariable>> constant_variables;
   std::string entrypoint;
 
   bool bypass_draw = false;
@@ -301,6 +318,7 @@ struct DrawDetails {
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
+  std::shared_ptr<const std::vector<ConstantVariable>> constant_variables;
 
   reshade::api::resource copy_source = {0u};
   reshade::api::resource copy_destination = {0u};
@@ -904,6 +922,36 @@ std::optional<std::vector<ResourceBind>> GetResourceBindsForShaderDetails(
         FromStringView(slot, resource_bind.slot);
         shader_details->resource_binds->push_back(resource_bind);
       }
+
+      // Constant table rows under "Registers": "//   name   c12   2", sizes in registers.
+      std::vector<ConstantVariable> constant_variables;
+      for (auto line : source_lines) {
+        if (!line.starts_with("//")) continue;
+        static const auto REGEX = std::regex(R"(^//\s+(\S+)\s+([cib])(\d+)\s+(\d+)\s*$)");
+        auto [name, register_type, first_register, register_count] = StringViewMatch<4>(line, REGEX);
+        if (name.empty()) continue;
+        ConstantVariable constant_variable = {.name = std::string(name)};
+        uint32_t words_per_register = 4u;
+        switch (register_type[0]) {
+          case 'i':
+            constant_variable.register_set = ConstantVariable::RegisterSet::INT4;
+            break;
+          case 'b':
+            constant_variable.register_set = ConstantVariable::RegisterSet::BOOL;
+            words_per_register = 1u;
+            break;
+          default:
+            constant_variable.register_set = ConstantVariable::RegisterSet::FLOAT4;
+            break;
+        }
+        FromStringView(first_register, constant_variable.first_word);
+        FromStringView(register_count, constant_variable.word_count);
+        constant_variable.first_word *= words_per_register;
+        constant_variable.word_count *= words_per_register;
+        constant_variables.push_back(std::move(constant_variable));
+      }
+      shader_details->constant_variables =
+          std::make_shared<const std::vector<ConstantVariable>>(std::move(constant_variables));
     } else if (shader_details->program_version->GetMajor() <= 5) {
       auto disassembly = std::get<std::string>(shader_details->disassembly);
       auto source_lines = StringViewSplitAll(disassembly, '\n');
@@ -930,6 +978,101 @@ std::optional<std::vector<ResourceBind>> GetResourceBindsForShaderDetails(
         }
         shader_details->resource_binds->push_back(resource_bind);
       }
+
+      // "Buffer Definitions" list each cbuffer's members with absolute byte offsets (struct members too; the struct
+      // name is on its closing line); "Resource Bindings", printed after them, maps the cbuffer name to its slot.
+      // Structured buffer layouts ("Resource bind info for") are not constant buffers.
+      std::vector<std::pair<std::string_view, ConstantVariable>> buffer_variables;
+      std::vector<size_t> open_struct_starts;
+      std::map<std::string_view, uint32_t> buffer_slots;
+      std::string_view current_buffer;
+      for (auto line : source_lines) {
+        if (!line.starts_with("//")) continue;
+        static const auto BUFFER_REGEX = std::regex(R"(^//\s+(cbuffer|tbuffer)\s+([\w$]+)\s*$)");
+        static const auto BIND_INFO_REGEX = std::regex(R"(^//\s+Resource bind info for .*$)");
+        static const auto STRUCT_OPEN_REGEX = std::regex(R"(^//\s+struct(?:\s+\w+)?\s*$)");
+        static const auto STRUCT_CLOSE_REGEX = std::regex(R"(^//\s+\}\s*([\w$]+)(?:\[\d+\])?;\s*// Offset:.*$)");
+        static const auto MEMBER_REGEX = std::regex(R"(^//\s+(?:(row_major)\s+|column_major\s+)?(\w+)\s+(\w+)(?:\[(\d+)\])?;\s*// Offset:\s*(\d+)(?:\s+Size:\s*(\d+))?.*$)");
+        // SM5.1 adds an ID column before the register; anchor on the register and count at the end of the row.
+        static const auto BINDING_REGEX = std::regex(R"(^//\s+([\w$]+)\s+cbuffer\s+.*\s(?:cb|CB)(\d+)(?:,\s*space\d+)?\s+\d+\s*$)");
+
+        if (auto [buffer_kind, buffer_name] = StringViewMatch<2>(line, BUFFER_REGEX); !buffer_kind.empty()) {
+          current_buffer = (buffer_kind == "cbuffer" ? buffer_name : std::string_view());
+          open_struct_starts.clear();
+          continue;
+        }
+        if (std::regex_match(line.begin(), line.end(), BIND_INFO_REGEX)) {
+          current_buffer = {};
+          open_struct_starts.clear();
+          continue;
+        }
+        if (auto [binding_name, binding_slot] = StringViewMatch<2>(line, BINDING_REGEX); !binding_name.empty()) {
+          FromStringView(binding_slot, buffer_slots[binding_name]);
+          continue;
+        }
+        if (current_buffer.empty()) continue;
+        if (std::regex_match(line.begin(), line.end(), STRUCT_OPEN_REGEX)) {
+          open_struct_starts.push_back(buffer_variables.size());
+          continue;
+        }
+        if (auto [struct_name] = StringViewMatch<1>(line, STRUCT_CLOSE_REGEX); !struct_name.empty()) {
+          if (open_struct_starts.empty()) continue;
+          for (auto index = open_struct_starts.back(); index < buffer_variables.size(); ++index) {
+            auto& variable = buffer_variables[index].second;
+            variable.name = std::format("{}.{}", struct_name, variable.name);
+          }
+          open_struct_starts.pop_back();
+          continue;
+        }
+        auto [row_major, type, name, array_count, offset, size] = StringViewMatch<6>(line, MEMBER_REGEX);
+        if (name.empty()) continue;
+        uint32_t first_byte = 0;
+        FromStringView(offset, first_byte);
+        uint32_t byte_size = 0;
+        if (size.empty()) {
+          // Members inside a struct carry no size: derive it from the type with HLSL packing (column_major default),
+          // array elements starting on 16-byte boundaries.
+          static const auto TYPE_REGEX = std::regex(R"(^[a-z_0-9]*?([a-z]+)([1-4])?(?:x([1-4]))?$)");
+          auto [scalar, rows, columns] = StringViewMatch<3>(type, TYPE_REGEX);
+          uint32_t row_count = 1u;
+          uint32_t column_count = 0u;
+          if (!rows.empty()) FromStringView(rows, row_count);
+          if (!columns.empty()) FromStringView(columns, column_count);
+          const uint32_t scalar_bytes = (scalar == "double" ? 8u : 4u);
+          if (column_count == 0u) {
+            byte_size = row_count * scalar_bytes;
+          } else if (row_major.empty()) {
+            byte_size = (16u * (column_count - 1u)) + (row_count * scalar_bytes);
+          } else {
+            byte_size = (16u * (row_count - 1u)) + (column_count * scalar_bytes);
+          }
+          if (!array_count.empty()) {
+            uint32_t element_count = 1u;
+            FromStringView(array_count, element_count);
+            const uint32_t element_stride = (byte_size + 15u) & ~15u;
+            byte_size += element_stride * (element_count - 1u);
+          }
+        } else {
+          FromStringView(size, byte_size);
+        }
+        buffer_variables.emplace_back(
+            current_buffer,
+            ConstantVariable{
+                .register_set = ConstantVariable::RegisterSet::CONSTANT_BUFFER,
+                .first_word = first_byte / 4u,
+                .word_count = (byte_size + 3u) / 4u,
+                .name = std::string(name),
+            });
+      }
+      std::vector<ConstantVariable> constant_variables;
+      for (auto& [buffer_name, variable] : buffer_variables) {
+        auto pair = buffer_slots.find(buffer_name);
+        if (pair == buffer_slots.end()) continue;
+        variable.slot = pair->second;
+        constant_variables.push_back(std::move(variable));
+      }
+      shader_details->constant_variables =
+          std::make_shared<const std::vector<ConstantVariable>>(std::move(constant_variables));
     } else {
       auto disassembly = std::get<std::string>(shader_details->disassembly);
       auto source_lines = StringViewSplitAll(disassembly, '\n');
@@ -2756,6 +2899,28 @@ std::vector<DeviceData*> device_data_list;
     return floats;
   };
 
+  // Names from the active shader's reflection for the words [first_word, first_word + word_count) of one register set;
+  // std::nullopt when the shader's reflection was not parsed.
+  const auto name_values = [&draw_details](
+                               ConstantVariable::RegisterSet register_set,
+                               uint32_t slot,
+                               uint64_t first_word,
+                               size_t word_count) -> std::optional<std::vector<devkit_draw_summary::ValueNameSummary>> {
+    if (draw_details.constant_variables == nullptr) return std::nullopt;
+    std::vector<devkit_draw_summary::ValueNameSummary> value_names;
+    for (const auto& variable : *draw_details.constant_variables) {
+      if (variable.register_set != register_set || variable.slot != slot) continue;
+      if (variable.first_word < first_word || variable.first_word >= first_word + word_count) continue;
+      const auto index = static_cast<uint32_t>(variable.first_word - first_word);
+      value_names.push_back(devkit_draw_summary::ValueNameSummary{
+          .name = variable.name,
+          .index = index,
+          .count = std::min(variable.word_count, static_cast<uint32_t>(word_count - index)),
+      });
+    }
+    return value_names;
+  };
+
   std::vector<devkit_draw_summary::ConstantBufferSummary> constant_buffers = {};
   constant_buffers.reserve(draw_details.constants.size());
   for (const auto& [slot_space, buffer_range] : draw_details.constants) {
@@ -2788,6 +2953,8 @@ std::vector<DeviceData*> device_data_list;
       constant_buffer.values_truncated = bytes.size() == MAX_CAPTURED_CONSTANT_BUFFER_BYTES
                                          && buffer_range.size > MAX_CAPTURED_CONSTANT_BUFFER_BYTES;
       constant_buffer.float_values = to_floats(words);
+      constant_buffer.value_names = name_values(
+          ConstantVariable::RegisterSet::CONSTANT_BUFFER, slot, buffer_range.offset / 4u, words.size());
       constant_buffer.uint_values = std::move(words);
     }
   }
@@ -2797,6 +2964,15 @@ std::vector<DeviceData*> device_data_list;
     push_constants.reserve(draw_details.push_constants.size());
     for (const auto& [push_constant_key, pushed] : draw_details.push_constants) {
       const auto& [layout_handle, layout_param, stages] = push_constant_key;
+      // D3D9 pixel shader constants: layout parameters 5/6/7 hold the float/int/bool registers. Only SM2/3 constant
+      // tables produce these register sets; constant_buffer_values_supported excludes D3D12 root constants at the same
+      // parameters.
+      std::optional<std::vector<devkit_draw_summary::ValueNameSummary>> value_names = std::nullopt;
+      if (draw_details.constant_buffer_values_supported && stages == reshade::api::shader_stage::pixel
+          && layout_param >= 5u && layout_param <= 7u) {
+        value_names = name_values(
+            static_cast<ConstantVariable::RegisterSet>(layout_param - 4u), 0u, pushed.first_written, pushed.values.size());
+      }
       push_constants.push_back(devkit_draw_summary::PushConstantSummary{
           .layout_handle = FormatHandle(layout_handle),
           .layout_param = layout_param,
@@ -2804,6 +2980,7 @@ std::vector<DeviceData*> device_data_list;
           .first_value = pushed.first_written,
           .float_values = to_floats(pushed.values),
           .uint_values = pushed.values,
+          .value_names = std::move(value_names),
       });
     }
     draw_summary.push_constants = std::move(push_constants);
@@ -5955,6 +6132,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
             GetResourceBindsForShaderDetails(device, device_data, shader_details);
           }
           draw_details.resource_binds = shader_details->resource_binds;
+          draw_details.constant_variables = shader_details->constant_variables;
         }
       }
 
