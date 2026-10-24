@@ -195,11 +195,16 @@ constants are not included.
 
 `valueNames` labels the words with the active pixel (or compute) shader's own variable names, read from the reflection
 in its disassembly: each entry is `name`, `index` (into `floatValues`/`uintValues`) and `count` (words).
-- D3D10/11 constant buffers: the "Buffer Definitions" block (cbuffer members and their byte offsets, struct members as
-  `struct.member`) joined to the slot through "Resource Bindings". Offsets are relative to the bound offset. Members of
-  nested structs have no size in the disassembly; their size is derived from the type (column_major packing unless the
-  line says `row_major`; array elements start on 16-byte boundaries). Arrays of structs are labelled at element 0 only.
-  `$Globals` is included; structured buffer layouts are not.
+- D3D10/11 constant buffers and D3D12 root constants (DXBC `//` or DXIL `;` disassembly): the "Buffer Definitions"
+  block (cbuffer members and their byte offsets, struct members as `struct.member`) joined to the register and space
+  through "Resource Bindings"; DXIL's wrapper struct named after the cbuffer adds no prefix (a DXBC struct member with
+  the cbuffer's name keeps it). Offsets are relative to the bound offset. A D3D12 root constant parameter is
+  matched through the root signature's register and space, and its word is the 32-bit value offset; D3D12 root and
+  table CBVs have no values, so no names. Members of nested structs (and every DXIL member) have no size in the
+  disassembly; their size is derived from the type (column_major packing unless the line says `row_major`; array
+  elements start on 16-byte boundaries; `double` and 64-bit integers take 8 bytes, 16-bit types are counted as
+  4). Arrays of structs are labelled at element 0 only. `$Globals` is included; structured buffer layouts are not.
+  Shipped D3D12 shaders often strip their reflection (`-Qstrip_reflect`), and then the list is empty.
 - D3D9 pixel shader constants (`layoutParam` 5/6/7): the constant table's "Registers" rows (`c`, `i`, `b`).
 - Vulkan push constants: the SPIR-V push constant block's `OpMemberName` and `OpMemberDecorate ... Offset` (word =
   Offset / 4, as `vkCmdPushConstants` addresses it; 16-bit members share their 32-bit word). Scalars, vectors, matrices
@@ -208,8 +213,8 @@ in its disassembly: each entry is `name`, `index` (into `floatValues`/`uintValue
   runs to the end of the captured words. Modules run through spirv-remap keep the offsets but lose the names, so the
   list is empty; it is also empty when the active pixel or compute shader declares no push constant block (a push that
   only the vertex shader reads).
-- Absent on D3D12 and OpenGL (not resolved yet: GL locations are assigned per program at link time). An empty
-  list means the game stripped the reflection, or no named variable starts inside the captured words.
+- Absent on OpenGL (not resolved yet: GL locations are assigned per program at link time). An empty list means the
+  game stripped the reflection, or no named variable starts inside the captured words.
 
 Constant buffer binds in snapshot draws (`constantBuffers`, with or without values) are the pixel or compute stage's, like
 SRVs and UAVs: before this change a vertex shader bind on D3D11 could overwrite the pixel shader's slot. Vulkan dynamic
