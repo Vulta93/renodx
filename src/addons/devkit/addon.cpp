@@ -190,9 +190,11 @@ struct ResourceBind {
   uint32_t space = 0;
 };
 
-// A named constant from the shader's own reflection in its disassembly: a DXBC or DXIL cbuffer member (words from
-// the buffer start), an SM2/3 constant table entry (float and int register N at word 4 * N, bool register N at word
-// N) or a SPIR-V push constant block member (word = byte Offset / 4, as vkCmdPushConstants addresses it).
+// A named constant from the shader's own reflection (its disassembly, or the linked GL program's active uniforms): a
+// DXBC or DXIL cbuffer member (words from the buffer start), an SM2/3 constant table entry (float and int register N
+// at word 4 * N, bool register N at word N), a SPIR-V push constant block member (word = byte Offset / 4, as
+// vkCmdPushConstants addresses it) or an OpenGL program uniform (word = 4 * location, where ReShade puts glUniform*
+// values).
 struct ConstantVariable {
   enum class RegisterSet : std::uint8_t {
     CONSTANT_BUFFER = 0,
@@ -200,6 +202,7 @@ struct ConstantVariable {
     INT4 = 2,
     BOOL = 3,
     PUSH_CONSTANT = 4,
+    UNIFORM_LOCATION = 5,
   } register_set = RegisterSet::CONSTANT_BUFFER;
   uint32_t slot = 0;
   uint32_t space = 0;
@@ -301,7 +304,9 @@ struct PushConstantValues {
   std::optional<ConstantVariableSource> named_by = std::nullopt;
 };
 
-using PushConstantKey = std::tuple<uint64_t, uint32_t, reshade::api::shader_stage>;
+// Layout handle, layout parameter, stages and, on OpenGL, the program current when the glUniform* call was made (uniform
+// values are program state, but ReShade reports them all through one context-wide layout); 0 on other APIs.
+using PushConstantKey = std::tuple<uint64_t, uint32_t, reshade::api::shader_stage, uint32_t>;
 
 constexpr uint64_t MAX_CAPTURED_CONSTANT_BUFFER_BYTES = 4096u;
 constexpr size_t MAX_CAPTURED_PUSH_CONSTANT_VALUES = 1024u;
@@ -497,6 +502,8 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::unordered_map<uint64_t, std::unordered_map<reshade::api::format, reshade::api::resource_view>> preview_srvs;
   std::shared_mutex mutex;
   std::unordered_map<uint64_t, reshade::api::blend_desc> pipeline_blends;
+  // OpenGL uniform names per program, read once per snapshot (program names can be reused between snapshots).
+  std::unordered_map<uint32_t, std::shared_ptr<const std::vector<ConstantVariable>>> gl_program_uniforms;
 
   reshade::api::effect_runtime* runtime = nullptr;
   std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_resource_analysis_requests;
@@ -3141,7 +3148,7 @@ std::vector<DeviceData*> device_data_list;
     std::vector<devkit_draw_summary::PushConstantSummary> push_constants = {};
     push_constants.reserve(draw_details.push_constants.size());
     for (const auto& [push_constant_key, pushed] : draw_details.push_constants) {
-      const auto& [layout_handle, layout_param, stages] = push_constant_key;
+      const auto& [layout_handle, layout_param, stages, gl_program] = push_constant_key;
       std::optional<std::vector<devkit_draw_summary::ValueNameSummary>> value_names = std::nullopt;
       if (pushed.named_by.has_value()) {
         value_names = name_values(pushed.named_by.value(), pushed.first_written, pushed.values.size());
@@ -3154,6 +3161,7 @@ std::vector<DeviceData*> device_data_list;
           .float_values = to_floats(pushed.values),
           .uint_values = pushed.values,
           .value_names = std::move(value_names),
+          .gl_program = (gl_program == 0u ? std::nullopt : std::optional<std::uint32_t>(gl_program)),
       });
     }
     draw_summary.push_constants = std::move(push_constants);
@@ -4963,6 +4971,7 @@ uint64_t StartSnapshotFrame(DeviceData* device_data) {
   ++device_data->snapshot_rows_generation;
   device_data->snapshot_rows_valid = false;
   device_data->snapshot_id = ++snapshots_started;
+  device_data->gl_program_uniforms.clear();
   snapshot_submission_counter.store(0u, std::memory_order_relaxed);
   snapshot_device = device_data->device;
   return device_data->snapshot_id;
@@ -5710,7 +5719,16 @@ void OnPushConstants(
   constexpr uint64_t MAX_PUSH_CONSTANT_VALUES = 65536u;
   if (count == 0u || static_cast<uint64_t>(first) + count > MAX_PUSH_CONSTANT_VALUES) return;
 
-  auto& pushed = data->push_constants[{layout.handle, layout_param, stages}];
+  // The hook runs on the thread that made the glUniform* call, after it, with that context current.
+  int gl_program = 0;
+  if (cmd_list->get_device()->get_api() == reshade::api::device_api::opengl) {
+    namespace gl_enum = renodx::addons::devkit::mcp::watch_region::gl_enum;
+    const auto* gl = renodx::addons::devkit::mcp::watch_region::GetOpenGLFunctions();
+    if (gl != nullptr && gl->get_current_context() != nullptr) {
+      gl->get_integerv(gl_enum::CURRENT_PROGRAM, &gl_program);
+    }
+  }
+  auto& pushed = data->push_constants[{layout.handle, layout_param, stages, static_cast<uint32_t>(gl_program)}];
   if (pushed.values.size() < first + count) {
     pushed.values.resize(first + count, 0u);
   }
@@ -6554,12 +6572,106 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     const auto active_stage = (draw_method == DrawDetails::DrawMethods::DISPATCH
                                    ? reshade::api::shader_stage::compute
                                    : reshade::api::shader_stage::pixel);
+    // OpenGL uniform values are program state, kept per program current at each glUniform* call: only the draw's
+    // program's values apply, and that program's active uniforms name them. glProgramUniform* never reaches the Devkit.
+    int gl_program = 0;
+    if (device_api == reshade::api::device_api::opengl) {
+      namespace gl_enum = renodx::addons::devkit::mcp::watch_region::gl_enum;
+      const auto* gl = renodx::addons::devkit::mcp::watch_region::GetOpenGLFunctions();
+      if (gl != nullptr && gl->get_current_context() != nullptr) {
+        gl->get_integerv(gl_enum::CURRENT_PROGRAM, &gl_program);
+      }
+      if (gl_program != 0) {
+        const auto program = static_cast<uint32_t>(gl_program);
+        auto& program_uniforms = device_data->gl_program_uniforms[program];
+        if (program_uniforms == nullptr) {
+          // A program whose last link failed can stay current with its old executable, but glGetUniformLocation would
+          // raise GL_INVALID_OPERATION in the game's context: no names then.
+          int link_status = 0;
+          int uniform_count = 0;
+          int max_name_length = 0;
+          gl->get_programiv(program, gl_enum::LINK_STATUS, &link_status);
+          if (link_status != 0) {
+            gl->get_programiv(program, gl_enum::ACTIVE_UNIFORMS, &uniform_count);
+          }
+          gl->get_programiv(program, gl_enum::ACTIVE_UNIFORM_MAX_LENGTH, &max_name_length);
+          std::string name_buffer(std::max(max_name_length, 1), '\0');
+          std::vector<ConstantVariable> constant_variables;
+          for (int uniform_index = 0; uniform_index < uniform_count; ++uniform_index) {
+            int name_length = 0;
+            int array_size = 0;
+            unsigned int type = 0u;
+            gl->get_active_uniform(
+                program, static_cast<unsigned int>(uniform_index), static_cast<int>(name_buffer.size()),
+                &name_length, &array_size, &type, name_buffer.data());
+            if (name_length <= 0) continue;
+            std::string name(name_buffer.data(), static_cast<size_t>(name_length));
+            // Uniform block members and built-ins have no location; glUniform* never sets them.
+            const int location = gl->get_uniform_location(program, name.c_str());
+            if (location < 0) continue;
+            // ReShade packs each call's values from word 4 * location: components times array elements.
+            uint32_t component_count = 1u;
+            switch (type) {
+              case gl_enum::FLOAT_VEC2:
+              case gl_enum::INT_VEC2:
+              case gl_enum::BOOL_VEC2:
+              case gl_enum::UNSIGNED_INT_VEC2:
+                component_count = 2u;
+                break;
+              case gl_enum::FLOAT_VEC3:
+              case gl_enum::INT_VEC3:
+              case gl_enum::BOOL_VEC3:
+              case gl_enum::UNSIGNED_INT_VEC3:
+                component_count = 3u;
+                break;
+              case gl_enum::FLOAT_VEC4:
+              case gl_enum::INT_VEC4:
+              case gl_enum::BOOL_VEC4:
+              case gl_enum::UNSIGNED_INT_VEC4:
+              case gl_enum::FLOAT_MAT2:
+                component_count = 4u;
+                break;
+              case gl_enum::FLOAT_MAT2X3:
+              case gl_enum::FLOAT_MAT3X2:
+                component_count = 6u;
+                break;
+              case gl_enum::FLOAT_MAT2X4:
+              case gl_enum::FLOAT_MAT4X2:
+                component_count = 8u;
+                break;
+              case gl_enum::FLOAT_MAT3:
+                component_count = 9u;
+                break;
+              case gl_enum::FLOAT_MAT3X4:
+              case gl_enum::FLOAT_MAT4X3:
+                component_count = 12u;
+                break;
+              case gl_enum::FLOAT_MAT4:
+                component_count = 16u;
+                break;
+              default:
+                break;
+            }
+            constant_variables.push_back(ConstantVariable{
+                .register_set = ConstantVariable::RegisterSet::UNIFORM_LOCATION,
+                .first_word = static_cast<uint32_t>(location) * 4u,
+                .word_count = component_count * static_cast<uint32_t>(std::max(array_size, 1)),
+                .name = std::move(name),
+            });
+          }
+          program_uniforms = std::make_shared<const std::vector<ConstantVariable>>(std::move(constant_variables));
+        }
+        draw_details.constant_variables = program_uniforms;
+      }
+    }
+
     // D3D12 root arguments and Vulkan push constants belong to the bound layout; values pushed for an earlier one are stale.
     // D3D9 and OpenGL push into one global layout.
     for (const auto& [push_constant_key, pushed] : command_list_data->push_constants) {
-      const auto& [layout_handle, layout_param, stages] = push_constant_key;
+      const auto& [layout_handle, layout_param, stages, pushed_gl_program] = push_constant_key;
       if (!renodx::utils::bitwise::HasAnyFlag(stages, active_stage)) continue;
       if (bound_layout_handle.has_value() && layout_handle != bound_layout_handle.value()) continue;
+      if (pushed_gl_program != static_cast<uint32_t>(gl_program)) continue;
       const auto captured_end = std::min<size_t>(pushed.values.size(), pushed.first_written + MAX_CAPTURED_PUSH_CONSTANT_VALUES);
       // D3D9 pixel shader constants arrive at layout parameters 5/6/7 for the float/int/bool registers; D3D12 root
       // constants at their root parameter, which the root signature maps to a cbuffer register and space (word = the
@@ -6573,6 +6685,9 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           break;
         case reshade::api::device_api::vulkan:
           named_by = ConstantVariableSource{.register_set = ConstantVariable::RegisterSet::PUSH_CONSTANT};
+          break;
+        case reshade::api::device_api::opengl:
+          named_by = ConstantVariableSource{.register_set = ConstantVariable::RegisterSet::UNIFORM_LOCATION};
           break;
         case reshade::api::device_api::d3d12:
           renodx::utils::pipeline_layout::GetPipelineLayoutData({layout_handle}, [&](const auto* layout_data) {

@@ -118,6 +118,8 @@ struct PushConstantSummary {
   std::vector<float> float_values;
   std::vector<std::uint32_t> uint_values;
   std::optional<std::vector<ValueNameSummary>> value_names = std::nullopt;
+  // OpenGL: the program that was current when these uniforms were set (the draw's own program).
+  std::optional<std::uint32_t> gl_program = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -132,6 +134,9 @@ inline void to_json(json& j, const PushConstantSummary& value) {
   };
   if (value.value_names.has_value()) {
     j["valueNames"] = value.value_names.value();
+  }
+  if (value.gl_program.has_value()) {
+    j["glProgram"] = value.gl_program.value();
   }
 }
 

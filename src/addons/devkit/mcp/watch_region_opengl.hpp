@@ -56,6 +56,31 @@ constexpr unsigned int LEFT = 0x0406u;
 constexpr unsigned int RIGHT = 0x0407u;
 constexpr unsigned int FRONT_AND_BACK = 0x0408u;
 constexpr unsigned int CURRENT_PROGRAM = 0x8B8Du;
+constexpr unsigned int LINK_STATUS = 0x8B82u;
+constexpr unsigned int ACTIVE_UNIFORMS = 0x8B86u;
+constexpr unsigned int ACTIVE_UNIFORM_MAX_LENGTH = 0x8B87u;
+// Uniform types glGetActiveUniform reports, for their 32-bit component counts.
+constexpr unsigned int FLOAT_VEC2 = 0x8B50u;
+constexpr unsigned int FLOAT_VEC3 = 0x8B51u;
+constexpr unsigned int FLOAT_VEC4 = 0x8B52u;
+constexpr unsigned int INT_VEC2 = 0x8B53u;
+constexpr unsigned int INT_VEC3 = 0x8B54u;
+constexpr unsigned int INT_VEC4 = 0x8B55u;
+constexpr unsigned int BOOL_VEC2 = 0x8B57u;
+constexpr unsigned int BOOL_VEC3 = 0x8B58u;
+constexpr unsigned int BOOL_VEC4 = 0x8B59u;
+constexpr unsigned int UNSIGNED_INT_VEC2 = 0x8DC6u;
+constexpr unsigned int UNSIGNED_INT_VEC3 = 0x8DC7u;
+constexpr unsigned int UNSIGNED_INT_VEC4 = 0x8DC8u;
+constexpr unsigned int FLOAT_MAT2 = 0x8B5Au;
+constexpr unsigned int FLOAT_MAT3 = 0x8B5Bu;
+constexpr unsigned int FLOAT_MAT4 = 0x8B5Cu;
+constexpr unsigned int FLOAT_MAT2X3 = 0x8B65u;
+constexpr unsigned int FLOAT_MAT2X4 = 0x8B66u;
+constexpr unsigned int FLOAT_MAT3X2 = 0x8B67u;
+constexpr unsigned int FLOAT_MAT3X4 = 0x8B68u;
+constexpr unsigned int FLOAT_MAT4X2 = 0x8B69u;
+constexpr unsigned int FLOAT_MAT4X3 = 0x8B6Au;
 // Target part of ReShade's pipeline handle for a program the application created ((PROGRAM << 40) | name).
 constexpr unsigned int PROGRAM = 0x82E2u;
 constexpr unsigned int MAX_TEXTURE_SIZE = 0x0D33u;
@@ -145,6 +170,9 @@ struct OpenGLFunctions {
   void*(APIENTRY* fence_sync)(unsigned int, unsigned int) = nullptr;
   unsigned int(APIENTRY* client_wait_sync)(void*, unsigned int, std::uint64_t) = nullptr;
   void(APIENTRY* delete_sync)(void*) = nullptr;
+  void(APIENTRY* get_programiv)(unsigned int, unsigned int, int*) = nullptr;
+  void(APIENTRY* get_active_uniform)(unsigned int, unsigned int, int, int*, int*, unsigned int*, char*) = nullptr;
+  int(APIENTRY* get_uniform_location)(unsigned int, const char*) = nullptr;
 };
 
 // The entry points, or null when the process has no complete OpenGL 4.3 set. Loading needs a current context, so a
@@ -197,7 +225,10 @@ struct OpenGLFunctions {
       && load(&loaded.bind_image_texture, "glBindImageTexture", false)
       && load(&loaded.fence_sync, "glFenceSync", false)
       && load(&loaded.client_wait_sync, "glClientWaitSync", false)
-      && load(&loaded.delete_sync, "glDeleteSync", false);
+      && load(&loaded.delete_sync, "glDeleteSync", false)
+      && load(&loaded.get_programiv, "glGetProgramiv", false)
+      && load(&loaded.get_active_uniform, "glGetActiveUniform", false)
+      && load(&loaded.get_uniform_location, "glGetUniformLocation", false);
   if (!complete) return nullptr;
 
   functions = loaded;

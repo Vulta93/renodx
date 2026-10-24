@@ -184,17 +184,20 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     `layoutHandle`).
   - D3D9 shader constants: `layoutParam` 5/6/7 are the pixel shader's float/int/bool constants. Float and int register N start
     at word 4 * N; bool register N is word N.
-  - OpenGL `glUniform*`: word 4 * location. One array per context, not per program: a location means something different in
-    every program, so a word can come from another program. Arrays and matrices fill consecutive words from 4 * location,
-    overlapping the next locations. `glProgramUniform*` is not hooked by ReShade, so those writes are missing.
+  - OpenGL `glUniform*`: word 4 * location. Values are kept per program (the one current at each call) and per context,
+    and a draw lists only its own program's (`glProgram`), since a location means something different in every program;
+    a uniform set on another context of the share group is not seen. Arrays and matrices fill consecutive words from
+    4 * location, overlapping the next locations. Values left from a deleted program whose name the driver reused show
+    up under the new program. `glProgramUniform*` is not hooked by ReShade, so those writes are missing.
 
 Limits: values are recorded only from calls the game makes during snapshot frames (like the other bindings the snapshot
 records). A constant the game set before the snapshot frame and did not set again is missing, or shows a value from an
 earlier snapshot on D3D9 and the D3D11/OpenGL immediate context, whose state is kept between frames. Vertex shader
-constants are not included.
+constants are not included, except on OpenGL, where uniforms belong to the whole linked program.
 
 `valueNames` labels the words with the active pixel (or compute) shader's own variable names, read from the reflection
-in its disassembly: each entry is `name`, `index` (into `floatValues`/`uintValues`) and `count` (words).
+in its disassembly (on OpenGL, the linked program's active uniforms, all stages): each entry is `name`, `index` (into
+`floatValues`/`uintValues`) and `count` (words).
 - D3D10/11 constant buffers and D3D12 root constants (DXBC `//` or DXIL `;` disassembly): the "Buffer Definitions"
   block (cbuffer members and their byte offsets, struct members as `struct.member`) joined to the register and space
   through "Resource Bindings"; DXIL's wrapper struct named after the cbuffer adds no prefix (a DXBC struct member with
@@ -213,8 +216,16 @@ in its disassembly: each entry is `name`, `index` (into `floatValues`/`uintValue
   runs to the end of the captured words. Modules run through spirv-remap keep the offsets but lose the names, so the
   list is empty; it is also empty when the active pixel or compute shader declares no push constant block (a push that
   only the vertex shader reads).
-- Absent on OpenGL (not resolved yet: GL locations are assigned per program at link time). An empty list means the
-  game stripped the reflection, or no named variable starts inside the captured words.
+- OpenGL uniforms: the draw's program (`glProgram`) is read from the context, and only the glUniform* values set
+  while that program was current are listed; its active uniforms (`glGetActiveUniform`, `glGetUniformLocation`) name
+  them at word 4 * location, counting components times array elements, as one whole-array call packs them. A game
+  that sets an array per element puts element i at word 4 * (location + i): inside the name's span for vec4 and
+  matrix arrays, past it (over the next locations' words) for float, vec2 and vec3 arrays. Words inside the captured
+  span that the game did not write in the snapshot frame read 0, like a written 0, and a uniform past the highest
+  written word gets no name. Names are read once per program per snapshot; double uniforms are not seen. Uniform
+  block members and `glProgramUniform*` values are never seen. Draws through program pipelines (`glUseProgramStages`)
+  have no current program and list only values set without one; a program whose last link failed gets no names.
+- An empty list means the game stripped the reflection, or no named variable starts inside the captured words.
 
 Constant buffer binds in snapshot draws (`constantBuffers`, with or without values) are the pixel or compute stage's, like
 SRVs and UAVs: before this change a vertex shader bind on D3D11 could overwrite the pixel shader's slot. Vulkan dynamic
