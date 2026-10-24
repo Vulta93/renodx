@@ -343,6 +343,7 @@ struct LoadedDiskShaderSummary {
   std::string path;
   bool removed = false;
   bool compilation_ok = false;
+  std::string compilation_error;
   bool activated = false;
 };
 
@@ -356,6 +357,9 @@ inline void to_json(json& j, const LoadedDiskShaderSummary& value) {
       {"isCompilationOk", value.compilation_ok},
       {"activated", value.activated},
   };
+  if (!value.compilation_error.empty()) {
+    j["compilationError"] = value.compilation_error;
+  }
 }
 
 }  // namespace renodx::addons::devkit::mcp::draw_summary

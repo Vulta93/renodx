@@ -3664,6 +3664,7 @@ struct LoadedDiskShaderResult {
   std::filesystem::path file_path;
   bool removed = false;
   bool compilation_ok = false;
+  std::string compilation_error;
   bool activated = false;
 };
 
@@ -3674,9 +3675,13 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
     const std::vector<LoadedDiskShaderResult>& results) {
   json shader_results = json::array();
   size_t activated_count = 0u;
+  size_t failed_count = 0u;
   for (const auto& result : results) {
     if (result.activated) {
       activated_count += 1u;
+    }
+    if (!result.removed && !result.compilation_ok) {
+      failed_count += 1u;
     }
     shader_results.push_back(devkit_draw_summary::LoadedDiskShaderSummary{
         .hash = FormatShaderHash(result.shader_hash),
@@ -3684,6 +3689,7 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
         .path = result.file_path.string(),
         .removed = result.removed,
         .compilation_ok = result.compilation_ok,
+        .compilation_error = result.compilation_error,
         .activated = result.activated,
     });
   }
@@ -3692,11 +3698,12 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   auto text = results.empty()
                   ? std::format("No live shaders were loaded from '{}'.", effective_directory.string())
                   : std::format(
-                        "Loaded {} live shader file(s) from '{}' for device #{} ({} activated).",
+                        "Loaded {} live shader file(s) from '{}' for device #{} ({} activated, {} failed to compile).",
                         results.size(),
                         effective_directory.string(),
                         device_index,
-                        activated_count);
+                        activated_count,
+                        failed_count);
 
   return ToolResult{
       .text = std::move(text),
@@ -3705,6 +3712,7 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
           {"effectiveDirectory", effective_directory.string()},
           {"loadedCount", results.size()},
           {"activatedCount", activated_count},
+          {"failedCount", failed_count},
           {"shaders", std::move(shader_results)},
       },
   };
@@ -7023,6 +7031,9 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
         .compilation_ok = custom_shader.IsCompilationOK(),
         .activated = false,
     };
+    if (!custom_shader.removed && !custom_shader.IsCompilationOK()) {
+      result.compilation_error = custom_shader.GetCompilationException().what();
+    }
 
     if (activate) {
       details->shader_source = ShaderDetails::ShaderSource::DISK_SHADER;

@@ -415,7 +415,10 @@ The safe loop is:
 3. copy the editable HLSL into `src/games/{game}`
 4. point `devkit_set_tools_path` at your repo `bin` folder if the game has conflicting DXC DLLs
 5. point `devkit_set_live_shader_path` at that folder
-6. call `devkit_load_live_shaders`
+6. call `devkit_load_live_shaders`; a file that failed to compile lists the compiler's message as `compilationError`
+   (`failedCount` counts them) and its earlier live replacement is removed, so the game's original shader runs. With the
+   Devkit's Live Reload setting on, the Devkit loads changed files itself at each present and this call finds nothing new;
+   compile errors are then only in `ReShade.log`.
 7. verify with `devkit_get_shader` that the source is `File`
 
 Keep the live shader folder clean:
