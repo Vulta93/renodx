@@ -201,7 +201,14 @@ in its disassembly: each entry is `name`, `index` (into `floatValues`/`uintValue
   line says `row_major`; array elements start on 16-byte boundaries). Arrays of structs are labelled at element 0 only.
   `$Globals` is included; structured buffer layouts are not.
 - D3D9 pixel shader constants (`layoutParam` 5/6/7): the constant table's "Registers" rows (`c`, `i`, `b`).
-- Absent on D3D12, Vulkan and OpenGL (not resolved yet: GL locations are assigned per program at link time). An empty
+- Vulkan push constants: the SPIR-V push constant block's `OpMemberName` and `OpMemberDecorate ... Offset` (word =
+  Offset / 4, as `vkCmdPushConstants` addresses it; 16-bit members share their 32-bit word). Scalars, vectors, matrices
+  (`MatrixStride` per column, per row when `RowMajor`) and arrays (`ArrayStride` per element) are sized from their type;
+  the next member's offset caps that size, since stride padding can overlap it, and bounds other members; the last one
+  runs to the end of the captured words. Modules run through spirv-remap keep the offsets but lose the names, so the
+  list is empty; it is also empty when the active pixel or compute shader declares no push constant block (a push that
+  only the vertex shader reads).
+- Absent on D3D12 and OpenGL (not resolved yet: GL locations are assigned per program at link time). An empty
   list means the game stripped the reflection, or no named variable starts inside the captured words.
 
 Constant buffer binds in snapshot draws (`constantBuffers`, with or without values) are the pixel or compute stage's, like

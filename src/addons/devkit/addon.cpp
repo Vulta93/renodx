@@ -32,6 +32,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
+#include <set>
 #include <shared_mutex>
 #include <span>
 #include <sstream>
@@ -189,13 +191,15 @@ struct ResourceBind {
 };
 
 // A named constant from the shader's own reflection in its disassembly: an SM4/5 cbuffer member (words from the buffer
-// start) or an SM2/3 constant table entry (float and int register N at word 4 * N, bool register N at word N).
+// start), an SM2/3 constant table entry (float and int register N at word 4 * N, bool register N at word N) or a
+// SPIR-V push constant block member (word = byte Offset / 4, as vkCmdPushConstants addresses it).
 struct ConstantVariable {
   enum class RegisterSet : std::uint8_t {
     CONSTANT_BUFFER = 0,
     FLOAT4 = 1,
     INT4 = 2,
     BOOL = 3,
+    PUSH_CONSTANT = 4,
   } register_set = RegisterSet::CONSTANT_BUFFER;
   uint32_t slot = 0;
   uint32_t first_word = 0;
@@ -284,6 +288,8 @@ struct PipelineBindDetails {
 struct PushConstantValues {
   uint32_t first_written = UINT32_MAX;
   std::vector<uint32_t> values;
+  // Recorded draws only: the reflected register set that names these values, std::nullopt when nothing does.
+  std::optional<ConstantVariable::RegisterSet> named_by = std::nullopt;
 };
 
 using PushConstantKey = std::tuple<uint64_t, uint32_t, reshade::api::shader_stage>;
@@ -764,6 +770,25 @@ std::optional<std::vector<ResourceBind>> GetResourceBindsForShaderDetails(
     std::map<std::string, SpirvVariable> variables;
     std::map<std::string, uint32_t> descriptor_sets;
     std::map<std::string, uint32_t> descriptor_bindings;
+    // Push constant block layout: member names and byte offsets per struct type, plus what sizes the members.
+    std::map<std::string, std::map<uint32_t, std::string>> member_names;
+    std::map<std::string, std::map<uint32_t, uint32_t>> member_offsets;
+    std::map<std::string, std::map<uint32_t, uint32_t>> member_matrix_strides;
+    std::map<std::string, std::set<uint32_t>> row_major_members;
+    std::map<std::string, std::vector<std::string>> struct_member_type_ids;
+    std::map<std::string, uint32_t> array_strides;
+    std::map<std::string, uint32_t> scalar_bytes;
+    struct CompositeType {
+      std::string element_type_id;  // vector: component type; matrix: column vector type
+      uint32_t element_count = 0u;
+    };
+    std::map<std::string, CompositeType> composite_types;
+    struct ArrayType {
+      std::string element_type_id;
+      std::string length_constant_id;
+    };
+    std::map<std::string, ArrayType> array_types;
+    std::map<std::string, uint32_t> constant_values;
 
     auto next_token = [](std::string_view& text) -> std::string_view {
       text = StringViewTrimStart(text);
@@ -812,6 +837,34 @@ std::optional<std::vector<ResourceBind>> GetResourceBindsForShaderDetails(
           type_block_decorations[std::string(id)] = std::string(decoration);
           continue;
         }
+        if (decoration == "ArrayStride") {
+          FromStringView(value_token, array_strides[std::string(id)]);
+          continue;
+        }
+        continue;
+      }
+
+      if (first_token == "OpMemberName" || first_token == "OpMemberDecorate") {
+        auto type_id = next_token(rest);
+        auto member_token = next_token(rest);
+        auto value_token = next_token(rest);
+        if (type_id.empty() || member_token.empty() || value_token.empty()) continue;
+        uint32_t member = 0u;
+        FromStringView(member_token, member);
+
+        if (first_token == "OpMemberName") {
+          if (value_token.size() > 2u && value_token.front() == '"' && value_token.back() == '"') {
+            member_names[std::string(type_id)][member] = std::string(value_token.substr(1u, value_token.size() - 2u));
+          }
+          continue;
+        }
+        if (value_token == "Offset") {
+          FromStringView(next_token(rest), member_offsets[std::string(type_id)][member]);
+        } else if (value_token == "MatrixStride") {
+          FromStringView(next_token(rest), member_matrix_strides[std::string(type_id)][member]);
+        } else if (value_token == "RowMajor") {
+          row_major_members[std::string(type_id)].insert(member);
+        }
         continue;
       }
 
@@ -828,6 +881,43 @@ std::optional<std::vector<ResourceBind>> GetResourceBindsForShaderDetails(
             .type_id = std::string(type_id),
             .storage_class = std::string(storage_class),
         };
+        continue;
+      }
+      if (opcode == "OpTypeFloat" || opcode == "OpTypeInt") {
+        uint32_t width = 0u;
+        FromStringView(next_token(rest), width);
+        scalar_bytes[std::string(first_token)] = width / 8u;
+        continue;
+      }
+      if (opcode == "OpTypeVector" || opcode == "OpTypeMatrix") {
+        auto element_type_id = next_token(rest);
+        uint32_t element_count = 0u;
+        FromStringView(next_token(rest), element_count);
+        composite_types[std::string(first_token)] = {
+            .element_type_id = std::string(element_type_id),
+            .element_count = element_count,
+        };
+        continue;
+      }
+      if (opcode == "OpTypeArray") {
+        auto element_type_id = next_token(rest);
+        auto length_id = next_token(rest);
+        array_types[std::string(first_token)] = {
+            .element_type_id = std::string(element_type_id),
+            .length_constant_id = std::string(length_id),
+        };
+        continue;
+      }
+      if (opcode == "OpTypeStruct") {
+        auto& member_type_ids = struct_member_type_ids[std::string(first_token)];
+        for (auto member_type_id = next_token(rest); !member_type_id.empty(); member_type_id = next_token(rest)) {
+          member_type_ids.emplace_back(member_type_id);
+        }
+        continue;
+      }
+      if (opcode == "OpConstant") {
+        next_token(rest);  // result type
+        FromStringView(next_token(rest), constant_values[std::string(first_token)]);
         continue;
       }
       if (opcode == "OpTypePointer") {
@@ -902,6 +992,69 @@ std::optional<std::vector<ResourceBind>> GetResourceBindsForShaderDetails(
 
       shader_details->resource_binds->push_back(resource_bind);
     }
+
+    // The push constant block: members at their byte offsets. A scalar, vector, matrix (MatrixStride per column, or per
+    // row when RowMajor) or array (ArrayStride per element) is sized from its type; the next member's offset caps that
+    // size, since stride padding can overlap it, and bounds members of other types; the last of those runs to the end
+    // of the captured words. Stripped modules (spirv-remap) keep the offsets but have no member names.
+    std::vector<ConstantVariable> constant_variables;
+    for (const auto& [variable_id, variable] : variables) {
+      if (variable.storage_class != "PushConstant") continue;
+      auto block_type_id = variable.type_id;
+      if (auto pair = pointer_pointee_ids.find(block_type_id); pair != pointer_pointee_ids.end()) {
+        block_type_id = pair->second;
+      }
+      const auto offsets_pair = member_offsets.find(block_type_id);
+      const auto names_pair = member_names.find(block_type_id);
+      if (offsets_pair == member_offsets.end() || names_pair == member_names.end()) continue;
+      const auto& offsets = offsets_pair->second;
+      const auto& member_type_ids = struct_member_type_ids[block_type_id];
+      const auto& matrix_strides = member_matrix_strides[block_type_id];
+      const auto& row_majors = row_major_members[block_type_id];
+      for (const auto& [member, name] : names_pair->second) {
+        const auto offset_pair = offsets.find(member);
+        if (offset_pair == offsets.end()) continue;
+        const uint32_t first_byte = offset_pair->second;
+
+        uint32_t byte_size = UINT32_MAX;
+        if (member < member_type_ids.size()) {
+          const auto& type_id = member_type_ids[member];
+          if (auto scalar_pair = scalar_bytes.find(type_id); scalar_pair != scalar_bytes.end()) {
+            byte_size = scalar_pair->second;
+          } else if (auto array_pair = array_types.find(type_id); array_pair != array_types.end()) {
+            const auto stride_pair = array_strides.find(type_id);
+            const auto length_pair = constant_values.find(array_pair->second.length_constant_id);
+            if (stride_pair != array_strides.end() && length_pair != constant_values.end()) {
+              byte_size = stride_pair->second * length_pair->second;
+            }
+          } else if (auto composite_pair = composite_types.find(type_id); composite_pair != composite_types.end()) {
+            const auto& [element_type_id, element_count] = composite_pair->second;
+            const auto column_pair = composite_types.find(element_type_id);
+            const auto stride_pair = matrix_strides.find(member);
+            if (column_pair != composite_types.end() && stride_pair != matrix_strides.end()) {
+              const uint32_t stride_count =
+                  (row_majors.contains(member) ? column_pair->second.element_count : element_count);
+              byte_size = stride_pair->second * stride_count;
+            } else if (auto component_pair = scalar_bytes.find(element_type_id); component_pair != scalar_bytes.end()) {
+              byte_size = component_pair->second * element_count;
+            }
+          }
+        }
+        for (const auto other_first_byte : offsets | std::views::values) {
+          if (other_first_byte > first_byte) {
+            byte_size = std::min(byte_size, other_first_byte - first_byte);
+          }
+        }
+        constant_variables.push_back(ConstantVariable{
+            .register_set = ConstantVariable::RegisterSet::PUSH_CONSTANT,
+            .first_word = first_byte / 4u,
+            .word_count = (byte_size == UINT32_MAX ? UINT32_MAX : (byte_size + 3u) / 4u),
+            .name = name,
+        });
+      }
+    }
+    shader_details->constant_variables =
+        std::make_shared<const std::vector<ConstantVariable>>(std::move(constant_variables));
 
     return shader_details->resource_binds;
   }
@@ -2964,14 +3117,9 @@ std::vector<DeviceData*> device_data_list;
     push_constants.reserve(draw_details.push_constants.size());
     for (const auto& [push_constant_key, pushed] : draw_details.push_constants) {
       const auto& [layout_handle, layout_param, stages] = push_constant_key;
-      // D3D9 pixel shader constants: layout parameters 5/6/7 hold the float/int/bool registers. Only SM2/3 constant
-      // tables produce these register sets; constant_buffer_values_supported excludes D3D12 root constants at the same
-      // parameters.
       std::optional<std::vector<devkit_draw_summary::ValueNameSummary>> value_names = std::nullopt;
-      if (draw_details.constant_buffer_values_supported && stages == reshade::api::shader_stage::pixel
-          && layout_param >= 5u && layout_param <= 7u) {
-        value_names = name_values(
-            static_cast<ConstantVariable::RegisterSet>(layout_param - 4u), 0u, pushed.first_written, pushed.values.size());
+      if (pushed.named_by.has_value()) {
+        value_names = name_values(pushed.named_by.value(), 0u, pushed.first_written, pushed.values.size());
       }
       push_constants.push_back(devkit_draw_summary::PushConstantSummary{
           .layout_handle = FormatHandle(layout_handle),
@@ -6388,11 +6536,26 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       if (!renodx::utils::bitwise::HasAnyFlag(stages, active_stage)) continue;
       if (bound_layout_handle.has_value() && layout_handle != bound_layout_handle.value()) continue;
       const auto captured_end = std::min<size_t>(pushed.values.size(), pushed.first_written + MAX_CAPTURED_PUSH_CONSTANT_VALUES);
+      // D3D9 pixel shader constants arrive at layout parameters 5/6/7 for the float/int/bool registers.
+      std::optional<ConstantVariable::RegisterSet> named_by = std::nullopt;
+      switch (device_api) {
+        case reshade::api::device_api::d3d9:
+          if (stages == reshade::api::shader_stage::pixel && layout_param >= 5u && layout_param <= 7u) {
+            named_by = static_cast<ConstantVariable::RegisterSet>(layout_param - 4u);
+          }
+          break;
+        case reshade::api::device_api::vulkan:
+          named_by = ConstantVariable::RegisterSet::PUSH_CONSTANT;
+          break;
+        default:
+          break;
+      }
       draw_details.push_constants.emplace(
           push_constant_key,
           PushConstantValues{
               .first_written = pushed.first_written,
               .values = {pushed.values.begin() + pushed.first_written, pushed.values.begin() + captured_end},
+              .named_by = named_by,
           });
     }
 
