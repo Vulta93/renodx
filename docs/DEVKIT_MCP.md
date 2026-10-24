@@ -81,8 +81,9 @@ ends.
 are finished (at most 120 s), with that device's snapshot summary, so no `devkit_snapshot_summary` polling is needed. It waits
 for the device's completed-snapshot id to change, so a capture that was already running when the call came also ends it.
 It fails when the device is destroyed or replaced meanwhile (its index then names another device), and at the limit: the
-request stays queued when the game presented no frame (paused in the background, minimized), and a running capture keeps
-capturing. Like the delay, it blocks other Devkit tool calls (worst case 60 s key + 30 s delay + 120 s).
+request stays queued when the game presented no frame (paused in the background, minimized), a running capture keeps
+capturing, and with neither pending (a request dropped without a capture) it says to queue a new one. Like the delay, it
+blocks other Devkit tool calls (worst case 60 s key + 30 s delay + 120 s).
 
 ### Resource inspection
 
