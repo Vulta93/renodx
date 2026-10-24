@@ -530,6 +530,19 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   HWND primary_swapchain_hwnd = nullptr;
   bool primary_swapchain_is_flip = false;
   bool is_d3d9_ex = false;
+  // The D3D11 device a RenoDX Display Proxy presents the game's frames on. It is listed only for the measuring tools
+  // (devkit_analyze_resource, devkit_watch_region): no snapshots, shader tracking, live shaders or clones.
+  bool is_display_proxy = false;
+  // Views the Devkit creates on the Display Proxy's back buffers. The proxy draws through the ReShade API, which raises
+  // no init_resource_view, so without these the back buffers have no tracked view for the measuring tools. The back
+  // buffer and its desc are kept for devkit_status, which runs on the MCP thread and must not call the proxy's
+  // single-threaded D3D11 device.
+  struct DisplayProxyBackBufferView {
+    reshade::api::resource_view view = {0u};
+    reshade::api::resource back_buffer = {0u};
+    reshade::api::resource_desc back_buffer_desc;
+  };
+  std::unordered_map<reshade::api::swapchain*, std::vector<DisplayProxyBackBufferView>> display_proxy_back_buffer_views;
   bool has_synced_addon_shaders = false;
   devkit_watch_region::Watcher watch_region_watcher;
 
@@ -2829,10 +2842,11 @@ std::vector<DeviceData*> device_data_list;
       .device_handle = FormatPointer(device),
       .api = StreamToString(device->get_api()),
       .is_d3d9_ex = device_data->is_d3d9_ex,
+      .is_display_proxy = device_data->is_display_proxy,
       .tracked_shaders = device_data->shader_details.size(),
       .captured_draws = device_data->draw_details_list.size(),
       .live_pipelines = device_data->live_pipelines.size(),
-      .swapchains = device_data->swapchain_descs.size(),
+      .swapchains = device_data->swapchain_descs.size() + device_data->display_proxy_back_buffer_views.size(),
       .snapshot_rows = device_data->snapshot_rows.size(),
       .snapshot_rows_valid = device_data->snapshot_rows_valid,
       .resource_usage_entries = device_data->resource_usage_by_handle.size(),
@@ -2845,6 +2859,19 @@ std::vector<DeviceData*> device_data_list;
         *device_data->primary_swapchain_desc,
         device_data->primary_swapchain_is_flip,
         device_data->primary_swapchain_hwnd);
+  }
+
+  for (const auto& [swapchain, back_buffer_views] : device_data->display_proxy_back_buffer_views) {
+    (void)swapchain;
+    for (const auto& back_buffer_view : back_buffer_views) {
+      summary.back_buffer_views.push_back(devkit_device_summary::BackBufferViewSummary{
+          .resource_view_handle = FormatHandle(back_buffer_view.view.handle),
+          .resource_handle = FormatHandle(back_buffer_view.back_buffer.handle),
+          .width = back_buffer_view.back_buffer_desc.texture.width,
+          .height = back_buffer_view.back_buffer_desc.texture.height,
+          .format = StreamToString(back_buffer_view.back_buffer_desc.texture.format),
+      });
+    }
   }
 
   return summary;
@@ -3318,8 +3345,9 @@ std::vector<DeviceData*> device_data_list;
   return draw_summary;
 }
 
-[[nodiscard]] auto BuildResolveDeviceIndexCallback() {
-  return [](const json& arguments) -> uint32_t {
+// Only the measuring tools accept the Display Proxy's device.
+[[nodiscard]] auto BuildResolveDeviceIndexCallback(bool accepts_display_proxy) {
+  return [accepts_display_proxy](const json& arguments) -> uint32_t {
     std::shared_lock list_lock(device_data_list_mutex);
     const auto device_count = device_data_list.size();
     const auto selected_index = device_count == 0u
@@ -3327,7 +3355,13 @@ std::vector<DeviceData*> device_data_list;
                                     : std::min<uint32_t>(
                                           device_data_index.load(std::memory_order_relaxed),
                                           static_cast<uint32_t>(device_count - 1u));
-    return devkit_device_selection::ResolveRequestedDeviceIndex(arguments, device_count, selected_index);
+    const auto device_index = devkit_device_selection::ResolveRequestedDeviceIndex(arguments, device_count, selected_index);
+    if (!accepts_display_proxy && device_data_list[device_index]->is_display_proxy) {
+      throw std::runtime_error(std::format(
+          "Device #{} is the Display Proxy's device, which only the read-back tools (devkit_analyze_resource, devkit_watch_region, devkit_dump_resource_with_hash) accept.",
+          device_index));
+    }
+    return device_index;
   };
 }
 
@@ -4712,7 +4746,16 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
         std::shared_lock list_lock(device_data_list_mutex);
         return device_data_list.size(); },
       .get_selected_device_index = []() { return device_data_index.load(std::memory_order_relaxed); },
-      .set_selected_device_index = [](uint32_t device_index) { device_data_index.store(device_index, std::memory_order_relaxed); },
+      // The selected device stays a game device: tools without deviceIndex, the overlay and the Device Proxy output window
+      // follow it.
+      .set_selected_device_index = [](uint32_t device_index) {
+        std::shared_lock list_lock(device_data_list_mutex);
+        if (device_index < device_data_list.size() && device_data_list[device_index]->is_display_proxy) {
+          throw std::runtime_error(std::format(
+              "Device #{} is the Display Proxy's device and cannot be selected; pass deviceIndex to the measuring tools instead.",
+              device_index));
+        }
+        device_data_index.store(device_index, std::memory_order_relaxed); },
       .get_pipe_name = []() { return NarrowAscii(devkit_mcp_session.server.GetPipeName()); },
       .is_connected = []() { return devkit_mcp_session.server.IsConnected(); },
       .has_active_snapshot = []() { return snapshot_device != nullptr; },
@@ -4820,6 +4863,14 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
           };
         }
         auto* device_data = device_data_list[device_index];
+        if (device_data->is_display_proxy) {
+          const auto error = std::format("Device #{} is the Display Proxy's device, which takes no snapshots; snapshot the game's device.", device_index);
+          return ToolResult{
+              .text = error,
+              .structured_content = json{{"error", error}},
+              .is_error = true,
+          };
+        }
 
         auto* device = device_data->device;
         reshade::api::device* active_snapshot_device = snapshot_device;
@@ -4930,36 +4981,36 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
   const devkit_mcp_runtime::RegistrationContext context = {
       .build_snapshot_tools_context = BuildSnapshotToolsContext,
       .build_shader_inspection_tool_context = []() { return devkit_shader_inspection::ToolContext{
-                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(),
+                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(false),
                                                          .get_shader_summary = BuildTrackedShaderSummaryForDevice,
                                                          .get_disassembly = BuildMcpShaderDisassemblySection,
                                                          .get_decompilation = BuildMcpShaderDecompilationSection,
                                                      }; },
       .build_live_shaders_tool_context = []() { return devkit_live_shaders::ToolContext{
-                                                    .resolve_device_index = BuildResolveDeviceIndexCallback(),
+                                                    .resolve_device_index = BuildResolveDeviceIndexCallback(false),
                                                     .dump_shader = DumpTrackedShaderForMcp,
                                                     .set_live_shader_path = SetLiveShaderPathForMcp,
                                                     .load_live_shaders = LoadLiveShadersForMcp,
                                                     .unload_live_shaders = UnloadLiveShadersForMcp,
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
-                                                        .resolve_device_index = BuildResolveDeviceIndexCallback(),
+                                                        .resolve_device_index = BuildResolveDeviceIndexCallback(true),
                                                         .enqueue_request = EnqueuePendingResourceAnalysisRequest,
                                                         .cancel_request = CancelPendingResourceAnalysisRequest,
                                                     }; },
       .build_watch_region_tool_context = []() { return devkit_watch_region::ToolContext{
-                                                    .resolve_device_index = BuildResolveDeviceIndexCallback(),
+                                                    .resolve_device_index = BuildResolveDeviceIndexCallback(true),
                                                     .enqueue_request = EnqueuePendingWatchRegionRequest,
                                                     .cancel_request = CancelPendingWatchRegionRequest,
                                                     .collect_snapshot_commands = CollectFrameOverview,
                                                 }; },
       .build_resource_clone_tool_context = []() { return devkit_resource_clone::ToolContext{
-                                                      .resolve_device_index = BuildResolveDeviceIndexCallback(),
+                                                      .resolve_device_index = BuildResolveDeviceIndexCallback(false),
                                                       .set_resource_clone = SetResourceCloneForMcp,
                                                       .replace_resource_with_file = ReplaceTrackedResourceWithFileForMcp,
                                                   }; },
       .build_texture_replace_tool_context = []() { return devkit_texture_replace::ToolContext{
-                                                       .resolve_device_index = BuildResolveDeviceIndexCallback(),
+                                                       .resolve_device_index = BuildResolveDeviceIndexCallback(false),
                                                        .set_enabled = SetTextureReplaceEnabledForMcp,
                                                        .reload_boot_cache = ReloadBootTextureCacheForMcp,
                                                        .set_rules = SetTextureReplaceRulesForMcp,
@@ -5022,36 +5073,44 @@ uint64_t StartSnapshotFrame(DeviceData* device_data) {
 }
 
 void OnInitDevice(reshade::api::device* device) {
-  if (renodx::utils::device_proxy::IsCreatingProxyDevice()
-      || renodx::utils::device_proxy::IsProxyDevice(device)) {
-    return;
-  }
+  // The Display Proxy's D3D11 device (a RenoDX proxy mod or the Devkit's Device Proxy) is not a game device. It is listed
+  // after the game's device as a measure-only device, so that the final HDR10 output it presents can be measured. Its
+  // device is not yet known to IsProxyDevice while D3D11CreateDevice runs, hence IsCreatingProxyDevice.
+  const bool is_display_proxy = renodx::utils::device_proxy::IsCreatingProxyDevice()
+                                || renodx::utils::device_proxy::IsProxyDevice(device);
 
   const auto device_api = device->get_api();
-  if (devkit_primary_device_api.load(std::memory_order_acquire)
-          == static_cast<uint32_t>(reshade::api::device_api::d3d9)
-      && device_api != reshade::api::device_api::d3d9) {
-    return;
-  }
-  if (device_api != reshade::api::device_api::d3d9) {
-    std::shared_lock list_lock(device_data_list_mutex);
-    for (auto* existing_device_data : device_data_list) {
-      if (existing_device_data == nullptr || existing_device_data->device == nullptr) continue;
-      if (existing_device_data->device->get_api() == reshade::api::device_api::d3d9) {
-        return;
+  // Other devices a D3D9 game creates next to its own (video decoders, overlays) stay unlisted.
+  if (!is_display_proxy) {
+    if (devkit_primary_device_api.load(std::memory_order_acquire)
+            == static_cast<uint32_t>(reshade::api::device_api::d3d9)
+        && device_api != reshade::api::device_api::d3d9) {
+      return;
+    }
+    if (device_api != reshade::api::device_api::d3d9) {
+      std::shared_lock list_lock(device_data_list_mutex);
+      for (auto* existing_device_data : device_data_list) {
+        if (existing_device_data == nullptr || existing_device_data->device == nullptr) continue;
+        if (existing_device_data->device->get_api() == reshade::api::device_api::d3d9) {
+          return;
+        }
       }
     }
   }
 
   auto* device_data = renodx::utils::data::Create<DeviceData>(device);
   std::unique_lock lock(device_data_list_mutex);
+  device_data->device = device;
+  device_data->is_display_proxy = is_display_proxy;
+  device_data_list.emplace_back(device_data);
+  if (is_display_proxy) return;
+
   uint32_t unknown_api = 0u;
   devkit_primary_device_api.compare_exchange_strong(
       unknown_api,
       static_cast<uint32_t>(device_api),
       std::memory_order_acq_rel,
       std::memory_order_acquire);
-  device_data->device = device;
   device_data->is_d3d9_ex = renodx::utils::device::IsD3D9ExDevice(device);
   device_data->watch_region_watcher.begin_linked_snapshot = [device_data]() -> std::optional<uint64_t> {
     if (snapshot_queued_device != nullptr) return std::nullopt;
@@ -5072,7 +5131,6 @@ void OnInitDevice(reshade::api::device* device) {
         .cmd_list_recording = command_list_data->recording,
     };
   };
-  device_data_list.emplace_back(device_data);
 
   if (g_device_proxy_dx9ex_bootstrap_pending && device->get_api() == reshade::api::device_api::d3d9) {
     const bool shared_proxy_was_active = IsSharedDeviceProxyActive();
@@ -5120,7 +5178,7 @@ void OnDestroyDevice(reshade::api::device* device) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
   devkit_watch_region::Shutdown(&device_data->watch_region_watcher, device);
-  if (GetSelectedDeviceData() == device_data) {
+  if (!device_data->is_display_proxy && GetSelectedDeviceData() == device_data) {
     DestroyDeviceProxyOutputWindow();
   }
   std::unique_lock list_lock(device_data_list_mutex);
@@ -5232,12 +5290,36 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
       || renodx::utils::device_proxy::IsCreatingProxySwapchain()
       || renodx::utils::device_proxy::IsProxyDevice(device)) {
     auto* hwnd = static_cast<HWND>(swapchain->get_hwnd());
-    const std::unique_lock<std::shared_mutex> lock(pending_created_swapchain_mutex);
-    if (hwnd != nullptr) {
-      pending_created_swapchain_descs.erase(hwnd);
-    } else {
-      pending_created_swapchain_fallback_desc.reset();
+    {
+      const std::unique_lock<std::shared_mutex> lock(pending_created_swapchain_mutex);
+      if (hwnd != nullptr) {
+        pending_created_swapchain_descs.erase(hwnd);
+      } else {
+        pending_created_swapchain_fallback_desc.reset();
+      }
     }
+    auto* proxy_device_data = renodx::utils::data::Get<DeviceData>(device);
+    if (proxy_device_data == nullptr || !proxy_device_data->is_display_proxy) return;
+
+    std::vector<DeviceData::DisplayProxyBackBufferView> back_buffer_views;
+    for (uint32_t index = 0u; index < swapchain->get_back_buffer_count(); ++index) {
+      const auto back_buffer = swapchain->get_back_buffer(index);
+      const auto back_buffer_desc = device->get_resource_desc(back_buffer);
+      const reshade::api::resource_view_desc view_desc(reshade::api::format_to_default_typed(back_buffer_desc.texture.format));
+      reshade::api::resource_view view = {0u};
+      if (!device->create_resource_view(back_buffer, reshade::api::resource_usage::render_target, view_desc, &view)) {
+        reshade::log::message(reshade::log::level::warning, "devkit::OnInitSwapchain(failed to create a view on a Display Proxy back buffer)");
+        continue;
+      }
+      renodx::utils::resource::OnInitResourceView(device, back_buffer, reshade::api::resource_usage::render_target, view_desc, view);
+      back_buffer_views.push_back({
+          .view = view,
+          .back_buffer = back_buffer,
+          .back_buffer_desc = back_buffer_desc,
+      });
+    }
+    const std::unique_lock lock(proxy_device_data->mutex);
+    proxy_device_data->display_proxy_back_buffer_views[swapchain] = std::move(back_buffer_views);
     return;
   }
 
@@ -5297,10 +5379,27 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
 
 void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool resize) {
   auto* device = swapchain->get_device();
-  if (renodx::utils::device_proxy::IsProxyDevice(device)) return;
-
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
+
+  if (device_data->is_display_proxy) {
+    // Released before a resize too: DXGI ResizeBuffers fails while a view still references a back buffer.
+    std::vector<DeviceData::DisplayProxyBackBufferView> back_buffer_views;
+    {
+      const std::unique_lock lock(device_data->mutex);
+      if (auto pair = device_data->display_proxy_back_buffer_views.find(swapchain);
+          pair != device_data->display_proxy_back_buffer_views.end()) {
+        back_buffer_views = std::move(pair->second);
+        device_data->display_proxy_back_buffer_views.erase(pair);
+      }
+    }
+    for (const auto& back_buffer_view : back_buffer_views) {
+      renodx::utils::resource::OnDestroyResourceView(device, back_buffer_view.view);
+      device->destroy_resource_view(back_buffer_view.view);
+    }
+    return;
+  }
+  if (renodx::utils::device_proxy::IsProxyDevice(device)) return;
 
   {
     const std::unique_lock<std::shared_mutex> lock(device_data->mutex);
@@ -5325,6 +5424,7 @@ void OnInitCommandList(reshade::api::command_list* cmd_list) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(cmd_list->get_device());
   if (device_data == nullptr) return;
   devkit_watch_region::OnCommandListReset(&device_data->watch_region_watcher, cmd_list, false);
+  if (device_data->is_display_proxy) return;
   renodx::utils::data::Create<CommandListData>(cmd_list)->recording = ++command_list_recordings;
 }
 
@@ -5370,7 +5470,7 @@ void OnInitPipelineTrackAddons(
     const reshade::api::pipeline_subobject* subobjects,
     reshade::api::pipeline pipeline) {
   auto* data = renodx::utils::data::Get<DeviceData>(device);
-  if (data == nullptr) return;
+  if (data == nullptr || data->is_display_proxy) return;
   if (data->has_synced_addon_shaders) return;
 
   bool found_replacement = false;
@@ -5396,7 +5496,7 @@ void OnInitPipeline(
   if (pipeline.handle == 0u) return;
 
   auto* data = renodx::utils::data::Get<DeviceData>(device);
-  if (data == nullptr) return;
+  if (data == nullptr || data->is_display_proxy) return;
   const std::unique_lock lock(data->mutex);
 
   // Blend states are recorded whatever the layout: D3D12 pipeline states whose root signature is embedded in the shader
@@ -5964,6 +6064,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       &device_data->watch_region_watcher,
       cmd_list,
       draw_method == DrawDetails::DrawMethods::DISPATCH);
+  if (device_data->is_display_proxy) return false;
 
   struct BoundShader {
     reshade::api::pipeline_stage stage;
@@ -10488,6 +10589,8 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
         assert(device_data->device != nullptr);
         continue;
       }
+      // The overlay's panes work on game devices; the Display Proxy's device is for the MCP measuring tools only.
+      if (device_data->is_display_proxy) continue;
       std::stringstream s;
       s << PRINT_PTR(reinterpret_cast<uint64_t>(device_data->device));
       s << " (" << device_data->device->get_api() << ")";
@@ -10499,6 +10602,11 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
       if (i == selected_device_index) {
         data = device_data;
       }
+    }
+    // A stale selection can point at the Display Proxy's device (devkit_select_device refuses it); show the first game device.
+    if (data == nullptr && !device_options.empty()) {
+      data = device_options.front().device_data;
+      selected_device_index = device_options.front().index;
     }
 
     if (data != nullptr) {
@@ -10668,8 +10776,8 @@ void OnExecuteCommandList(
 // The watch's end-of-frame work runs here rather than in OnPresent: ReShade raises reshade_present after every add-on's
 // present handler, so writes made by other add-ons during present are included whatever the add-on load order.
 void OnReShadePresent(reshade::api::effect_runtime* runtime) {
-  // Checked before the proxy-device return: with a display proxy the runtime that receives input is the proxy's. The
-  // shared lock keeps the common case (no key armed) cheap on the presenting thread.
+  // Checked before the device lookup: with a display proxy the runtime that receives input is the proxy's. The shared
+  // lock keeps the common case (no key armed) cheap on the presenting thread.
   bool armed_key_pressed = false;
   {
     std::shared_lock key_lock(capture_key_state.mutex);
@@ -10681,8 +10789,6 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
   }
 
   auto* device = runtime->get_device();
-  if (renodx::utils::device_proxy::IsProxyDevice(device)) return;
-
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
 
@@ -10702,6 +10808,9 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
   }
   std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> other_swap_chain_requests;
   std::erase_if(pending_frame_end_requests, [&](const std::shared_ptr<devkit_resource_analysis::PendingRequest>& request) {
+    // A view destroyed since the request (a Display Proxy view released by a resize) is not asked for its resource: the
+    // analysis reports it as untracked.
+    if (!renodx::utils::resource::IsKnownResourceView(request->resource_view)) return false;
     const auto resource = renodx::utils::resource::GetResourceFromView(device, request->resource_view);
     const bool is_other_back_buffer = renodx::utils::swapchain::IsBackBuffer(resource)
                                       && std::ranges::find(own_back_buffer_handles, resource.handle) == own_back_buffer_handles.end();
@@ -10719,6 +10828,7 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
     auto* cmd_list = runtime_queue->get_immediate_command_list();
     for (const auto& request : pending_frame_end_requests) {
       request->frame_end_queue = runtime_queue;
+      if (!renodx::utils::resource::IsKnownResourceView(request->resource_view)) continue;
       const auto resource = renodx::utils::resource::GetResourceFromView(device, request->resource_view);
       if (std::ranges::find(own_back_buffer_handles, resource.handle) == own_back_buffer_handles.end()) continue;
       const auto back_buffer_desc = device->get_resource_desc(resource);
@@ -10890,16 +11000,16 @@ void OnPresent(
     uint32_t dirty_rect_count,
     const reshade::api::rect* dirty_rects) {
   auto* device = swapchain->get_device();
-  if (renodx::utils::device_proxy::IsProxyDevice(device)) return;
-
   DeviceData* data = renodx::utils::data::Get<DeviceData>(device);
   if (data == nullptr) return;
   const auto get_data = [&]() -> DeviceData* {
     return data;
   };
 
-  EnsureDevkitMcpServerStarted();
-  PumpDeviceProxyOutputWindowMessages();
+  if (!data->is_display_proxy) {
+    EnsureDevkitMcpServerStarted();
+    PumpDeviceProxyOutputWindowMessages();
+  }
 
   if (auto* device_data = get_data(); device_data != nullptr) {
     const auto device_index = GetDeviceIndex(device_data);
@@ -10914,6 +11024,8 @@ void OnPresent(
         device_data->device,
         queue,
         BuildResourceAnalysisProcessingContext());
+    // The Display Proxy's device serves only the measuring tools.
+    if (device_data->is_display_proxy) return;
 
     std::deque<std::shared_ptr<PendingLiveShaderRequest>> pending_live_shader_requests;
     {

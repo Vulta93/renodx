@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <include/reshade.hpp>
 
@@ -61,12 +62,33 @@ inline void to_json(json& j, const PrimarySwapchainSummary& value) {
   }
 }
 
+// A view the Devkit created on a Display Proxy back buffer, to pass as resourceViewHandle to the measuring tools.
+struct BackBufferViewSummary {
+  std::string resource_view_handle;
+  std::string resource_handle;
+  std::uint32_t width = 0u;
+  std::uint32_t height = 0u;
+  std::string format;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const BackBufferViewSummary& value) {
+  j = {
+      {"resourceViewHandle", value.resource_view_handle},
+      {"resourceHandle", value.resource_handle},
+      {"width", value.width},
+      {"height", value.height},
+      {"format", value.format},
+  };
+}
+
 struct DeviceSummary {
   std::size_t index = 0u;
   bool is_selected = false;
   std::string device_handle;
   std::string api;
   bool is_d3d9_ex = false;
+  bool is_display_proxy = false;
   std::size_t tracked_shaders = 0u;
   std::size_t captured_draws = 0u;
   std::size_t live_pipelines = 0u;
@@ -77,6 +99,7 @@ struct DeviceSummary {
   bool snapshot_queued = false;
   bool snapshot_active = false;
   std::optional<PrimarySwapchainSummary> primary_swapchain = std::nullopt;
+  std::vector<BackBufferViewSummary> back_buffer_views;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -87,6 +110,7 @@ inline void to_json(json& j, const DeviceSummary& value) {
       {"deviceHandle", value.device_handle},
       {"api", value.api},
       {"isD3D9Ex", value.is_d3d9_ex},
+      {"isProxy", value.is_display_proxy},
       {"trackedShaders", value.tracked_shaders},
       {"capturedDraws", value.captured_draws},
       {"livePipelines", value.live_pipelines},
@@ -99,6 +123,9 @@ inline void to_json(json& j, const DeviceSummary& value) {
   };
   if (value.primary_swapchain.has_value()) {
     j["primarySwapchain"] = value.primary_swapchain.value();
+  }
+  if (!value.back_buffer_views.empty()) {
+    j["backBufferViews"] = value.back_buffer_views;
   }
 }
 

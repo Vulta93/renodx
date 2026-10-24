@@ -477,13 +477,45 @@ The PNG is for quick visual inspection, not for HDR truth.
   effects and overlay, the same point as the watch's end-of-frame measurement. Includes the ReShade menu, FPS/clock and any
   active effect such as Lilium: disable them for clean numbers. A back buffer is read at the frame end of its own swap chain
   (as the watch does). Needs a swap chain with a ReShade effect runtime on the game's device (otherwise the call times out
-  after 15 s; so does a D3D9 present that ReShade skips). Not verified with a RenoDX DX9 proxy mod, where the effect
-  runtime runs on the proxy device: expect the timeout there and use `present`. On Vulkan the analysis cannot flush
+  after 15 s; so does a D3D9 present that ReShade skips). With a RenoDX DX9 proxy mod the effect runtime runs on the
+  Display Proxy's device, so `frame_end` on the D3D9 device is expected to time out: measure the final output on the proxy
+  device instead (see "Display Proxy device" below). On Vulkan the analysis cannot flush
   ReShade's immediate command list and wait inside `reshade_present` (that would submit ReShade's effect commands without
   the present's wait semaphores). There a back buffer of the presenting swap chain is copied into a Devkit-owned texture on
   that list, which ReShade submits with the semaphores at present, and the analysis reads the copy in `finish_present`
   (the same split the watch uses for its stats signal). Any other texture asked for with `frame_end` on Vulkan is read
   after the present as it is, which is the same as `present` for it.
+
+### Display Proxy device
+
+A RenoDX Display Proxy (a DX9 or OpenGL proxy mod such as `princeofpersiaww`, or the Devkit's own Device Proxy) copies the
+game's frame into a D3D11 device and swap chain it creates (`utils/device_proxy.hpp`), draws its swap-chain pass there and
+presents HDR10 on it. The game's device only holds the float intermediates; the encoded output exists only on that D3D11
+device. The Devkit lists it after the game's device, measure-only:
+
+- `devkit_status` shows it with `api: d3d11`, `isProxy: true` and `backBufferViews` (one entry per back buffer:
+  `resourceViewHandle`, `resourceHandle`, `width`, `height`, `format`). The proxy draws through the ReShade API, which raises
+  no `init_resource_view`, so the Devkit creates these render-target views itself when the swap chain starts (and releases
+  them before every resize, which DXGI requires) and registers them with `utils::resource` so the measuring tools accept them.
+- Measure the final output with `devkit_analyze_resource`, `deviceIndex` of the proxy, one of its `backBufferViews` as
+  `resourceViewHandle`, `signal: pq` and `measurePoint: frame_end`. `present` reads inside the Devkit's handler for the
+  proxy's present, which can run before the mod's handler draws the swap-chain pass (handlers run in load order). ReShade's
+  overlay and effects (Lilium) run on the proxy's own effect runtime (its own ReShade ini, usually `ReShade2.ini` in the
+  ReShade base folder), so `frame_end` includes them: close the menu and disable them first. Without that runtime
+  (`[INSTALL] MaxEffectRuntimes` set to 1) `frame_end` on the proxy times out after 15 s. ReShade's D3D11 swap chain exposes
+  one back buffer, so there is one view per proxy swap chain; after a resize or a proxy restart it has a new handle, so
+  read `devkit_status` again (a request on a released view fails as not tracked).
+- `devkit_watch_region` works on those views, but the proxy pass is drawn through the ReShade API and is never a writer, so
+  only `endOfWatch` (and `verify` at that point) is meaningful. `withSnapshot` links nothing on this device.
+  `devkit_dump_resource_with_hash` also reads them.
+- `devkit_select_device`, `devkit_queue_snapshot`, shader inspection (`devkit_get_shader`, `devkit_dump_shader`), live
+  shaders, resource clones and texture replacement return an error for its index. The snapshot listings
+  (`devkit_snapshot_summary`, `devkit_list_draws`, `devkit_get_draw`, `devkit_list_shaders`, `devkit_frame_overview`,
+  `devkit_list_replacements`) return empty results for it. The overlay does not list it. The device handlers keep only what
+  the watch needs on it (command list and lifetime hooks); no shaders, pipelines or draws are tracked.
+- The game's device is listed first and stays the selected device, so tools without `deviceIndex` keep working on it (the
+  proxy is created at the game's first present and torn down with the game's device). Other non-D3D9 devices of a D3D9
+  game (video, overlays) stay unlisted, as before.
 
 ### Colour statistics (saturation and hue)
 

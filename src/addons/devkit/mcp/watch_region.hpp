@@ -2731,10 +2731,13 @@ inline void ProcessAtFrameEnd(
   // withSnapshot: the snapshot must record the first counted frame, so it starts at the frame end before it (the watch's
   // start on D3D9/D3D11/OpenGL, the end of the warm-up frame on D3D12/Vulkan). Called without the watcher lock.
   const auto begin_linked_snapshot = [&](const std::shared_ptr<Request>& request) {
-    std::optional<std::uint64_t> snapshot_id = std::nullopt;
-    if (watcher->begin_linked_snapshot) {
-      snapshot_id = watcher->begin_linked_snapshot();
+    // Unset on a device the Devkit takes no snapshots of.
+    if (!watcher->begin_linked_snapshot) {
+      std::scoped_lock request_lock(request->mutex);
+      request->snapshot_link_error = "This device takes no snapshots, so the writers are not linked to a snapshot.";
+      return;
     }
+    const auto snapshot_id = watcher->begin_linked_snapshot();
     std::scoped_lock request_lock(request->mutex);
     if (snapshot_id.has_value()) {
       request->linked_snapshot_id = snapshot_id;
