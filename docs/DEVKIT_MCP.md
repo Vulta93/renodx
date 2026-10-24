@@ -337,9 +337,9 @@ thousands of draws:
     that also draw in a pass of another role (`ui`, `tonemap`, `output`, `other`; a pass that is both tonemap and output
     counts as tonemap). A replacement of such a hash changes every one of those passes, as when one shader draws both UI
     and scene, so its callback has to tell them apart (for example by render target or by the bound texture). Each lists
-    up to 8 passes, candidate passes first, with `firstDrawOfShader` (that shader's first draw in the pass, for
-    `devkit_get_draw`); at most 16 are listed, the one with the latest first candidate pass first, and `sharedShaderCount`
-    counts them all.
+    up to 8 passes (the first pass of each role, then the others in frame order), with `firstDrawOfShader` (that
+    shader's first draw in the pass, for `devkit_get_draw`); at most 16 are listed, the one with the latest first
+    candidate pass first, and `sharedShaderCount` counts them all.
 
 Limits: hints are candidates from formats, sizes, blend state and command order, never proof; the skills require proving
 the signal (`devkit_get_draw`, the shader, `devkit_watch_region`) before calling a pass the tonemap. Snapshots record no

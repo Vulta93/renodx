@@ -932,25 +932,42 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     }
   }
   constexpr std::size_t MAX_SHARED_SHADERS = 16u;
-  std::vector<std::pair<std::uint32_t, std::vector<ShaderPassUse>*>> shared_shader_uses;
-  for (auto& [shader_hash, uses] : uses_by_shader) {
+  struct SharedShader {
+    std::uint32_t shader_hash = 0u;
+    std::size_t first_candidate_pass = 0u;
+    // The first pass of each role, so the listed passes show why the shader is shared, then the rest in frame order.
+    std::vector<ShaderPassUse> uses;
+  };
+  std::vector<SharedShader> shared_shader_list;
+  for (const auto& [shader_hash, uses] : uses_by_shader) {
+    const auto first_candidate = std::ranges::find_if(uses, [&](const ShaderPassUse& use) { return pass_role(use.pass_index) != "other"; });
+    if (first_candidate == uses.end()) continue;
     const auto first_role = pass_role(uses.front().pass_index);
     if (std::ranges::none_of(uses, [&](const ShaderPassUse& use) { return pass_role(use.pass_index) != first_role; })) continue;
-    // Candidate passes first, so the passes that made the shader a candidate are among the listed ones.
-    std::ranges::stable_partition(uses, [&](const ShaderPassUse& use) { return pass_role(use.pass_index) != "other"; });
-    if (pass_role(uses.front().pass_index) == "other") continue;
-    shared_shader_uses.emplace_back(shader_hash, &uses);
+    auto& shared_shader = shared_shader_list.emplace_back(SharedShader{
+        .shader_hash = shader_hash,
+        .first_candidate_pass = first_candidate->pass_index,
+    });
+    for (const auto& use : uses) {
+      if (std::ranges::none_of(shared_shader.uses, [&](const ShaderPassUse& listed) { return pass_role(listed.pass_index) == pass_role(use.pass_index); })) {
+        shared_shader.uses.push_back(use);
+      }
+    }
+    for (const auto& use : uses) {
+      if (std::ranges::none_of(shared_shader.uses, [&](const ShaderPassUse& listed) { return listed.pass_index == use.pass_index; })) {
+        shared_shader.uses.push_back(use);
+      }
+    }
   }
   // Latest first candidate pass first, since the end of the frame (output, UI) matters most when the list is cut.
-  std::ranges::sort(shared_shader_uses, [](const auto& left, const auto& right) {
-    return left.second->front().pass_index > right.second->front().pass_index;
+  std::ranges::sort(shared_shader_list, [](const SharedShader& left, const SharedShader& right) {
+    return left.first_candidate_pass > right.first_candidate_pass;
   });
-  const auto shared_shader_count = shared_shader_uses.size();
+  const auto shared_shader_count = shared_shader_list.size();
   json shared_shaders = json::array();
-  for (const auto& [shader_hash, uses_pointer] : shared_shader_uses | std::views::take(MAX_SHARED_SHADERS)) {
-    const auto& uses = *uses_pointer;
+  for (const auto& shared_shader : shared_shader_list | std::views::take(MAX_SHARED_SHADERS)) {
     json pass_entries = json::array();
-    for (const auto& use : uses | std::views::take(MAX_LISTED)) {
+    for (const auto& use : shared_shader.uses | std::views::take(MAX_LISTED)) {
       pass_entries.push_back({
           {"pass", use.pass_index},
           {"firstDrawOfShader", use.first_draw},
@@ -958,8 +975,8 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       });
     }
     shared_shaders.push_back({
-        {"shaderHash", formatting::FormatShaderHash(shader_hash)},
-        {"passCount", uses.size()},
+        {"shaderHash", formatting::FormatShaderHash(shared_shader.shader_hash)},
+        {"passCount", shared_shader.uses.size()},
         {"passes", std::move(pass_entries)},
     });
   }
