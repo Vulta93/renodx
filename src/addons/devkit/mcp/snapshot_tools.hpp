@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -32,12 +34,21 @@
 #include "frame_overview.hpp"
 #include "shader_summary.hpp"
 #include "snapshot_summary.hpp"
+#include "tool_catalog.hpp"
 
 namespace renodx::addons::devkit::mcp::snapshot_tools {
 
 using json = renodx::utils::mcp::json;
 using ToolResult = renodx::utils::mcp::ToolResult;
 namespace mcp_arguments = renodx::utils::mcp::arguments;
+
+struct SnapshotCompletion {
+  // Tells a device from the one that takes its index after it is destroyed.
+  std::uintptr_t device_handle = 0u;
+  std::uint64_t completed_snapshot_id = 0u;
+  bool queued = false;
+  bool active = false;
+};
 
 struct ToolContext {
   std::function<std::size_t()> get_device_count;
@@ -49,6 +60,7 @@ struct ToolContext {
   std::function<bool()> has_queued_snapshot;
   std::function<bool(std::uint32_t)> is_snapshot_active;
   std::function<bool(std::uint32_t)> is_snapshot_queued;
+  std::function<std::optional<SnapshotCompletion>(std::uint32_t device_index)> get_snapshot_completion;
   std::function<device_summary::DeviceSummary(std::uint32_t index, bool is_selected)> build_device_summary;
   std::function<std::vector<shader_summary::TrackedShaderSummary>(
       std::uint32_t device_index,
@@ -457,7 +469,57 @@ inline ToolResult HandleQueueSnapshotTool(const json& arguments, const ToolConte
     throw std::runtime_error("The snapshot tool context is not configured.");
   }
 
-  return context.queue_snapshot(internal::ResolveDeviceIndex(arguments, context));
+  const auto wait_for_completion = mcp_arguments::GetOptional<bool>(arguments, "waitForCompletion").value_or(false);
+  const auto device_index = internal::ResolveDeviceIndex(arguments, context);
+  // Read before queueing, so a capture that finishes quickly is not missed. A capture that was already running when
+  // the call came finishes the wait too.
+  const auto completion_before = (wait_for_completion ? context.get_snapshot_completion(device_index) : std::nullopt);
+  auto queue_result = context.queue_snapshot(device_index);
+  if (queue_result.is_error || !wait_for_completion) return queue_result;
+  if (!completion_before.has_value()) {
+    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
+  }
+
+  const auto make_error = [](std::string error) {
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  };
+  const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::seconds(tool_catalog::MAX_SNAPSHOT_COMPLETION_WAIT_SECONDS);
+  while (true) {
+    const auto completion = context.get_snapshot_completion(device_index);
+    if (!completion.has_value() || completion->device_handle != completion_before->device_handle) {
+      return make_error(std::format("Device #{} was destroyed or replaced while the snapshot was pending.", device_index));
+    }
+    if (completion->completed_snapshot_id != completion_before->completed_snapshot_id) break;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      if (completion->queued) {
+        return make_error(std::format(
+            "The snapshot of device #{} did not start within {} s: the game presented no frame (paused in the background, minimized or loading?). The request stays queued.",
+            device_index,
+            tool_catalog::MAX_SNAPSHOT_COMPLETION_WAIT_SECONDS));
+      }
+      if (completion->active) {
+        return make_error(std::format(
+            "The snapshot of device #{} was not finished within {} s; it keeps capturing. Check devkit_snapshot_summary later.",
+            device_index,
+            tool_catalog::MAX_SNAPSHOT_COMPLETION_WAIT_SECONDS));
+      }
+      // Seen when the request was dropped without a capture, e.g. a device destroyed and recreated at the same address.
+      return make_error(std::format(
+          "No snapshot of device #{} finished within {} s and none is queued or capturing; queue a new one.",
+          device_index,
+          tool_catalog::MAX_SNAPSHOT_COMPLETION_WAIT_SECONDS));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  // The summary of this device, not of the selected one, which the overlay can change during the wait.
+  auto summary_arguments = arguments;
+  summary_arguments["deviceIndex"] = device_index;
+  return HandleSnapshotSummaryTool(summary_arguments, context);
 }
 
 inline ToolResult HandleListReplacementsTool(const json& arguments, const ToolContext& context) {

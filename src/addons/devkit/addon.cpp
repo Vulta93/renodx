@@ -498,6 +498,8 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   reshade::api::device* device;
   // The latest snapshot started on this device (see snapshots_started).
   uint64_t snapshot_id = 0u;
+  // The latest snapshot whose end-of-frame processing (sorting, usage maps) finished on this device.
+  uint64_t completed_snapshot_id = 0u;
   std::unordered_map<uint32_t, ShaderDetails> shader_details;
   // std::vector<CommandListData> command_list_data;
   std::vector<DrawDetails> draw_details_list;
@@ -4768,6 +4770,17 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
         std::shared_lock list_lock(device_data_list_mutex);
         if (device_index >= device_data_list.size()) return false;
         return snapshot_queued_device == device_data_list[device_index]->device; },
+      .get_snapshot_completion = [](uint32_t device_index) -> std::optional<devkit_snapshot_tools::SnapshotCompletion> {
+        std::shared_lock list_lock(device_data_list_mutex);
+        if (device_index >= device_data_list.size()) return std::nullopt;
+        auto* device_data = device_data_list[device_index];
+        std::shared_lock device_lock(device_data->mutex);
+        return devkit_snapshot_tools::SnapshotCompletion{
+            .device_handle = reinterpret_cast<std::uintptr_t>(device_data->device),
+            .completed_snapshot_id = device_data->completed_snapshot_id,
+            .queued = snapshot_queued_device == device_data->device,
+            .active = snapshot_device == device_data->device,
+        }; },
       .build_device_summary = [](uint32_t device_index, bool is_selected) {
         std::shared_lock list_lock(device_data_list_mutex);
         if (device_index >= device_data_list.size()) {
@@ -11137,6 +11150,7 @@ void OnPresent(
     device_data->snapshot_rows.clear();
     device_data->snapshot_row_layout_key = 0u;
     device_data->snapshot_rows_valid = false;
+    device_data->completed_snapshot_id = device_data->snapshot_id;
   }
 }
 
