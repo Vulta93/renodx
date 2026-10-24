@@ -8,14 +8,18 @@ Tested with the common community fixes installed (Ultimate ASI Loader, widescree
 
 | Step | What | Shaders |
 |---|---|---|
-| 1 | 3D scene, post effects and glow A into the render-target texture T (3840x2160 A8R8G8B8) | fixed function, ps_1_1 (glow A: 0x6820B8A4, 0x5EA85978, 0xCC6D19AE, additive combine 0x8B23F50B) |
-| 2 | Scene blit T → backbuffer, `r0 = t0 * c0 + (t0 - c0)` | vs 0x344B89F7, ps_1_1 0x2059E26C |
+| 1 | 3D scene and post effects into the render-target texture T (3840x2160 A8R8G8B8) | fixed function, ps_1_1 |
+| 1a | Some areas only: offset blit T → backbuffer, `rgb = t0 + (2 * c0 - 1)` (c0 = 0.52 seen: +0.04), copy backbuffer → T | vs 0x344B89F7, ps_1_1 0x10B45210, StretchRect |
+| 1b | Glow A into T | ps_1_1 0x6820B8A4, 0x5EA85978, 0xCC6D19AE, additive combine 0x8B23F50B |
+| 2 | Grade blit T → backbuffer, `r0 = t0 * c0 + (t0 - c0)` | vs 0x344B89F7, ps_1_1 0x2059E26C |
 | 3 | Copy backbuffer → T | StretchRect |
 | 4 | Glow B / blur / motion trail into T | ps_1_1 0x5EA85978, 0xCC6D19AE, composite 0x3D277874 |
 | 5 | HUD into T, copy T → backbuffer | fixed function, StretchRect |
 
 There is no tone mapper and no LUT: vanilla clips at the 8-bit targets. Values above white only come from the game's
 own blending (fires, lanterns, lit decals). ps_1_x shaders clamp their output to [0, 1], even into float16 targets.
+The offset blit clamps too: a flame at 2.30 in T comes back from it at exactly 1.0 (Devkit), so the bridge must start
+at the offset blit when it runs (step 1a is absent in some areas, e.g. the burning ship).
 
 ## What the mod does
 
@@ -24,9 +28,15 @@ own blending (fires, lanterns, lit decals). ps_1_x shaders clamp their output to
    D3D9 backbuffer is a surface). Without it the HUD and the final image went to the unseen original backbuffer.
 3. **Graded SDR bridge around the game's own glow B / blur** (`handle-sdr-tonemap-lut` graded SDR pattern). Those
    effects need values ≤ 1 (their ps_1_1 shaders clamp and their blending relies on it):
-   - pass 1 (`scene_sdr_ps`, drawn instead of the blit): the HDR scene is saved to a side texture and the effects get
-     an SDR scene, identical to vanilla up to white; above white the colour is scaled by its max channel (hue kept),
-     or clipped per channel in Vanilla mode;
+   - pass 1 (`scene_sdr_ps`, drawn instead of the first scene blit of the frame: the offset blit when it runs, else the
+     grade blit; same pattern as the T2T mod): the HDR scene is saved to a side texture and the effects get an SDR
+     scene, identical to vanilla up to white (that blit's formula applied); above white the colour is scaled by its
+     max channel (hue kept), or clipped per channel in Vanilla mode. After an offset blit, glow A and the game's own
+     grade blit run on that SDR scene, so the offset, glow A and grade reach HDR through graded_sdr, i.e. up to white
+     only. Above white the two kinds of area differ slightly: in grade-blit-only areas the HDR scene includes glow A's
+     overshoot and the grade's highlight expansion (`t0 * (1 + c0) - c0`); in offset areas it does not. The grade c0
+     measured in an offset area was ~0.01 (expansion ~1%), and flame peaks were similar (red 3.0 vs 3.2 on the burning
+     ship); glow A's bloom above white around flames is the visible part of the difference;
    - pass 2 (`scene_finish_ps`, at the first draw after glow B, or at the final copy): HDR is rebuilt on top of the
      game's result with `renodx::tonemap::UpgradeToneMap(untonemapped, neutral_sdr, graded_sdr)`, then tone mapped and
      written with `RenderIntermediatePass`, so the HUD drawn afterwards follows UI Brightness.

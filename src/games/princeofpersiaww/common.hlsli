@@ -5,13 +5,15 @@
 
 // Shared by the two addon-drawn scene passes (see addon.cpp, "Scene passes").
 float4 scene_pass_params : register(c49);  // xy = 1 / render target size
-float4 game_blit_c0 : register(c48);       // c0 of the game's scene blit
+float4 game_blit_c0 : register(c48);       // c0 of the game's grade blit; 0 (identity) when pass 1 ran at the offset blit
+float4 game_offset_c0 : register(c47);     // c0 of the game's offset blit; 0.5 (identity) when pass 1 ran at the grade blit
 
 float2 ScenePassUV(float2 vpos) {
   return (vpos + 0.5f) * scene_pass_params.xy;
 }
 
-// The game's scene blit (ps_1_1 0x2059E26C): r0 = t0 * c0 + (t0 - c0), here without the ps_1_x / 8-bit clamp.
+// The game's grade blit (ps_1_1 0x2059E26C): r0 = t0 * c0 + (t0 - c0), here without the ps_1_x / 8-bit clamp.
+// Identity when pass 1 ran at the offset blit (the grade then reaches HDR through graded_sdr).
 // Returns the linear (sRGB-decoded) HDR scene.
 float3 SceneUntonemapped(sampler2D scene_texture, float2 vpos) {
   const float4 scene = tex2Dlod(scene_texture, float4(ScenePassUV(vpos), 0.f, 0.f));

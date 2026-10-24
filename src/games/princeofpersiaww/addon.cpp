@@ -53,17 +53,21 @@ IDirect3DSurface9* GetD3D9Surface(reshade::api::resource resource) {
 
 
 // ---- Scene passes (graded SDR bridge around the game's own post effects) ----
-// Frame order (Devkit snapshots, gameplay): 3D scene, post effects and glow A -> render-target texture T; scene blit
-// T -> backbuffer (vs 0x344B89F7, ps_1_1 0x2059E26C: r0 = t0 * c0 + (t0 - c0)); copy backbuffer -> T; glow B / blur
-// (ps_1_1 0x5EA85978, 0xCC6D19AE, composite 0x3D277874) into T; HUD into T; copy T -> backbuffer.
-// Glow B / blur needs values <= 1.0 (its ps_1_1 shaders clamp and its blending relies on it: unclamped, the image
-// blurred and blew out). So:
-//   pass 1, in place of the blit: save T (HDR scene) aside, write the SDR scene (scene_sdr_ps) to the backbuffer;
+// Frame order (Devkit snapshots, gameplay): 3D scene -> render-target texture T; in some areas an offset blit
+// T -> backbuffer (vs 0x344B89F7, ps_1_1 0x10B45210: rgb = t0 + (2 * c0 - 1)) and a copy backbuffer -> T; glow A into T;
+// grade blit T -> backbuffer (vs 0x344B89F7, ps_1_1 0x2059E26C: r0 = t0 * c0 + (t0 - c0)); copy backbuffer -> T;
+// glow B / blur (ps_1_1 0x5EA85978, 0xCC6D19AE, composite 0x3D277874) into T; HUD into T; copy T -> backbuffer.
+// Both blits clamp to [0, 1] (ps_1_1), and glow B / blur needs values <= 1.0 (its blending relies on it: unclamped,
+// the image blurred and blew out). So:
+//   pass 1, in place of the first scene blit of the frame (the offset blit when it runs, else the grade blit): save T
+//           (HDR scene) aside, write the SDR scene (scene_sdr_ps) to the backbuffer. Everything after it, including
+//           the game's own grade blit after an offset blit, runs on SDR as in vanilla;
 //   pass 2, at the first draw after glow B (or at the final copy): rebuild HDR on top of the game's SDR result and
 //           tone map it (scene_finish_ps), writing back into T. The HUD drawn afterwards stays at UI Brightness.
 // Native D3D9 calls; the game's state is saved and restored with a state block, render target 0 separately.
 constexpr uint32_t SCENE_BLIT_VERTEX_SHADER = 0x344B89F7;
-constexpr uint32_t SCENE_BLIT_PIXEL_SHADER = 0x2059E26C;
+constexpr uint32_t OFFSET_BLIT_PIXEL_SHADER = 0x10B45210;
+constexpr uint32_t GRADE_BLIT_PIXEL_SHADER = 0x2059E26C;
 constexpr uint32_t GLOW_B_PIXEL_SHADERS[] = {0x5EA85978, 0xCC6D19AE, 0x3D277874};
 
 template <typename T>
@@ -84,9 +88,11 @@ struct ScenePassState {
   IDirect3DTexture9* hdr_scene = nullptr;
   IDirect3DTexture9* graded_copy = nullptr;
   uint64_t back_buffer = 0;
-  float game_c0[4] = {0.f, 0.f, 0.f, 0.f};
+  float game_c0[4] = {0.f, 0.f, 0.f, 0.f};          // grade blit c0; 0 = identity
+  float offset_c0[4] = {0.5f, 0.5f, 0.5f, 0.5f};    // offset blit c0; 0.5 = identity (2 * c0 - 1)
   bool done_this_frame = false;
   bool finish_pending = false;
+  bool finish_armed = false;
 
   // Device-owned objects must be released before IDirect3DDevice9::Reset and on device destruction.
   void Release() {
@@ -99,6 +105,7 @@ struct ScenePassState {
     SafeRelease(&vertex_shader);
     device = nullptr;
     finish_pending = false;
+    finish_armed = false;
   }
 };
 
@@ -165,6 +172,7 @@ bool DrawScenePass(IDirect3DDevice9* native_device, IDirect3DSurface9* target, I
   const float inverse_size[4] = {1.f / static_cast<float>(target_desc.Width), 1.f / static_cast<float>(target_desc.Height), 0.f, 0.f};
   native_device->SetPixelShaderConstantF(49, inverse_size, 1);
   native_device->SetPixelShaderConstantF(48, scene_pass.game_c0, 1);
+  native_device->SetPixelShaderConstantF(47, scene_pass.offset_c0, 1);
   const float vertices[4][4] = {
       {-1.f, 1.f, 0.f, 1.f},
       {1.f, 1.f, 0.f, 1.f},
@@ -204,6 +212,11 @@ bool OnScenePassCheck(reshade::api::command_list* cmd_list) {
   auto* native_device = reinterpret_cast<IDirect3DDevice9*>(reshade_device->get_native());
 
   if (scene_pass.finish_pending) {
+    // After an offset blit, glow A (same blur shaders as glow B) and the game's grade blit still have to run on SDR.
+    if (!scene_pass.finish_armed) {
+      scene_pass.finish_armed = (pixel_shader_hash == GRADE_BLIT_PIXEL_SHADER);
+      return false;
+    }
     if (std::ranges::find(GLOW_B_PIXEL_SHADERS, pixel_shader_hash) != std::end(GLOW_B_PIXEL_SHADERS)) return false;
     // First draw after glow B (the HUD, into T): finish the scene in the current render target.
     IDirect3DSurface9* current_target = nullptr;
@@ -216,9 +229,9 @@ bool OnScenePassCheck(reshade::api::command_list* cmd_list) {
   }
 
   if (scene_pass.done_this_frame) return false;
-  if (pixel_shader_hash != SCENE_BLIT_PIXEL_SHADER) return false;
+  const bool is_offset_blit = (pixel_shader_hash == OFFSET_BLIT_PIXEL_SHADER);
+  if (!is_offset_blit && pixel_shader_hash != GRADE_BLIT_PIXEL_SHADER) return false;
   if (renodx::utils::shader::GetCurrentVertexShaderHash(shader_state) != SCENE_BLIT_VERTEX_SHADER) return false;
-  scene_pass.done_this_frame = true;
 
   reshade::api::resource back_buffer_clone = {0u};
   renodx::utils::resource::GetResourceInfo({scene_pass.back_buffer}, [&](const renodx::utils::resource::ResourceInfo& info) {
@@ -228,11 +241,16 @@ bool OnScenePassCheck(reshade::api::command_list* cmd_list) {
   IDirect3DSurface9* clone_surface = GetD3D9Surface(back_buffer_clone);
   if (clone_surface == nullptr) return false;
 
-  // Only when the blit targets the backbuffer (clone).
+  // Only when the blit targets the backbuffer (clone): a blit shader drawing elsewhere must not use up the frame's pass 1.
   IDirect3DSurface9* current_target = nullptr;
   native_device->GetRenderTarget(0, &current_target);
   const bool targets_back_buffer = (current_target == clone_surface);
   SafeRelease(&current_target);
+  if (!targets_back_buffer) {
+    SafeRelease(&clone_surface);
+    return false;
+  }
+  scene_pass.done_this_frame = true;
 
   // Scene texture T: the texture the game bound at stage 0, or its float16 clone.
   IDirect3DBaseTexture9* bound_texture = nullptr;
@@ -246,7 +264,15 @@ bool OnScenePassCheck(reshade::api::command_list* cmd_list) {
           }
         });
   }
-  native_device->GetPixelShaderConstantF(0, scene_pass.game_c0, 1);
+  // The saved HDR scene is the input of the first blit. After an offset blit, the offset, glow A and the grade blit all
+  // reach HDR through graded_sdr, so the grade formula is set to identity (c0 = 0) for both passes.
+  if (is_offset_blit) {
+    native_device->GetPixelShaderConstantF(0, scene_pass.offset_c0, 1);
+    std::ranges::fill(scene_pass.game_c0, 0.f);
+  } else {
+    std::ranges::fill(scene_pass.offset_c0, 0.5f);
+    native_device->GetPixelShaderConstantF(0, scene_pass.game_c0, 1);
+  }
 
   if (scene_pass.device != native_device) {
     scene_pass.Release();
@@ -275,8 +301,7 @@ bool OnScenePassCheck(reshade::api::command_list* cmd_list) {
   bool drawn = false;
   IDirect3DSurface9* scene_surface = nullptr;
   D3DSURFACE_DESC scene_desc = {};
-  if (targets_back_buffer
-      && scene_texture != nullptr
+  if (scene_texture != nullptr
       && scene_texture->GetType() == D3DRTYPE_TEXTURE
       && scene_pass.vertex_shader != nullptr
       && scene_pass.sdr_pixel_shader != nullptr
@@ -289,6 +314,7 @@ bool OnScenePassCheck(reshade::api::command_list* cmd_list) {
       && CopySurface(native_device, scene_surface, scene_pass.hdr_scene)) {
     drawn = DrawScenePass(native_device, clone_surface, scene_pass.sdr_pixel_shader, scene_texture, nullptr);
     scene_pass.finish_pending = drawn;
+    scene_pass.finish_armed = !is_offset_blit;
   }
   SafeRelease(&scene_surface);
   SafeRelease(&bound_texture);
@@ -330,8 +356,9 @@ bool OnCopyBackBufferSurface(
   bool handled = false;
   if (src_surface != nullptr && dst_surface != nullptr) {
     auto* native_device = reinterpret_cast<IDirect3DDevice9*>(device->get_native());
-    // Final copy T -> backbuffer without a draw after glow B (no HUD): finish the scene now.
-    if (scene_pass.finish_pending && dest_is_back_buffer && !source_is_back_buffer) {
+    // Final copy T -> backbuffer without a draw after glow B (no HUD): finish the scene now. Not before the grade blit
+    // armed it: a frame that never reaches it stays vanilla SDR instead of tone mapping a HUD already in T.
+    if (scene_pass.finish_pending && scene_pass.finish_armed && dest_is_back_buffer && !source_is_back_buffer) {
       RunSceneFinish(native_device, src_surface);
     }
     RECT src_rect = {};
@@ -369,6 +396,7 @@ void OnScenePassPresent(reshade::api::command_queue*, reshade::api::swapchain* s
   scene_pass.back_buffer = swapchain->get_current_back_buffer().handle;
   scene_pass.done_this_frame = false;
   scene_pass.finish_pending = false;
+  scene_pass.finish_armed = false;
 }
 
 void OnScenePassDestroySwapchain(reshade::api::swapchain* swapchain, bool) {
