@@ -277,6 +277,17 @@ struct HandleFrameResult {
   return pipes;
 }
 
+// A Devkit pipe is named after its game's process id, so a restarted game comes back under a new name and the old
+// name is no longer listed. Pipe names without the Devkit prefix (custom --pipe names) are never listed, so they never
+// count as exited.
+[[nodiscard]] bool IsExitedDevkitPipe(std::string_view pipe_name, const std::vector<std::string>& available_pipes) {
+  constexpr std::string_view PIPE_NAMESPACE = R"(\\.\pipe\)";
+  if (pipe_name.starts_with(PIPE_NAMESPACE)) {
+    pipe_name.remove_prefix(PIPE_NAMESPACE.size());
+  }
+  return MatchesDevkitPipePrefix(pipe_name) && std::ranges::find(available_pipes, pipe_name) == available_pipes.end();
+}
+
 [[nodiscard]] const std::vector<ToolDescriptor>& GetFallbackDevkitTools() {
   static const std::vector<ToolDescriptor> TOOLS = [] {
     std::vector<ToolDescriptor> built_tools = {};
@@ -728,19 +739,23 @@ class Bridge {
   }
 
   [[nodiscard]] bool EnsureBackendReady() {
-    if (client.IsConnected() && backend_initialized) return true;
-
-    if (selected_pipe.has_value()) {
-      if (ConnectToPipe(selected_pipe.value())) {
-        return true;
-      }
-      if (manual_pipe_selection) {
-        return false;
-      }
+    // A selected Devkit pipe whose game exited is dropped, even one chosen with renodx_connect, so the restarted game's
+    // pipe is used without a renodx_connect call.
+    const auto available_pipes = EnumerateDevkitPipes();
+    if (selected_pipe.has_value() && IsExitedDevkitPipe(selected_pipe.value(), available_pipes)) {
+      DisconnectBackend();
+      selected_pipe.reset();
+      manual_pipe_selection = false;
     }
+    if (selected_pipe.has_value()) return ConnectToPipe(selected_pipe.value());
 
-    auto available_pipes = EnumerateDevkitPipes();
     if (available_pipes.size() != 1u) {
+      SetBackendDiagnostic(BackendDiagnostic{
+          .stage = "connect",
+          .message = (available_pipes.empty()
+                          ? "No RenoDX DevKit pipe is listed: no game with the DevKit loaded is running."
+                          : "Several RenoDX DevKit pipes are listed. Use renodx_connect with 'index' or 'pipe' to choose one."),
+      });
       return false;
     }
 
@@ -796,7 +811,7 @@ class Bridge {
 
   [[nodiscard]] ToolResultPayload HandleListConnectionsTool() {
     auto available_pipes = EnumerateDevkitPipes();
-    if (!connected_pipe.has_value() && !manual_pipe_selection && available_pipes.size() == 1u) {
+    if (available_pipes.size() == 1u && connected_pipe != available_pipes.front()) {
       [[maybe_unused]] const bool backend_ready = EnsureBackendReady();
       available_pipes = EnumerateDevkitPipes();
     }
@@ -866,7 +881,7 @@ class Bridge {
         };
       }
       target_pipe = available_pipes[static_cast<size_t>(index)];
-    } else if (selected_pipe.has_value()) {
+    } else if (selected_pipe.has_value() && !IsExitedDevkitPipe(selected_pipe.value(), available_pipes)) {
       target_pipe = selected_pipe;
     } else if (available_pipes.size() == 1u) {
       target_pipe = available_pipes.front();

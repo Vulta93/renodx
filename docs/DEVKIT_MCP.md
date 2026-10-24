@@ -35,6 +35,12 @@ The bridge advertises the DevKit tool surface up front. If there is exactly one 
 - `renodx_list_connections`
 - `renodx_connect`
 
+A Devkit pipe is named after its game's process id (`renodx-devkit-mcp-<pid>`), so a restarted game comes back under a new
+name. Before each tool call the bridge drops a selected Devkit pipe that is no longer listed, even one chosen with
+`renodx_connect`, and uses the only listed pipe instead; with none or several listed, the call fails with that reason. A
+pipe chosen with `renodx_connect` that is still listed stays selected while other games start. Pipe names without the
+`renodx-devkit-mcp` prefix (custom `--pipe` names) are never listed and never dropped.
+
 ## 3. Tool groups
 
 The exact MCP schema can evolve, but the current workflow is built around these groups.
