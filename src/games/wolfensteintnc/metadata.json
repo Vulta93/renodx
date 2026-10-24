@@ -1,0 +1,19 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "wolfensteintnc",
+  "title": "Wolfenstein II: The New Colossus",
+  "maintainers": [
+    "Vulta93"
+  ],
+  "notes": [
+    "Vulkan renderer only (NewColossus_x64vk.exe)"
+  ],
+  "deploy": {
+    "steam_appid": 612880,
+    "game_exe": "NewColossus_x64vk.exe",
+    "api": "vulkan",
+    "architecture": [
+      "x64"
+    ]
+  }
+}
