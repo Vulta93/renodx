@@ -515,6 +515,31 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
             },
         },
     },
+    {
+        "devkit_measure_tone_curve",
+        {
+            .title = "Measure Tone Curve",
+            .description = "Measure the effective transfer of one pass from the current snapshot: drawIndex (a draw with a render target, e.g. the tonemap candidate of devkit_frame_overview), its input (inputSlot, or the first shader resource of the target's size, preferring a float one) and its first render target are read at the same present, each resolved to a mod's active clone, and paired pixel by pixel (same size; a region applies to both). Input luminance (inputSignal: raw = BT.709 luminance of the decoded values, scrgb/pq = nits) is split into log-spaced bins (bins 4-128, default 24, between the input's 0.5th and 99.5th percentile; bins with fewer than 16 pixels are left out) and each bin reports its median input and median output (outputSignal: raw, or nits for pq/scrgb). Also: midGray (output at input 0.18 and the log-log slope there), peakOutputP99_9, highestMedianOutput and shoulderInput (where the median output first reaches 90% of its highest value). Both textures are read at the end of the frame, so the call refuses when the snapshot shows a later command writing either again (ping-pong chains, UI drawn onto the output; laterInputWriters/laterOutputWriters list them), unless allowLaterWriters (use a region away from what they touch). Grading, LUTs and local effects (bloom, vignette) also move pixels: it is the pass's overall mapping, not a formula. The textures are read live, so take the snapshot on the same scene. waitForKey/delaySeconds as in devkit_analyze_resource.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"drawIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"inputSlot", {.types = {"integer"}, .minimum = 0}},
+                    {"inputSignal", {.types = {"string"}, .enum_values = {"raw", "pq", "scrgb"}}},
+                    {"outputSignal", {.types = {"string"}, .enum_values = {"raw", "pq", "scrgb"}}},
+                    {"bins", {.types = {"integer"}, .minimum = 4, .maximum = 128}},
+                    {"allowLaterWriters", {.types = {"boolean"}}},
+                    {"regionX", {.types = {"integer"}, .minimum = 0}},
+                    {"regionY", {.types = {"integer"}, .minimum = 0}},
+                    {"regionWidth", {.types = {"integer"}, .minimum = 1}},
+                    {"regionHeight", {.types = {"integer"}, .minimum = 1}},
+                    {"delaySeconds", {.types = {"integer"}, .minimum = 0, .maximum = MAX_CAPTURE_DELAY_SECONDS}},
+                    {"waitForKey", {.types = {"string"}, .enum_values = {"F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"}}},
+                },
+                .required = {"drawIndex"},
+            },
+        },
+    },
 };
 
 }  // namespace renodx::addons::devkit::mcp::tool_catalog

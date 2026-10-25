@@ -96,6 +96,13 @@ struct PendingRequest {
   // The source the shader has after the A/B, and why it is not ab_restore_source when restoring it failed.
   std::string ab_restored_source;
   std::string ab_restore_note;
+  // Tone curve: the pass's input is read in the same present as its output (resource_view), so both come from one frame;
+  // both keep one luminance per pixel. Only the present thread writes them while the request runs.
+  std::optional<reshade::api::resource_view> curve_input_view = std::nullopt;
+  Signal curve_input_signal = Signal::RAW;
+  std::vector<float> curve_input_luminance;
+  std::vector<float> curve_output_luminance;
+  json curve_input_result;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -104,8 +111,21 @@ struct PendingRequest {
   std::optional<ToolResult> result = std::nullopt;
 };
 
+// A snapshot draw's input and output for devkit_measure_tone_curve.
+struct DrawCurveViews {
+  reshade::api::resource_view input_view = {0u};
+  reshade::api::resource_view output_view = {0u};
+  std::uint32_t input_slot = 0u;
+  // Later commands of the snapshot frame that write the input or the output again; the end-of-frame contents are then
+  // no longer the ones the pass read or wrote.
+  std::vector<std::size_t> later_input_writers;
+  std::vector<std::size_t> later_output_writers;
+};
+
 struct ToolContext {
   std::function<std::uint32_t(const json& arguments)> resolve_device_index;
+  // Throws why the draw has no usable output or input.
+  std::function<DrawCurveViews(std::uint32_t device_index, std::size_t draw_index, std::optional<std::uint32_t> input_slot)> resolve_draw_curve_views;
   std::function<bool(std::uint32_t device_index, const std::shared_ptr<PendingRequest>& request)> enqueue_request;
   std::function<void(std::uint32_t device_index, const std::shared_ptr<PendingRequest>& request)> cancel_request;
 };
@@ -767,7 +787,10 @@ inline void EncodePreviewPixel(
     bool prefer_clone,
     const std::optional<reshade::api::subresource_box>& region,
     Signal signal,
-    reshade::api::resource frame_end_copy) {
+    reshade::api::resource frame_end_copy,
+    // When set, receives one luminance per pixel in row order (nits with a signal, else BT.709 luminance of the decoded
+    // values; NaN for a non-finite pixel), for the tone curve's input/output pairs.
+    std::vector<float>* pixel_luminance = nullptr) {
   AnalysisTarget target = {};
   try {
     target = ResolveAnalysisTarget(resource_view, device, prefer_clone);
@@ -1118,7 +1141,12 @@ inline void EncodePreviewPixel(
         }
         if (has_nan) ++nan_pixel_count;
         if (has_inf) ++inf_pixel_count;
-        if (has_nan || has_inf) continue;
+        if (has_nan || has_inf) {
+          if (pixel_luminance != nullptr) {
+            pixel_luminance->push_back(std::numeric_limits<float>::quiet_NaN());
+          }
+          continue;
+        }
 
         ++finite_pixel_count;
 
@@ -1147,11 +1175,19 @@ inline void EncodePreviewPixel(
         luminance_max = std::max(luminance_max, luminance);
         luminance_sum += luminance;
 
-        if (signal == Signal::RAW) continue;
+        if (signal == Signal::RAW) {
+          if (pixel_luminance != nullptr) {
+            pixel_luminance->push_back(static_cast<float>(luminance));
+          }
+          continue;
+        }
 
         const auto display_light = DecodeDisplayLight(signal, rgba);
         const auto& nits = display_light.nits;
         const auto nits_luminance = display_light.luminance;
+        if (pixel_luminance != nullptr) {
+          pixel_luminance->push_back(static_cast<float>(nits_luminance));
+        }
         const auto nits_max_channel = std::max({nits[0], nits[1], nits[2]});
         nits_luminance_values.push_back(static_cast<float>(nits_luminance));
         nits_luminance_min = std::min(nits_luminance_min, nits_luminance);
@@ -1834,6 +1870,218 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
   return result;
 }
 
+// The effective transfer of one pass: its input and output read at the same present, paired pixel by pixel, binned by
+// input luminance (log-spaced) with the median output per bin.
+[[nodiscard]] inline ToolResult HandleMeasureToneCurveTool(const json& arguments, const ToolContext& context) {
+  if (!context.resolve_device_index || !context.enqueue_request || !context.resolve_draw_curve_views) {
+    throw std::runtime_error("AnalyzeResourceToolContext is not initialized.");
+  }
+  constexpr std::size_t MIN_BIN_PIXELS = 16u;
+  constexpr double MID_GRAY = 0.18;
+
+  const auto device_index = context.resolve_device_index(arguments);
+  const auto draw_index = mcp_arguments::GetRequired<std::uint32_t>(arguments, "drawIndex");
+  const auto input_slot = mcp_arguments::GetOptional<std::uint32_t>(arguments, "inputSlot");
+  const auto input_signal = internal::ParseSignal(mcp_arguments::GetOptional<std::string>(arguments, "inputSignal").value_or("raw"));
+  const auto output_signal = internal::ParseSignal(mcp_arguments::GetOptional<std::string>(arguments, "outputSignal").value_or("raw"));
+  const auto region = internal::ParseRegion(arguments);
+  const auto bin_count = mcp_arguments::ValidateRange<std::uint32_t>(
+      "bins",
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "bins").value_or(24u),
+      4u,
+      128u);
+  const auto allow_later_writers = mcp_arguments::GetOptional<bool>(arguments, "allowLaterWriters").value_or(false);
+
+  const auto views = context.resolve_draw_curve_views(device_index, draw_index, input_slot);
+  if (!allow_later_writers && (!views.later_input_writers.empty() || !views.later_output_writers.empty())) {
+    const auto error = std::format(
+        "The snapshot frame writes the pass's input again at draw(s) {} and its output at draw(s) {}: read at the end of the "
+        "frame, those textures no longer hold what this pass read or wrote, so the pairs would be wrong. Pick a pass "
+        "whose textures stay untouched, or pass allowLaterWriters when the later writes cannot matter (e.g. UI blended "
+        "outside the region).",
+        json(views.later_input_writers).dump(),
+        json(views.later_output_writers).dump());
+    return ToolResult{
+        .text = error,
+        .structured_content = json{
+            {"error", error},
+            {"laterInputWriters", views.later_input_writers},
+            {"laterOutputWriters", views.later_output_writers},
+        },
+        .is_error = true,
+    };
+  }
+
+  // Both views resolve to a mod's active clone, the texture the GPU really renders.
+  auto request = std::make_shared<PendingRequest>();
+  request->resource_view = views.output_view;
+  request->prefer_clone = true;
+  request->region = region;
+  request->signal = output_signal;
+  request->curve_input_view = views.input_view;
+  request->curve_input_signal = input_signal;
+  if (!context.enqueue_request(device_index, request)) {
+    throw std::runtime_error(std::format("Failed to queue the tone curve request for device #{}.", device_index));
+  }
+  {
+    std::unique_lock request_lock(request->mutex);
+    if (!request->cv.wait_for(request_lock, std::chrono::seconds(15), [&request] { return request->completed || request->started; })) {
+      request->canceled = true;
+      request_lock.unlock();
+      if (context.cancel_request) {
+        context.cancel_request(device_index, request);
+      }
+      throw std::runtime_error("Timed out waiting for the next present to read the pass's textures.");
+    }
+    request->cv.wait(request_lock, [&request] { return request->completed; });
+  }
+  if (!request->result.has_value()) {
+    throw std::runtime_error("The tone curve request completed without a result.");
+  }
+  if (request->result->is_error) return request->result.value();
+
+  const auto& input_luminance = request->curve_input_luminance;
+  const auto& output_luminance = request->curve_output_luminance;
+  if (input_luminance.empty() || input_luminance.size() != output_luminance.size()) {
+    throw std::runtime_error(std::format(
+        "The input ({} pixels) and output ({} pixels) do not pair up: the pass must read and write textures of the same size "
+        "(use a region inside both), in a format the Devkit decodes.",
+        input_luminance.size(),
+        output_luminance.size()));
+  }
+
+  std::vector<std::pair<float, float>> pairs;
+  pairs.reserve(input_luminance.size());
+  for (std::size_t index = 0u; index < input_luminance.size(); ++index) {
+    if (std::isfinite(input_luminance[index]) && std::isfinite(output_luminance[index]) && input_luminance[index] > 0.f) {
+      pairs.emplace_back(input_luminance[index], output_luminance[index]);
+    }
+  }
+  if (pairs.size() < MIN_BIN_PIXELS * 4u) {
+    throw std::runtime_error(std::format("Only {} pixels have a finite, positive input: too few for a curve.", pairs.size()));
+  }
+
+  // The bins span the input's 0.5th to 99.5th percentile, so a few stray pixels do not stretch them.
+  std::vector<float> sorted_inputs;
+  sorted_inputs.reserve(pairs.size());
+  for (const auto& [input_value, output_value] : pairs) {
+    sorted_inputs.push_back(input_value);
+  }
+  std::ranges::sort(sorted_inputs);
+  const auto input_low = static_cast<double>(sorted_inputs[sorted_inputs.size() / 200u]);
+  const auto input_high = static_cast<double>(sorted_inputs[sorted_inputs.size() - 1u - (sorted_inputs.size() / 200u)]);
+  if (!(input_high > input_low)) {
+    throw std::runtime_error("The input luminance has no range in this region (a flat area?).");
+  }
+  const auto log_low = std::log(input_low);
+  const auto log_step = (std::log(input_high) - log_low) / static_cast<double>(bin_count);
+
+  std::vector<std::vector<float>> bin_inputs(bin_count);
+  std::vector<std::vector<float>> bin_outputs(bin_count);
+  std::vector<float> all_outputs;
+  all_outputs.reserve(pairs.size());
+  for (const auto& [input_value, output_value] : pairs) {
+    all_outputs.push_back(output_value);
+    const auto bin = static_cast<std::int64_t>(std::floor((std::log(static_cast<double>(input_value)) - log_low) / log_step));
+    if (bin < 0 || bin >= static_cast<std::int64_t>(bin_count)) continue;
+    bin_inputs[static_cast<std::size_t>(bin)].push_back(input_value);
+    bin_outputs[static_cast<std::size_t>(bin)].push_back(output_value);
+  }
+  const auto median = [](std::vector<float>* values) {
+    auto middle = values->begin() + static_cast<std::ptrdiff_t>(values->size() / 2u);
+    std::nth_element(values->begin(), middle, values->end());
+    return static_cast<double>(*middle);
+  };
+
+  struct CurvePoint {
+    double input = 0.0;
+    double output = 0.0;
+    std::size_t count = 0u;
+  };
+  std::vector<CurvePoint> points;
+  for (std::uint32_t bin = 0u; bin < bin_count; ++bin) {
+    if (bin_outputs[bin].size() < MIN_BIN_PIXELS) continue;
+    points.push_back({
+        .input = median(&bin_inputs[bin]),
+        .output = median(&bin_outputs[bin]),
+        .count = bin_outputs[bin].size(),
+    });
+  }
+  if (points.size() < 2u) {
+    throw std::runtime_error("Fewer than two bins hold enough pixels for a curve; try a larger region or fewer bins.");
+  }
+
+  json curve_points = json::array();
+  for (const auto& point : points) {
+    curve_points.push_back({{"input", point.input}, {"output", point.output}, {"pixels", point.count}});
+  }
+  json result_json = {
+      {"deviceIndex", device_index},
+      {"drawIndex", draw_index},
+      {"inputSlot", views.input_slot},
+      {"inputSignal", std::string(internal::GetSignalName(input_signal))},
+      {"outputSignal", std::string(internal::GetSignalName(output_signal))},
+      {"pairedPixels", pairs.size()},
+      {"inputRange", {input_low, input_high}},
+      {"points", std::move(curve_points)},
+      {"input", request->curve_input_result.value("analysisTarget", json(nullptr))},
+      {"output", request->result->structured_content.value("analysisTarget", json(nullptr))},
+  };
+  if (!views.later_input_writers.empty() || !views.later_output_writers.empty()) {
+    result_json["laterInputWriters"] = views.later_input_writers;
+    result_json["laterOutputWriters"] = views.later_output_writers;
+  }
+
+  // Mid grey: the output at input 0.18 and the log-log slope there, from the two points around it.
+  const auto above_mid_gray = std::ranges::find_if(points, [&](const CurvePoint& point) { return point.input >= MID_GRAY; });
+  if (above_mid_gray != points.begin() && above_mid_gray != points.end()) {
+    const auto& upper = *above_mid_gray;
+    const auto& lower = *(above_mid_gray - 1);
+    const auto fraction = (std::log(MID_GRAY) - std::log(lower.input)) / (std::log(upper.input) - std::log(lower.input));
+    json mid_gray = {
+        {"input", MID_GRAY},
+        {"output", lower.output + (fraction * (upper.output - lower.output))},
+    };
+    if (lower.output > 0.0 && upper.output > 0.0) {
+      mid_gray["logLogSlope"] = (std::log(upper.output) - std::log(lower.output)) / (std::log(upper.input) - std::log(lower.input));
+    }
+    result_json["midGray"] = std::move(mid_gray);
+  }
+  const auto peak_index = static_cast<std::ptrdiff_t>((all_outputs.size() - 1u) * 999u / 1000u);
+  std::nth_element(all_outputs.begin(), all_outputs.begin() + peak_index, all_outputs.end());
+  const auto peak_output = static_cast<double>(all_outputs[static_cast<std::size_t>(peak_index)]);
+  const auto highest_point = std::ranges::max_element(points, {}, &CurvePoint::output);
+  const auto shoulder = std::ranges::find_if(points, [&](const CurvePoint& point) { return point.output >= highest_point->output * 0.9; });
+  result_json["peakOutputP99_9"] = peak_output;
+  result_json["highestMedianOutput"] = {{"input", highest_point->input}, {"output", highest_point->output}};
+  result_json["shoulderInput"] = shoulder->input;
+  result_json["note"] =
+      "An effective transfer: median output per log-spaced input bin of the pixels this pass read and wrote in one frame. "
+      "Grading, LUTs, local effects (bloom, vignette) and UI also move pixels, so read it as the pass's overall mapping, "
+      "not a formula. Output is in the output signal's unit (nits for pq/scrgb, decoded values for raw).";
+
+  auto text = std::format(
+      "Tone curve of draw #{} (input slot {}): {} paired pixels, input {:.4g}..{:.4g} in {} bins; peak output (p99.9) {:.4g}, "
+      "highest median {:.4g} at input {:.4g}, 90% of it from input {:.4g}.",
+      draw_index,
+      views.input_slot,
+      pairs.size(),
+      input_low,
+      input_high,
+      points.size(),
+      peak_output,
+      highest_point->output,
+      highest_point->input,
+      shoulder->input);
+  if (result_json.contains("midGray")) {
+    text += std::format(" At input 0.18 the output is {:.4g}.", result_json["midGray"]["output"].get<double>());
+  }
+  return ToolResult{
+      .text = std::move(text),
+      .structured_content = std::move(result_json),
+  };
+}
+
 [[nodiscard]] inline ToolResult HandleDumpResourceWithHashTool(const json& arguments, const ToolContext& context) {
   if (!context.resolve_device_index || !context.enqueue_request) {
     throw std::runtime_error("AnalyzeResourceToolContext is not initialized.");
@@ -1976,6 +2224,36 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       continue;
     }
 
+    // Tone curve: the input first, in the same present as the output below.
+    if (request->curve_input_view.has_value()) {
+      auto input_result = make_error("Unknown resource analysis failure.");
+      try {
+        input_result = internal::PerformResourceAnalysis(
+            context,
+            device_index,
+            device,
+            queue,
+            request->curve_input_view.value(),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            request->preview_mode,
+            request->preview_mode_name,
+            request->prefer_clone,
+            request->region,
+            request->curve_input_signal,
+            {0u},
+            &request->curve_input_luminance);
+      } catch (const std::exception& exception) {
+        input_result = make_error(exception.what());
+      }
+      if (input_result.is_error) {
+        complete(make_error(std::format("Reading the pass's input failed: {}", input_result.text)));
+        continue;
+      }
+      request->curve_input_result = std::move(input_result.structured_content);
+    }
+
     ToolResult result = make_error("Unknown resource analysis failure.");
     try {
       result = internal::PerformResourceAnalysis(
@@ -1992,7 +2270,8 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
           request->prefer_clone,
           request->region,
           request->signal,
-          request->frame_end_copy);
+          request->frame_end_copy,
+          (request->curve_input_view.has_value() ? &request->curve_output_luminance : nullptr));
     } catch (const std::exception& exception) {
       result = make_error(exception.what());
     }

@@ -581,6 +581,29 @@ More A/B rules and caveats:
 - Samples follow the device's presents. With several swap chains on one device they interleave windows, and `frame`
   counts the presents the request saw, not the game's frame numbers.
 
+### Tone curve of a pass (`devkit_measure_tone_curve`)
+
+`devkit_measure_tone_curve {drawIndex}` measures the effective transfer of one pass of the current snapshot, for example
+the tonemap candidate of `devkit_frame_overview`: what output the pass makes from what input, so a new mod can match the
+game's own curve (mid grey, shoulder, peak).
+- The draw's first render target is the output; the input is `inputSlot`, or else the first shader resource of the
+  target's size (a float one if there is one). Both are resolved to a mod's active clone (the texture the GPU really
+  renders: Sleeping Dogs' tonemap targets are game r8g8b8a8 with r16g16b16a16_float clones) and read at the same present,
+  so both come from one frame. They must be the same size; `regionX/Y/Width/Height` applies to both.
+- Pixels are paired one to one. Input luminance (`inputSignal`: `raw` = BT.709 luminance of the decoded values,
+  `scrgb`/`pq` = nits) is split into `bins` log-spaced bins (default 24) between the input's 0.5th and 99.5th
+  percentile; bins with fewer than 16 pixels are left out. Each point is the bin's median input and median output
+  (`outputSignal`: `raw`, or nits for `pq`/`scrgb`).
+- Also reported: `midGray` (output at input 0.18 and the log-log slope there), `peakOutputP99_9`,
+  `highestMedianOutput` and `shoulderInput` (where the median output first reaches 90% of its highest value).
+- Validity: both textures are read at the end of the frame, after the whole frame. When the snapshot shows a later
+  command writing the input or the output again (a ping-pong chain, UI drawn onto the output), the call refuses and
+  lists them (`laterInputWriters`, `laterOutputWriters`); `allowLaterWriters` overrides it when a region keeps away from
+  what they touch. The snapshot and the read are different frames: take them on the same, still scene.
+- It is the pass's overall mapping, not a formula: grading, LUTs and local effects (bloom, vignette, local contrast)
+  also move pixels, so points scatter where those act. Compare with `devkit_set_shader_source` original vs addon to see
+  what a replacement changed.
+
 ### Display Proxy device
 
 A RenoDX Display Proxy (a DX9 or OpenGL proxy mod such as `princeofpersiaww`, or the Devkit's own Device Proxy) copies the

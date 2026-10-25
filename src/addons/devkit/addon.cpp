@@ -4695,6 +4695,94 @@ void ProcessPendingLiveShaderRequests(
   }
 }
 
+// devkit_measure_tone_curve: the draw's first render target and the input it reads (inputSlot, or the first SRV of the
+// same size as that target, preferring a float one), plus the later commands that write either texture again.
+devkit_resource_analysis::DrawCurveViews ResolveDrawCurveViewsForMcp(
+    uint32_t device_index,
+    std::size_t draw_index,
+    std::optional<uint32_t> input_slot) {
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (device_index >= device_data_list.size()) {
+    throw std::runtime_error(std::format("Device #{} is not available.", device_index));
+  }
+  auto* device_data = device_data_list[device_index];
+  std::shared_lock device_lock(device_data->mutex);
+  const auto& draws = device_data->draw_details_list;
+  if (draw_index >= draws.size()) {
+    throw std::runtime_error(std::format("Draw #{} is not in the snapshot ({} commands); queue a snapshot first.", draw_index, draws.size()));
+  }
+  const auto& draw = draws[draw_index];
+  if (!draw.IsDraw() || draw.render_targets.empty()) {
+    throw std::runtime_error(std::format("Draw #{} is not a draw with a render target.", draw_index));
+  }
+  const auto& output = draw.render_targets.begin()->second;
+  const auto& output_texture = output.resource_desc.texture;
+
+  const auto rendered_format = [](const ResourceViewDetails& details) {
+    return (details.clone_resource.handle != 0u ? details.clone_resource_desc.texture.format : details.resource_desc.texture.format);
+  };
+  const auto is_float_format = [](reshade::api::format format) {
+    switch (reshade::api::format_to_default_typed(format)) {
+      case reshade::api::format::r16g16b16a16_float:
+      case reshade::api::format::r11g11b10_float:
+      case reshade::api::format::r32g32b32a32_float:
+      case reshade::api::format::r32g32b32_float:
+      case reshade::api::format::r9g9b9e5:
+        return true;
+      default:
+        return false;
+    }
+  };
+  const ResourceViewDetails* input = nullptr;
+  uint32_t found_slot = 0u;
+  for (const auto& [slot_space, details] : draw.srv_binds) {
+    const auto& [slot, space] = slot_space;
+    (void)space;
+    if (input_slot.has_value()) {
+      if (slot != input_slot.value()) continue;
+    } else {
+      const bool same_size = details.resource_desc.type == reshade::api::resource_type::texture_2d
+                             && details.resource_desc.texture.width == output_texture.width
+                             && details.resource_desc.texture.height == output_texture.height
+                             && details.resource.handle != output.resource.handle;
+      if (!same_size) continue;
+      // The first same-size input, replaced by the first float one.
+      if (input != nullptr && (!is_float_format(rendered_format(details)) || is_float_format(rendered_format(*input)))) continue;
+    }
+    input = &details;
+    found_slot = slot;
+    if (input_slot.has_value()) break;
+  }
+  if (input == nullptr) {
+    throw std::runtime_error(
+        input_slot.has_value()
+            ? std::format("Draw #{} binds no shader resource at slot {}.", draw_index, input_slot.value())
+            : std::format("Draw #{} reads no texture of its target's size ({}x{}); pass inputSlot.", draw_index, output_texture.width, output_texture.height));
+  }
+
+  devkit_resource_analysis::DrawCurveViews views = {
+      .input_view = input->resource_view,
+      .output_view = output.resource_view,
+      .input_slot = found_slot,
+  };
+  const auto writes = [](const DrawDetails& later, reshade::api::resource resource) {
+    if (later.copy_destination.handle == resource.handle) return true;
+    const auto targets_resource = [&](const auto& binds) {
+      return std::ranges::any_of(binds, [&](const auto& bind) { return bind.second.resource.handle == resource.handle; });
+    };
+    return targets_resource(later.render_targets) || targets_resource(later.uav_binds);
+  };
+  for (auto later_index = draw_index + 1u; later_index < draws.size(); ++later_index) {
+    if (writes(draws[later_index], input->resource)) {
+      views.later_input_writers.push_back(later_index);
+    }
+    if (writes(draws[later_index], output.resource)) {
+      views.later_output_writers.push_back(later_index);
+    }
+  }
+  return views;
+}
+
 devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
   std::shared_lock list_lock(device_data_list_mutex);
   if (device_index >= device_data_list.size()) {
@@ -5099,6 +5187,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(true),
+                                                        .resolve_draw_curve_views = ResolveDrawCurveViewsForMcp,
                                                         .enqueue_request = EnqueuePendingResourceAnalysisRequest,
                                                         .cancel_request = CancelPendingResourceAnalysisRequest,
                                                     }; },

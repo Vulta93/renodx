@@ -174,6 +174,11 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
     if (auto trigger_error = wait_for_capture_trigger(arguments)) return *trigger_error;
     return watch_region::HandleWatchRegionTool(arguments, build_watch_region_tool_context());
   });
+  register_tool("devkit_measure_tone_curve", [wait_for_capture_trigger, build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
+                                                 const renodx::utils::mcp::json& arguments) {
+    if (auto trigger_error = wait_for_capture_trigger(arguments)) return *trigger_error;
+    return resource_analysis::HandleMeasureToneCurveTool(arguments, build_analyze_resource_tool_context());
+  });
   register_tool("devkit_dump_resource_with_hash", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                        const renodx::utils::mcp::json& arguments) {
     return resource_analysis::HandleDumpResourceWithHashTool(arguments, build_analyze_resource_tool_context());
