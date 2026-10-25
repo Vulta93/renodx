@@ -1916,10 +1916,9 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
     };
   }
 
-  // Both views resolve to a mod's active clone, the texture the GPU really renders.
+  // Each view resolves to a mod's active clone when it has one (see ProcessPendingRequests).
   auto request = std::make_shared<PendingRequest>();
   request->resource_view = views.output_view;
-  request->prefer_clone = true;
   request->region = region;
   request->signal = output_signal;
   request->curve_input_view = views.input_view;
@@ -2261,6 +2260,18 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       continue;
     }
 
+    // The tone curve reads what the GPU really renders: a mod's clone where one is active, else the resource itself (a
+    // game without a mod, or a texture the mod leaves alone). Explicit preferClone elsewhere stays strict.
+    const auto has_active_clone = [](reshade::api::resource_view resource_view) {
+      const auto view_info = internal::FindTrackedResourceViewInfo(resource_view);
+      if (!view_info.has_value() || view_info->clone.handle == 0u) return false;
+      bool clone_active = false;
+      renodx::utils::resource::GetResourceInfo(view_info->original_resource, [&](const renodx::utils::resource::ResourceInfo& info) {
+        clone_active = info.clone_enabled && info.clone.handle != 0u;
+      });
+      return clone_active;
+    };
+
     // Tone curve: the input first, in the same present as the output below.
     if (request->curve_input_view.has_value()) {
       auto input_result = make_error("Unknown resource analysis failure.");
@@ -2276,7 +2287,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
             std::nullopt,
             request->preview_mode,
             request->preview_mode_name,
-            request->prefer_clone,
+            has_active_clone(request->curve_input_view.value()),
             request->region,
             request->curve_input_signal,
             {0u},
@@ -2304,7 +2315,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
           request->name_prefix,
           request->preview_mode,
           request->preview_mode_name,
-          request->prefer_clone,
+          (request->curve_input_view.has_value() ? has_active_clone(request->resource_view) : request->prefer_clone),
           request->region,
           request->signal,
           request->frame_end_copy,

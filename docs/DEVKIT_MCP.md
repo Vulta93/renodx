@@ -588,8 +588,9 @@ More A/B rules and caveats:
 the tonemap candidate of `devkit_frame_overview`: what output the pass makes from what input, so a new mod can match the
 game's own curve (mid grey, shoulder, peak).
 - The draw's first render target is the output; the input is `inputSlot`, or else the first shader resource of the
-  target's size (a float one if there is one). Both are resolved to a mod's active clone (the texture the GPU really
-  renders: Sleeping Dogs' tonemap targets are game r8g8b8a8 with r16g16b16a16_float clones) and read at the same present,
+  target's size (a float one if there is one). Each is resolved to a mod's active clone when it has one (the texture the
+  GPU really renders: Sleeping Dogs' tonemap targets are game r8g8b8a8 with r16g16b16a16_float clones), else to the
+  texture itself, so the call also works without a mod; both are read at the same present,
   so both come from one frame. They must be the same size; `regionX/Y/Width/Height` applies to both.
 - Pixels are paired one to one. Input luminance (`inputSignal`: `raw` = BT.709 luminance of the decoded values,
   `scrgb`/`pq` = nits) is split into `bins` log-spaced bins (default 24) between the input's 0.5th and 99.5th
