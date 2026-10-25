@@ -353,6 +353,21 @@ thousands of draws:
     shader's first draw in the pass, for `devkit_get_draw`); at most 16 are listed, the one with the latest first
     candidate pass first, and `sharedShaderCount` counts them all.
 
+Comparing two frames (`saveBaseline`, `compareWith`): `saveBaseline` (absolute path to a `.json` file) writes every pass's
+structure: its targets and inputs with the format the game created and the format rendered, their sizes and swap-chain
+flag, its shader hashes, command count and hint types. The file survives a game restart, which most comparisons need
+(upgrades and mod changes act at creation, and resource handles change with a restart). `compareWith` takes such a file
+and adds `comparison`:
+- Passes are aligned in frame order (longest common subsequence) by kind, the targets as the game created them (format,
+  size, swap chain) and blend, so a pass whose target a mod upgraded or cloned still aligns.
+- For each aligned pass, `changes`: `targetRenderedFormat` (a target now upgraded or cloned, or no longer),
+  `inputRenderedFormats` (added and removed input formats), `shaderHashes` (only for passes of at most 4 shaders: scene
+  passes draw a different set of objects each frame), `commandCount` (when it changed by half or more, at least 4) and
+  `hints`.
+- `onlyInBaseline` and `onlyInCurrent`: passes with no counterpart (at most 32 listed each, counts complete).
+Use it before and after a resource upgrade or a mod change, on the same spot. First compare two snapshots of an
+unchanged still scene, to see what varies on its own (passes that come and go with effects or particles).
+
 Limits: hints are candidates from formats, sizes, blend state and command order, never proof; the skills require proving
 the signal (`devkit_get_draw`, the shader, `devkit_watch_region`) before calling a pass the tonemap. Snapshots record no
 viewports, vertex counts or depth targets: a "large" target covers at least a quarter of the swap chain's back buffer

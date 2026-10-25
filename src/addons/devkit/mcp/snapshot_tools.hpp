@@ -11,8 +11,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
+#include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -621,6 +625,13 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       mcp_arguments::GetOptional<std::uint32_t>(arguments, "maxResources").value_or(32u),
       0u,
       2000u);
+  const auto save_baseline_path = mcp_arguments::GetOptional<std::string>(arguments, "saveBaseline");
+  const auto compare_with_path = mcp_arguments::GetOptional<std::string>(arguments, "compareWith");
+  for (const auto* path : {&save_baseline_path, &compare_with_path}) {
+    if (path->has_value() && !std::filesystem::path(path->value()).is_absolute()) {
+      throw std::runtime_error("saveBaseline and compareWith must be absolute paths.");
+    }
+  }
   const auto device_index = internal::ResolveDeviceIndex(arguments, context);
   const auto input = context.collect_frame_overview(device_index);
 
@@ -628,6 +639,10 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
   using frame_overview::TextureInfo;
   constexpr std::size_t MAX_LISTED = 8u;
   constexpr std::size_t MAX_LUT_TEXTURES = 16u;
+  // compareWith: the alignment table holds one word per pass pair (4M pairs = 16 MB, e.g. 2000 x 2000 passes).
+  constexpr std::size_t MAX_COMPARED_PASS_PAIRS = 4'000'000u;
+  constexpr std::size_t MAX_COMPARED_SHADERS = 4u;
+  constexpr std::size_t MAX_COMPARED_PASSES_LISTED = 32u;
 
   const auto is_float_format = [](reshade::api::format format) {
     switch (reshade::api::format_to_default_typed(format)) {
@@ -981,6 +996,256 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     });
   }
 
+  // Baseline and comparison: a structural description of every pass, saved to a file so it survives a game restart
+  // (upgrades and mod changes usually need one, and resource handles change with it). Passes are aligned by kind, the
+  // targets as the game created them (format, size, swap chain) and blend, so a pass whose targets a mod upgraded or
+  // cloned still aligns and shows its new rendered format as the difference.
+  json comparison = nullptr;
+  std::string comparison_text;
+  if (save_baseline_path.has_value() || compare_with_path.has_value()) {
+    if (input.snapshot_pending || input.commands.empty()) {
+      throw std::runtime_error("saveBaseline and compareWith need a finished snapshot (devkit_queue_snapshot).");
+    }
+    const auto game_format = [](const TextureInfo& texture) {
+      return (texture.is_upgraded ? texture.original_format : texture.format);
+    };
+    const auto texture_signature = [&](const TextureInfo& texture) {
+      return json{
+          {"gameFormat", formatting::StreamToString(game_format(texture))},
+          {"renderedFormat", formatting::StreamToString(rendered_format(texture))},
+          {"width", texture.width},
+          {"height", texture.height},
+          {"swapchain", texture.is_swapchain},
+      };
+    };
+    json pass_signatures = json::array();
+    for (std::size_t pass_index = 0u; pass_index < passes.size(); ++pass_index) {
+      const auto& pass = passes[pass_index];
+      std::string kind_name = "draw";
+      if (pass.kind == CommandKind::DISPATCH) {
+        kind_name = "dispatch";
+      } else if (pass.kind == CommandKind::COPY) {
+        kind_name = "copy";
+      }
+      std::string key = kind_name;
+      json targets = json::array();
+      for (const auto& target : pass.targets) {
+        key += std::format(
+            "|{} {}x{}{}",
+            formatting::StreamToString(game_format(target)),
+            target.width,
+            target.height,
+            (target.is_swapchain ? " swapchain" : ""));
+        targets.push_back(texture_signature(target));
+      }
+      if (pass.blend_known) {
+        key += (pass.blend_enabled ? "|blend" : "|opaque");
+      }
+      json inputs = json::array();
+      for (const auto& texture : pass.inputs) {
+        inputs.push_back(texture_signature(texture));
+      }
+      json shader_hashes = json::array();
+      for (const auto shader_hash : pass.shader_hashes) {
+        shader_hashes.push_back(formatting::FormatShaderHash(shader_hash));
+      }
+      json hint_types = json::array();
+      for (const auto& hint : pass.hints) {
+        hint_types.push_back(hint["type"]);
+      }
+      pass_signatures.push_back({
+          {"pass", pass_index},
+          {"firstDraw", pass.first_draw},
+          {"commandCount", pass.command_count},
+          {"key", std::move(key)},
+          {"targets", std::move(targets)},
+          {"inputs", std::move(inputs)},
+          {"shaderHashes", std::move(shader_hashes)},
+          {"hints", std::move(hint_types)},
+      });
+    }
+
+    if (compare_with_path.has_value()) {
+      std::ifstream baseline_file(std::filesystem::path(compare_with_path.value()));
+      if (!baseline_file) {
+        throw std::runtime_error(std::format("compareWith: cannot open '{}'.", compare_with_path.value()));
+      }
+      const auto baseline = json::parse(baseline_file, nullptr, false);
+      if (baseline.is_discarded() || !baseline.contains("passes") || !baseline["passes"].is_array()) {
+        throw std::runtime_error(std::format("compareWith: '{}' is not a saveBaseline file.", compare_with_path.value()));
+      }
+      const auto& baseline_passes = baseline["passes"];
+      const auto baseline_count = baseline_passes.size();
+      const auto current_count = pass_signatures.size();
+      if (baseline_count * current_count > MAX_COMPARED_PASS_PAIRS) {
+        throw std::runtime_error(std::format("compareWith: {} x {} passes is too many to align.", baseline_count, current_count));
+      }
+
+      // Longest common subsequence of the pass keys, in frame order.
+      std::vector<std::uint32_t> common_lengths((baseline_count + 1u) * (current_count + 1u), 0u);
+      const auto common_length = [&](std::size_t baseline_index, std::size_t current_index) -> std::uint32_t& {
+        return common_lengths[(baseline_index * (current_count + 1u)) + current_index];
+      };
+      for (auto baseline_index = baseline_count; baseline_index-- > 0u;) {
+        for (auto current_index = current_count; current_index-- > 0u;) {
+          if (baseline_passes[baseline_index]["key"] == pass_signatures[current_index]["key"]) {
+            common_length(baseline_index, current_index) = common_length(baseline_index + 1u, current_index + 1u) + 1u;
+          } else {
+            common_length(baseline_index, current_index) = std::max(
+                common_length(baseline_index + 1u, current_index),
+                common_length(baseline_index, current_index + 1u));
+          }
+        }
+      }
+
+      const auto rendered_inputs = [](const json& pass_signature) {
+        std::vector<std::string> formats;
+        for (const auto& texture : pass_signature["inputs"]) {
+          formats.push_back(std::format(
+              "{} {}x{}",
+              texture["renderedFormat"].get<std::string>(),
+              texture["width"].get<std::uint32_t>(),
+              texture["height"].get<std::uint32_t>()));
+        }
+        std::ranges::sort(formats);
+        return formats;
+      };
+      const auto pass_brief = [&](const json& pass_signature) {
+        json shader_hashes = json::array();
+        for (const auto& shader_hash : pass_signature["shaderHashes"] | std::views::take(MAX_LISTED)) {
+          shader_hashes.push_back(shader_hash);
+        }
+        return json{
+            {"pass", pass_signature["pass"]},
+            {"firstDraw", pass_signature["firstDraw"]},
+            {"key", pass_signature["key"]},
+            {"shaderHashes", std::move(shader_hashes)},
+        };
+      };
+
+      json changed_passes = json::array();
+      json only_in_baseline = json::array();
+      json only_in_current = json::array();
+      std::size_t matched_count = 0u;
+      std::size_t changed_count = 0u;
+      std::size_t only_in_baseline_count = 0u;
+      std::size_t only_in_current_count = 0u;
+      std::size_t baseline_index = 0u;
+      std::size_t current_index = 0u;
+      while (baseline_index < baseline_count || current_index < current_count) {
+        const bool both_left = (baseline_index < baseline_count && current_index < current_count);
+        if (both_left && baseline_passes[baseline_index]["key"] == pass_signatures[current_index]["key"]) {
+          const auto& baseline_pass = baseline_passes[baseline_index];
+          const auto& current_pass = pass_signatures[current_index];
+          json changes = json::array();
+          for (std::size_t target_index = 0u; target_index < current_pass["targets"].size(); ++target_index) {
+            const auto& baseline_target = baseline_pass["targets"][target_index];
+            const auto& current_target = current_pass["targets"][target_index];
+            if (baseline_target["renderedFormat"] != current_target["renderedFormat"]) {
+              changes.push_back({
+                  {"what", "targetRenderedFormat"},
+                  {"target", target_index},
+                  {"from", baseline_target["renderedFormat"]},
+                  {"to", current_target["renderedFormat"]},
+              });
+            }
+          }
+          const auto baseline_inputs = rendered_inputs(baseline_pass);
+          const auto current_inputs = rendered_inputs(current_pass);
+          if (baseline_inputs != current_inputs) {
+            std::vector<std::string> removed_inputs;
+            std::vector<std::string> added_inputs;
+            std::ranges::set_difference(baseline_inputs, current_inputs, std::back_inserter(removed_inputs));
+            std::ranges::set_difference(current_inputs, baseline_inputs, std::back_inserter(added_inputs));
+            changes.push_back({
+                {"what", "inputRenderedFormats"},
+                {"removed", removed_inputs},
+                {"added", added_inputs},
+            });
+          }
+          // Scene passes draw a different set of objects each frame; only short passes (post-processing) compare shaders.
+          const auto& baseline_shaders = baseline_pass["shaderHashes"];
+          const auto& current_shaders = current_pass["shaderHashes"];
+          if (baseline_shaders.size() <= MAX_COMPARED_SHADERS && current_shaders.size() <= MAX_COMPARED_SHADERS
+              && baseline_shaders != current_shaders) {
+            changes.push_back({{"what", "shaderHashes"}, {"from", baseline_shaders}, {"to", current_shaders}});
+          }
+          const auto baseline_commands = baseline_pass["commandCount"].get<std::size_t>();
+          const auto current_commands = current_pass["commandCount"].get<std::size_t>();
+          const auto fewer_commands = std::min(baseline_commands, current_commands);
+          const auto more_commands = std::max(baseline_commands, current_commands);
+          if (more_commands - fewer_commands >= 4u && more_commands * 2u >= fewer_commands * 3u) {
+            changes.push_back({{"what", "commandCount"}, {"from", baseline_commands}, {"to", current_commands}});
+          }
+          if (baseline_pass["hints"] != current_pass["hints"]) {
+            changes.push_back({{"what", "hints"}, {"from", baseline_pass["hints"]}, {"to", current_pass["hints"]}});
+          }
+          ++matched_count;
+          if (!changes.empty()) {
+            ++changed_count;
+            if (changed_passes.size() < MAX_COMPARED_PASSES_LISTED) {
+              changed_passes.push_back({
+                  {"baselinePass", baseline_pass["pass"]},
+                  {"currentPass", current_pass["pass"]},
+                  {"currentFirstDraw", current_pass["firstDraw"]},
+                  {"key", current_pass["key"]},
+                  {"changes", std::move(changes)},
+              });
+            }
+          }
+          ++baseline_index;
+          ++current_index;
+        } else if (current_index >= current_count
+                   || (both_left && common_length(baseline_index + 1u, current_index) >= common_length(baseline_index, current_index + 1u))) {
+          ++only_in_baseline_count;
+          if (only_in_baseline.size() < MAX_COMPARED_PASSES_LISTED) {
+            only_in_baseline.push_back(pass_brief(baseline_passes[baseline_index]));
+          }
+          ++baseline_index;
+        } else {
+          ++only_in_current_count;
+          if (only_in_current.size() < MAX_COMPARED_PASSES_LISTED) {
+            only_in_current.push_back(pass_brief(pass_signatures[current_index]));
+          }
+          ++current_index;
+        }
+      }
+      comparison = {
+          {"baselinePath", compare_with_path.value()},
+          {"baselinePassCount", baseline_count},
+          {"currentPassCount", current_count},
+          {"matchedPassCount", matched_count},
+          {"changedPassCount", changed_count},
+          {"onlyInBaselineCount", only_in_baseline_count},
+          {"onlyInCurrentCount", only_in_current_count},
+          {"changedPasses", std::move(changed_passes)},
+          {"onlyInBaseline", std::move(only_in_baseline)},
+          {"onlyInCurrent", std::move(only_in_current)},
+      };
+      comparison_text = std::format(
+          " Compared with '{}': {} of {} passes aligned, {} changed, {} only in the baseline, {} only now.",
+          compare_with_path.value(),
+          matched_count,
+          current_count,
+          changed_count,
+          only_in_baseline_count,
+          only_in_current_count);
+    }
+
+    if (save_baseline_path.has_value()) {
+      std::ofstream baseline_file(std::filesystem::path(save_baseline_path.value()), std::ios::trunc);
+      if (!baseline_file) {
+        throw std::runtime_error(std::format("saveBaseline: cannot write '{}'.", save_baseline_path.value()));
+      }
+      baseline_file << json{
+          {"version", 1},
+          {"capturedCommands", input.commands.size()},
+          {"passes", std::move(pass_signatures)},
+      }.dump();
+      comparison_text += std::format(" Saved the pass list as a baseline to '{}'.", save_baseline_path.value());
+    }
+  }
+
   // The listing budget goes to candidates first (tonemap, output, UI, LUT builders, LUT readers), then to the latest
   // passes, where HDR work happens.
   std::vector<bool> listed(passes.size(), false);
@@ -1127,8 +1392,9 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
         output_text,
         shared_shader_count);
   }
+  text += comparison_text;
 
-  return ToolResult{
+  auto result = ToolResult{
       .text = std::move(text),
       .structured_content = json{
           {"deviceIndex", device_index},
@@ -1163,5 +1429,9 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           }},
       },
   };
+  if (!comparison.is_null()) {
+    result.structured_content["comparison"] = std::move(comparison);
+  }
+  return result;
 }
 }  // namespace renodx::addons::devkit::mcp::snapshot_tools
