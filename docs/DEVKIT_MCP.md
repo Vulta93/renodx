@@ -360,8 +360,11 @@ flag, its shader hashes, command count and hint types, and returns the path as `
 game restart, which most comparisons need (upgrades and mod changes act at creation, and resource handles change with
 a restart). `compareWith` takes such a file and adds `comparison`:
 - Passes are aligned in frame order (longest common subsequence) by kind, the targets as the game created them (format,
-  size, swap chain) and blend, so a pass whose target a mod upgraded or cloned still aligns.
-- For each aligned pass, `changes`: `targetRenderedFormat` (a target now upgraded or cloned, or no longer),
+  size, swap chain; a swap chain by size alone, since a mod upgrades it when the game creates it) and blend, so a pass
+  whose target a mod upgraded or cloned still aligns.
+- For each aligned pass, `changes`: `targetGameFormat` (a swap chain created in another format, as after a mod's
+  swap-chain upgrade), `targetRenderedFormat` (a target now upgraded or cloned, or no longer; left out when it only
+  repeats `targetGameFormat`, a swap chain upgraded in place without a clone),
   `inputRenderedFormats` (added and removed input formats), `shaderHashes` (only for passes of at most 4 shaders: scene
   passes draw a different set of objects each frame), `commandCount` (when it changed by half or more, at least 4) and
   `hints`.

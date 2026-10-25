@@ -990,8 +990,8 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
 
   // Baseline and comparison: a structural description of every pass, saved to a file so it survives a game restart
   // (upgrades and mod changes usually need one, and resource handles change with it). Passes are aligned by kind, the
-  // targets as the game created them (format, size, swap chain) and blend, so a pass whose targets a mod upgraded or
-  // cloned still aligns and shows its new rendered format as the difference.
+  // targets as the game created them (format, size, swap chain; a swap chain by size alone) and blend, so a pass whose
+  // targets a mod upgraded or cloned still aligns and shows its new rendered format as the difference.
   json comparison = nullptr;
   std::string comparison_text;
   if (save_baseline_path.has_value() || compare_with_path.has_value()) {
@@ -1065,6 +1065,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       const auto is_texture_list = [](const json& textures) {
         return textures.is_array() && std::ranges::all_of(textures, [](const json& texture) {
                  return texture.is_object()
+                        && texture.contains("gameFormat") && texture["gameFormat"].is_string()
                         && texture.contains("renderedFormat") && texture["renderedFormat"].is_string()
                         && texture.contains("width") && texture["width"].is_number_unsigned()
                         && texture.contains("height") && texture["height"].is_number_unsigned();
@@ -1093,15 +1094,32 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       if (baseline_count * current_count > MAX_COMPARED_PASS_PAIRS) {
         throw std::runtime_error(std::format("compareWith: {} x {} passes is too many to align.", baseline_count, current_count));
       }
+      // A mod upgrades the swap chain when the game creates it, so the format the game asked for is gone after a restart
+      // with the mod: swap-chain targets align by size alone ("<format> WxH swapchain" -> "WxH swapchain"), and their
+      // format change is reported as targetGameFormat.
+      const auto alignment_key = [](const std::string& key) {
+        std::string aligned_key;
+        for (const auto key_part : std::views::split(key, '|')) {
+          auto part = std::string_view(key_part.begin(), key_part.end());
+          if (part.ends_with(" swapchain")) {
+            part.remove_prefix(part.find(' ') + 1u);
+          }
+          if (!aligned_key.empty()) {
+            aligned_key += '|';
+          }
+          aligned_key += part;
+        }
+        return aligned_key;
+      };
       std::vector<std::string> baseline_keys;
       std::vector<std::string> current_keys;
       baseline_keys.reserve(baseline_count);
       current_keys.reserve(current_count);
       for (const auto& pass_signature : baseline_passes) {
-        baseline_keys.push_back(pass_signature["key"].get<std::string>());
+        baseline_keys.push_back(alignment_key(pass_signature["key"].get<std::string>()));
       }
       for (const auto& pass_signature : pass_signatures) {
-        current_keys.push_back(pass_signature["key"].get<std::string>());
+        current_keys.push_back(alignment_key(pass_signature["key"].get<std::string>()));
       }
 
       // Longest common subsequence of the pass keys, in frame order.
@@ -1166,7 +1184,21 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           for (std::size_t target_index = 0u; target_index < target_count; ++target_index) {
             const auto& baseline_target = baseline_pass["targets"][target_index];
             const auto& current_target = current_pass["targets"][target_index];
-            if (baseline_target["renderedFormat"] != current_target["renderedFormat"]) {
+            const bool game_format_changed = (baseline_target["gameFormat"] != current_target["gameFormat"]);
+            if (game_format_changed) {
+              changes.push_back({
+                  {"what", "targetGameFormat"},
+                  {"target", target_index},
+                  {"from", baseline_target["gameFormat"]},
+                  {"to", current_target["gameFormat"]},
+              });
+            }
+            // A swap chain upgraded at creation without a clone renders the format it was created with on both sides,
+            // which targetGameFormat already reports.
+            const bool both_rendered_as_created = (baseline_target["renderedFormat"] == baseline_target["gameFormat"]
+                                                   && current_target["renderedFormat"] == current_target["gameFormat"]);
+            if (baseline_target["renderedFormat"] != current_target["renderedFormat"]
+                && !(game_format_changed && both_rendered_as_created)) {
               changes.push_back({
                   {"what", "targetRenderedFormat"},
                   {"target", target_index},
