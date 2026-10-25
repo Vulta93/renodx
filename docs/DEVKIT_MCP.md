@@ -368,7 +368,9 @@ a restart). `compareWith` takes such a file and adds `comparison`:
   `inputRenderedFormats` (added and removed input formats), `shaderHashes` (only for passes of at most 4 shaders: scene
   passes draw a different set of objects each frame), `commandCount` (when it changed by half or more, at least 4) and
   `hints`.
-- `onlyInBaseline` and `onlyInCurrent`: passes with no counterpart (at most 32 listed each, counts complete).
+- `onlyInBaseline` and `onlyInCurrent`: passes with no counterpart.
+- `changedPasses`, `onlyInBaseline` and `onlyInCurrent` hold at most 32 entries each, the latest in the frame (tonemap,
+  UI and output come last); earlier entries are left out, and the counts are complete.
 Use it before and after a resource upgrade or a mod change, on the same spot. First compare two snapshots of an
 unchanged still scene, to see what varies on its own (passes that come and go with effects or particles).
 

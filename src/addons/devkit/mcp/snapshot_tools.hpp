@@ -1240,33 +1240,38 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           ++matched_count;
           if (!changes.empty()) {
             ++changed_count;
-            if (changed_passes.size() < MAX_COMPARED_PASSES_LISTED) {
-              changed_passes.push_back({
-                  {"baselinePass", baseline_pass["pass"]},
-                  {"currentPass", current_pass["pass"]},
-                  {"currentFirstDraw", current_pass["firstDraw"]},
-                  {"key", current_pass["key"]},
-                  {"changes", std::move(changes)},
-              });
-            }
+            changed_passes.push_back({
+                {"baselinePass", baseline_pass["pass"]},
+                {"currentPass", current_pass["pass"]},
+                {"currentFirstDraw", current_pass["firstDraw"]},
+                {"key", current_pass["key"]},
+                {"changes", std::move(changes)},
+            });
           }
           ++baseline_index;
           ++current_index;
         } else if (current_index >= current_count
                    || (both_left && common_length(baseline_index + 1u, current_index) >= common_length(baseline_index, current_index + 1u))) {
           ++only_in_baseline_count;
-          if (only_in_baseline.size() < MAX_COMPARED_PASSES_LISTED) {
-            only_in_baseline.push_back(pass_brief(baseline_passes[baseline_index]));
-          }
+          only_in_baseline.push_back(pass_brief(baseline_passes[baseline_index]));
           ++baseline_index;
         } else {
           ++only_in_current_count;
-          if (only_in_current.size() < MAX_COMPARED_PASSES_LISTED) {
-            only_in_current.push_back(pass_brief(pass_signatures[current_index]));
-          }
+          only_in_current.push_back(pass_brief(pass_signatures[current_index]));
           ++current_index;
         }
       }
+      // The end of the frame (tonemap, UI, output) matters most for HDR work: past the cap, each list keeps its latest
+      // entries.
+      const auto keep_latest = [](json* passes_listed) {
+        if (passes_listed->size() > MAX_COMPARED_PASSES_LISTED) {
+          passes_listed->erase(passes_listed->begin(),
+                               passes_listed->end() - static_cast<std::ptrdiff_t>(MAX_COMPARED_PASSES_LISTED));
+        }
+      };
+      keep_latest(&changed_passes);
+      keep_latest(&only_in_baseline);
+      keep_latest(&only_in_current);
       comparison = {
           {"baselinePath", compare_with_path.value()},
           {"baselinePassCount", baseline_count},
