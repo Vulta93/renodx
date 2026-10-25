@@ -254,6 +254,17 @@ struct ShaderDetails {
       "addon",
       "file",
   };
+
+  [[nodiscard]] bool HasCompiledDiskShader() const {
+    return disk_shader.has_value() && !disk_shader->removed && disk_shader->IsCompilationOK();
+  }
+
+  [[nodiscard]] static std::optional<ShaderSource> ParseShaderSourceMcpName(std::string_view name) {
+    for (size_t index = 0u; index < std::size(SHADER_SOURCE_MCP_NAMES); ++index) {
+      if (name == SHADER_SOURCE_MCP_NAMES[index]) return static_cast<ShaderSource>(index);
+    }
+    return std::nullopt;
+  }
 };
 
 struct PendingLiveShaderRequest {
@@ -3409,13 +3420,10 @@ void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::spa
     reshade::api::device* device,
     ShaderDetails* details,
     ShaderDetails::ShaderSource source) {
-  const bool has_disk_shader = details->disk_shader.has_value()
-                               && !details->disk_shader->removed
-                               && details->disk_shader->IsCompilationOK();
   if (source == ShaderDetails::ShaderSource::ADDON_SHADER && details->addon_shader.empty()) {
     return "No add-on replaces this shader, or the Devkit has not seen the add-on's replacements on this device yet.";
   }
-  if (source == ShaderDetails::ShaderSource::DISK_SHADER && !has_disk_shader) {
+  if (source == ShaderDetails::ShaderSource::DISK_SHADER && !details->HasCompiledDiskShader()) {
     return "No live shader file for this shader compiled; load one with devkit_load_live_shaders first.";
   }
 
@@ -3434,7 +3442,7 @@ void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::spa
       .format_handle = [](uint64_t value) { return FormatHandle(value); },
       .format_format = [](reshade::api::format format) { return StreamToString(format); },
       .build_resource_view_summary = [](reshade::api::resource_view resource_view, reshade::api::device* device) { return BuildResourceViewSummary(GetResourceViewDetails(resource_view, device)); },
-      .set_shader_source = [](reshade::api::device* device, uint32_t shader_hash, std::string_view source_name) {
+      .set_shader_source = [](reshade::api::device* device, uint32_t shader_hash, std::string_view source_name, bool restoring) {
         auto* data = renodx::utils::data::Get<DeviceData>(device);
         if (data == nullptr || data->is_display_proxy) {
           throw std::runtime_error("Shader A/B needs the game's device, not the Display Proxy's.");
@@ -3445,12 +3453,13 @@ void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::spa
               "Shader A/B switches the shader every few frames, which this version does only on D3D9, D3D10, D3D11 and "
               "OpenGL: on D3D12/Vulkan a switch destroys a pipeline that frames still in flight may use.");
         }
-        const auto* const source_names_end = std::end(ShaderDetails::SHADER_SOURCE_MCP_NAMES);
-        const auto* const found_name = std::find_if(
-            std::begin(ShaderDetails::SHADER_SOURCE_MCP_NAMES),
-            source_names_end,
-            [&](const char* name) { return source_name == name; });
-        if (found_name == source_names_end) {
+        // Live Reload loads changed files at every present and would switch the shader in the middle of the A/B. A
+        // restore is never refused, so the shader cannot stay on one side.
+        if (setting_live_reload && !restoring) {
+          throw std::runtime_error("Turn the Devkit's Live Reload setting off for a shader A/B.");
+        }
+        const auto source = ShaderDetails::ParseShaderSourceMcpName(source_name);
+        if (!source.has_value()) {
           throw std::runtime_error("The shader source must be 'original', 'addon' or 'file'.");
         }
         std::unique_lock device_lock(data->mutex);
@@ -3459,8 +3468,7 @@ void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::spa
           throw std::runtime_error(std::format("Shader {} has not been seen on this device.", FormatShaderHash(shader_hash)));
         }
         const std::string previous_source = ShaderDetails::SHADER_SOURCE_MCP_NAMES[static_cast<int>(shader_details->second.shader_source)];
-        const auto source = static_cast<ShaderDetails::ShaderSource>(found_name - std::begin(ShaderDetails::SHADER_SOURCE_MCP_NAMES));
-        if (const auto error = SetShaderSource(device, &shader_details->second, source); error.has_value()) {
+        if (const auto error = SetShaderSource(device, &shader_details->second, source.value()); error.has_value()) {
           throw std::runtime_error(error.value());
         }
         return previous_source;
@@ -3964,15 +3972,11 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   auto request = std::make_shared<PendingLiveShaderRequest>();
   request->operation = PendingLiveShaderRequest::Operation::SET_SOURCE;
   request->shader_hash = shader_hash;
-  if (source_name == "original") {
-    request->source = ShaderDetails::ShaderSource::ORIGINAL_SHADER;
-  } else if (source_name == "addon") {
-    request->source = ShaderDetails::ShaderSource::ADDON_SHADER;
-  } else if (source_name == "file") {
-    request->source = ShaderDetails::ShaderSource::DISK_SHADER;
-  } else {
+  const auto source = ShaderDetails::ParseShaderSourceMcpName(source_name);
+  if (!source.has_value()) {
     throw std::runtime_error("source must be 'original', 'addon' or 'file'.");
   }
+  request->source = source.value();
   return RunLiveShaderRequestForMcp(device_index, request, "shader source");
 }
 
@@ -4613,7 +4617,17 @@ void ProcessPendingLiveShaderRequests(
           break;
         }
         case PendingLiveShaderRequest::Operation::SET_SOURCE: {
-          // A switch destroys the replacement pipeline at once; D3D12/Vulkan frames still in flight may use it.
+          {
+            std::shared_lock device_lock(device_data->mutex);
+            if (!device_data->shader_details.contains(request->shader_hash)) {
+              throw std::runtime_error(std::format(
+                  "Shader {} has not been seen on device #{}.",
+                  FormatShaderHash(request->shader_hash),
+                  device_index));
+            }
+          }
+          // A switch destroys the replacement pipeline at once; D3D12/Vulkan frames still in flight may use it. Only
+          // the present queue is waited on: other queues and command lists recorded ahead are not covered.
           const auto device_api = device_data->device->get_api();
           if (device_api == reshade::api::device_api::d3d12 || device_api == reshade::api::device_api::vulkan) {
             queue->wait_idle();
@@ -4646,7 +4660,7 @@ void ProcessPendingLiveShaderRequests(
                   {"source", source_name},
                   {"previousSource", previous_name},
                   {"addonReplacesShader", !details.addon_shader.empty()},
-                  {"hasLiveFile", details.disk_shader.has_value() && !details.disk_shader->removed && details.disk_shader->IsCompilationOK()},
+                  {"hasLiveFile", details.HasCompiledDiskShader()},
               },
           };
           break;
@@ -5562,11 +5576,16 @@ void OnInitPipelineTrackAddons(
   auto* data = renodx::utils::data::Get<DeviceData>(device);
   if (data == nullptr || data->is_display_proxy) return;
   if (data->has_synced_addon_shaders) return;
+  // The present thread reassigns disk shaders and switches sources under this lock.
+  const std::unique_lock lock(data->mutex);
 
   bool found_replacement = false;
   renodx::utils::shader::ForEachRuntimeReplacement(device, [&](uint32_t shader_hash, std::span<const uint8_t> bytecode) {
-        found_replacement = true;
         auto* shader_details = data->GetShaderDetails(shader_hash);
+        // The Devkit's own live files share the runtime map; they are not an add-on's replacement.
+        if (shader_details->HasCompiledDiskShader()
+            && shader_details->disk_shader->GetCompilationData().data() == bytecode.data()) return;
+        found_replacement = true;
         shader_details->addon_shader = bytecode;
         if (shader_details->shader_source != ShaderDetails::ShaderSource::DISK_SHADER) {
           shader_details->shader_source = ShaderDetails::ShaderSource::ADDON_SHADER;
@@ -8916,16 +8935,10 @@ void RenderShadersPane(reshade::api::device* device, DeviceData* data) {
 
               ImGui::BeginDisabled(
                   (i == 1 && shader_details->addon_shader.empty())
-                  || (i == 2 && (!shader_details->disk_shader.has_value() || !shader_details->disk_shader->IsCompilationOK())));
+                  || (i == 2 && !shader_details->HasCompiledDiskShader()));
               if (ImGui::Selectable(ShaderDetails::SHADER_SOURCE_NAMES[i], is_selected)) {
-                shader_details->shader_source = static_cast<ShaderDetails::ShaderSource>(i);
-                DeactivateShader(device, shader_details->shader_hash);
-                if (i == 1) {
-                  ActivateShader(device, shader_details->shader_hash, shader_details->addon_shader);
-                } else if (i == 2) {
-                  const auto& shader_data = shader_details->disk_shader->GetCompilationData();
-                  ActivateShader(device, shader_details->shader_hash, shader_data);
-                }
+                // The disabled entries are the sources SetShaderSource refuses; the overlay holds the device data's lock.
+                (void)SetShaderSource(device, shader_details, static_cast<ShaderDetails::ShaderSource>(i));
               }
               if (is_selected) {
                 ImGui::SetItemDefaultFocus();

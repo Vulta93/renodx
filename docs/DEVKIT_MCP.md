@@ -117,7 +117,9 @@ present thread and takes effect at the shader's next bind. Use it to find which 
 switch back to `addon`. Only that hash changes: the mod's resource upgrades, clones and swap-chain proxy stay, so
 `original` everywhere is not a vanilla view (the mod's Off preset is). With the Devkit loaded every mod replacement is a
 bind-time one (the Devkit sets `use_replace_async`), which is why the switch can undo a mod's shader at all. On D3D12 and
-Vulkan the present queue is waited idle before the switch, because it destroys the replacement pipeline at once.
+Vulkan the present queue is waited idle before the switch, because it destroys the replacement pipeline at once. That
+does not cover other queues (async compute, a separate present queue) or command lists already recorded for the next
+frame, so a device loss is still possible there; the overlay's combo has the same risk.
 
 Default devkit folder layout under the ReShade base path:
 
@@ -545,6 +547,24 @@ mean, and `rangesOverlap` when the two sides' min-max ranges overlap: a differen
 noise floor of the spot. Limits: `measurePoint: present`, no `outputPath`, the game's device (not a Display Proxy), and
 D3D9/D3D10/D3D11/OpenGL only, since on D3D12/Vulkan a switch destroys a pipeline that frames still in flight may use.
 Only that shader changes: the mod's resource upgrades and swap-chain proxy stay, so `original` is not a vanilla view.
+In an A/B, `frames.summary` is left out (it would mix both sides); `ab.a` and `ab.b` carry the summaries.
+
+More A/B rules and caveats:
+- Refused while the Devkit's Live Reload setting is on: it loads changed files at every present and would switch the
+  shader in the middle of the run. If it is turned on during a run, the next switch fails and the shader is put back
+  (the restore itself is never refused).
+- The previous source is put back on completion, failure and cancel. The recorded source can describe nothing active
+  (`file` after a live file failed to compile); then the shader falls back to `addon`, then `original`, and
+  `ab.restoredSource` and `ab.restoreNote` say so. After the overlay's "Unload Shaders", which removes the replacements
+  without resetting the recorded source, the restore brings the recorded replacement back.
+- The call gives up after 180 s (a game that stops presenting, for example minimized) and cancels the rest; the shader
+  gets its previous source back at the next present.
+- A frame measured right after a switch uses the new source for draws on the immediate context. Command lists recorded
+  ahead (D3D11 deferred contexts) can still hold the old one, and effects that carry earlier frames (TAA history, eye
+  adaptation, bloom feedback) mix the other side into each sample: an A-against-A run shows how much noise remains,
+  but not that lag.
+- Samples follow the device's presents. With several swap chains on one device they interleave windows, and `frame`
+  counts the presents the request saw, not the game's frame numbers.
 
 ### Display Proxy device
 

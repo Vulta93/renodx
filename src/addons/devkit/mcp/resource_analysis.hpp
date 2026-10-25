@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -92,6 +93,9 @@ struct PendingRequest {
   std::array<std::string, 2> ab_sources = {"original", "addon"};
   std::optional<std::string> ab_restore_source = std::nullopt;
   std::size_t ab_current_side = 0u;
+  // The source the shader has after the A/B, and why it is not ab_restore_source when restoring it failed.
+  std::string ab_restored_source;
+  std::string ab_restore_note;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -111,8 +115,9 @@ struct ProcessingContext {
   std::function<std::string(reshade::api::format format)> format_format;
   std::function<resource_view_summary::ResourceViewSummary(reshade::api::resource_view resource_view, reshade::api::device* device)> build_resource_view_summary;
   // Makes a shader draw from 'original', 'addon' or 'file' from its next bind and returns its previous source; throws
-  // why it cannot. Called on the present thread.
-  std::function<std::string(reshade::api::device* device, std::uint32_t shader_hash, std::string_view source)> set_shader_source;
+  // why it cannot. restoring marks the switch back at the end of an A/B, which only a missing source can refuse. Called
+  // on the present thread.
+  std::function<std::string(reshade::api::device* device, std::uint32_t shader_hash, std::string_view source, bool restoring)> set_shader_source;
 };
 
 namespace internal {
@@ -1581,6 +1586,8 @@ inline void EncodePreviewPixel(
 }  // namespace internal
 
 inline constexpr std::uint32_t MAX_ANALYSIS_FRAMES = 32u;
+// 65 analyses of a 4K frame with a signal take about a minute on the game's thread; three times that is room enough.
+inline constexpr std::uint32_t MAX_MULTI_FRAME_WAIT_SECONDS = 180u;
 
 // Headline numbers kept per frame of a multi-frame analysis, by JSON pointer into that frame's analysis. Missing or null
 // ones are left out (nits and colour need a signal).
@@ -1669,15 +1676,12 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       mcp_arguments::GetOptional<std::string>(arguments, "abSourceA").value_or("original"),
       mcp_arguments::GetOptional<std::string>(arguments, "abSourceB").value_or("addon"),
   };
-  if (ab_shader_hash.has_value()) {
-    for (const auto& ab_source : ab_sources) {
-      if (ab_source != "original" && ab_source != "addon" && ab_source != "file") {
-        throw std::runtime_error("abSourceA and abSourceB must be 'original', 'addon' or 'file'.");
-      }
-    }
-    if (measure_point != "present" || !output_path_value.empty()) {
-      throw std::runtime_error("abShaderHash needs measurePoint 'present' and no outputPath.");
-    }
+  // The source names themselves are checked when the game's thread switches the first time.
+  if (!ab_shader_hash.has_value() && (arguments.contains("abSourceA") || arguments.contains("abSourceB"))) {
+    throw std::runtime_error("abSourceA and abSourceB need abShaderHash.");
+  }
+  if (ab_shader_hash.has_value() && (measure_point != "present" || !output_path_value.empty())) {
+    throw std::runtime_error("abShaderHash needs measurePoint 'present' and no outputPath.");
   }
 
   std::optional<std::filesystem::path> output_path = std::nullopt;
@@ -1737,8 +1741,18 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       };
     }
 
-    if (!request->completed) {
-      request->cv.wait(request_lock, [&request] { return request->completed; });
+    // A multi-frame request spans many presents, which stop when the game is minimized or loading: give up then, and let
+    // the game's thread put an A/B shader back at its next present.
+    if (!request->cv.wait_for(request_lock, std::chrono::seconds(MAX_MULTI_FRAME_WAIT_SECONDS), [&request] { return request->completed; })) {
+      request->canceled = true;
+      const auto error = std::format(
+          "The multi-frame analysis did not finish within {} s (the game stopped presenting frames?). It is canceled; an A/B shader gets its previous source back at the next present.",
+          MAX_MULTI_FRAME_WAIT_SECONDS);
+      return ToolResult{
+          .text = error,
+          .structured_content = json{{"error", error}},
+          .is_error = true,
+      };
     }
   }
 
@@ -1774,14 +1788,15 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
   }
   result.structured_content["frames"] = {
       {"count", frame_samples.size()},
-      {"note", "analysis is the last frame; summary covers every frame (consecutive presents, numbered in frame)."},
-      {"summary", SummarizeFrameSamples(frame_samples)},
-      {"samples", std::move(frame_samples)},
+      {"note", "analysis is the last frame; frame numbers count the presents this request saw (one sample per present)."},
   };
   if (!ab_shader_hash.has_value()) {
-    result.text += std::format(" Measured {} consecutive frames; per-frame headline numbers and their summary are in frames.", frames);
+    result.structured_content["frames"]["summary"] = SummarizeFrameSamples(frame_samples);
+    result.structured_content["frames"]["samples"] = std::move(frame_samples);
+    result.text += std::format(" Measured {} frames, one per present; per-frame headline numbers and their summary are in frames.", frames);
     return result;
   }
+  result.structured_content["frames"]["samples"] = std::move(frame_samples);
 
   const auto summary_a = SummarizeFrameSamples(side_samples[0]);
   const auto summary_b = SummarizeFrameSamples(side_samples[1]);
@@ -1801,16 +1816,21 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       {"a", {{"source", ab_sources[0]}, {"summary", summary_a}}},
       {"b", {{"source", ab_sources[1]}, {"summary", summary_b}}},
       {"difference", std::move(difference)},
-      {"restoredSource", request->ab_restore_source.value_or("")},
-      {"note", "Frames alternate A, B, B, A, ... from the frame after the first switch; each side has frames samples. A difference whose ranges overlap is within frame-to-frame noise; run A against A (abSourceA = abSourceB) to see the noise floor."},
+      {"previousSource", request->ab_restore_source.value_or("")},
+      {"restoredSource", request->ab_restored_source},
+      {"note", "Frames alternate A, B, B, A, ... from the frame after the first switch; each side has frames samples. A difference whose ranges overlap is within frame-to-frame noise; run A against A (abSourceA = abSourceB) to see the noise floor. Effects that carry earlier frames (TAA history, eye adaptation, bloom feedback) mix both sides into each sample."},
   };
+  if (!request->ab_restore_note.empty()) {
+    result.structured_content["ab"]["restoreNote"] = request->ab_restore_note;
+  }
   result.text += std::format(
-      " A/B on shader 0x{:08X}: {} frames of '{}' (A) and of '{}' (B), alternating A, B, B, A; summaries and B minus A in ab. The shader's source is back to '{}'.",
+      " A/B on shader 0x{:08X}: {} frames of '{}' (A) and of '{}' (B), alternating A, B, B, A; summaries and B minus A in ab. The shader's source is now '{}'.{}",
       ab_shader_hash.value(),
       frames,
       ab_sources[0],
       ab_sources[1],
-      request->ab_restore_source.value_or(""));
+      request->ab_restored_source,
+      (request->ab_restore_note.empty() ? "" : std::format(" {}", request->ab_restore_note)));
   return result;
 }
 
@@ -1891,18 +1911,6 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
     const ProcessingContext& context) {
   std::deque<std::shared_ptr<PendingRequest>> unfinished;
   for (const auto& request : requests) {
-    {
-      std::scoped_lock request_lock(request->mutex);
-      if (request->completed || request->canceled) {
-        request->completed = true;
-        request->cv.notify_all();
-        continue;
-      }
-      request->started = true;
-    }
-    request->cv.notify_all();
-    ++request->presents_seen;
-
     const auto make_error = [](const std::string& error) {
       return ToolResult{
           .text = error,
@@ -1918,21 +1926,47 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       }
       request->cv.notify_all();
     };
-    // A/B ends with the shader's source as it was, whether the request finishes or fails. Returns why that failed.
-    const auto restore_ab_source = [&]() -> std::optional<std::string> {
-      if (!request->ab_restore_source.has_value()) return std::nullopt;
-      try {
-        (void)context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_restore_source.value());
-      } catch (const std::exception& exception) {
-        return std::string(exception.what());
+    // An A/B ends with the shader's source as it was, whether it finishes, fails or is canceled. The recorded source can
+    // describe nothing active (a live file that failed to compile), so a failed restore falls back to the add-on's
+    // shader, then to the original, and says so in ab_restore_note.
+    const auto restore_ab_source = [&]() {
+      if (!request->ab_restore_source.has_value()) return;
+      for (const auto* fallback_source : {request->ab_restore_source->c_str(), "addon", "original"}) {
+        try {
+          (void)context.set_shader_source(device, request->ab_shader_hash.value(), fallback_source, true);
+        } catch (const std::exception& exception) {
+          request->ab_restore_note += std::format("Restoring '{}' failed: {} ", fallback_source, exception.what());
+          continue;
+        }
+        request->ab_restored_source = fallback_source;
+        return;
       }
-      return std::nullopt;
     };
+
+    bool canceled = false;
+    {
+      std::scoped_lock request_lock(request->mutex);
+      if (request->completed) {
+        request->cv.notify_all();
+        continue;
+      }
+      canceled = request->canceled;
+      if (!canceled) {
+        request->started = true;
+      }
+    }
+    if (canceled) {
+      restore_ab_source();
+      complete(make_error("The resource analysis request was canceled."));
+      continue;
+    }
+    request->cv.notify_all();
+    ++request->presents_seen;
 
     // A/B: the first present only switches to side A, since the frame it ends was drawn before the switch.
     if (request->ab_shader_hash.has_value() && !request->ab_restore_source.has_value()) {
       try {
-        request->ab_restore_source = context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_sources[0]);
+        request->ab_restore_source = context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_sources[0], false);
       } catch (const std::exception& exception) {
         complete(make_error(exception.what()));
         continue;
@@ -1982,14 +2016,15 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
           const std::size_t next_side = ((sample_index == 0u || sample_index == 3u) ? 0u : 1u);
           if (next_side != request->ab_current_side) {
             try {
-              (void)context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_sources[next_side]);
+              (void)context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_sources[next_side], false);
             } catch (const std::exception& exception) {
-              const auto restore_error = restore_ab_source();
+              restore_ab_source();
               complete(make_error(std::format(
-                  "Switching to side {} failed: {}{}",
+                  "Switching to side {} failed: {} The shader's source is now '{}'. {}",
                   (next_side == 0u ? "A" : "B"),
                   exception.what(),
-                  (restore_error.has_value() ? std::format(" Restoring the shader's source failed too: {}", restore_error.value()) : ""))));
+                  request->ab_restored_source,
+                  request->ab_restore_note)));
               continue;
             }
             request->ab_current_side = next_side;
@@ -2000,12 +2035,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       }
     }
 
-    if (const auto restore_error = restore_ab_source(); restore_error.has_value()) {
-      result = make_error(std::format(
-          "The A/B finished, but restoring shader source '{}' failed: {}",
-          request->ab_restore_source.value(),
-          restore_error.value()));
-    }
+    restore_ab_source();
     complete(std::move(result));
   }
   return unfinished;
