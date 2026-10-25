@@ -699,6 +699,11 @@ the CPU at one measurement point at the end of the watch and compare it with the
   shaders): executions, frames seen, how often the region changed, min/mean/max of the region peak and mean before and after,
   how often the peak was lowered or raised, how often values went from above 1.0 to at most 1.0, and `afterPeakMode` (the most
   repeated after-peak, a ceiling candidate).
+- Alpha: every measurement has `maxAlpha` and `pixelsAlphaAboveOne` (alpha as stored, of the finite pixels; formats
+  without alpha read 1, so their numbers say nothing), and `writers[]` add `raisedAlphaAboveOneExecutions` (no pixel's
+  alpha was above 1.0 before the writer and some is after) and `afterMaxAlpha`. This finds the draw that pushes alpha out
+  of range after an 8-bit target was upgraded to float (Dead Cells: the glow layer's alpha summed to 3.5-7.2). `verify`
+  checks both alpha numbers against the CPU. Same layout on every API (the reduce shaders' slots 14 and 15; D3D9 group 3).
 - Writers whose state before or after could not be measured are never dropped: each one is in `trace` with `measured: false`,
   `unmeasuredSide` and `unmeasuredReason`, counted in `writers[].unmeasuredExecutions`/`unmeasuredReasons`, in
   `unmeasured.reasons`, and its frame is listed in `unmeasured.frames`. Reasons: `slot_limit` (more than 1023 measurements in a

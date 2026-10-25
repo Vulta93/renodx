@@ -5,7 +5,7 @@
 //   group 0: max luminance, min luminance, max channel, luminance sum
 //   group 1: finite, non-finite, negative and above-1.0 pixel counts
 //   group 2: black, above 203, above 400 and above 1000 nits pixel counts
-//   group 3: above 4000 nits pixel count
+//   group 3: above 4000 nits pixel count, max alpha, alpha-above-1.0 pixel count
 // Intermediate passes write the four groups to four render targets (MRT). The last pass writes one row of the stats
 // target instead: four pixels (x = group) at y = the measurement's slot.
 // Counts are floats, exact up to 2^24 pixels, the largest region watched on Direct3D 9. The luminance sum is a float sum
@@ -70,7 +70,8 @@ Output main(float2 position : VPOS) {
       if (texel.x < input_extent_pass_signal.x && texel.y < input_extent_pass_signal.y) {
         const float4 uv = float4((input_origin_and_size.xy + texel + 0.5f) / input_origin_and_size.zw, 0.f, 0.f);
         if (first_pass) {
-          const float3 rgb = tex2Dlod(input0, uv).rgb;
+          const float4 rgba = tex2Dlod(input0, uv);
+          const float3 rgb = rgba.rgb;
           if (!IsFinite(rgb.r) || !IsFinite(rgb.g) || !IsFinite(rgb.b)) {
             group1.y += 1.f;
           } else {
@@ -95,6 +96,11 @@ Output main(float2 position : VPOS) {
             group1.z += (rgb.r < 0.f || rgb.g < 0.f || rgb.b < 0.f) ? 1.f : 0.f;
             group1.w += (rgb.r > 1.f || rgb.g > 1.f || rgb.b > 1.f) ? 1.f : 0.f;
             group2.x += (rgb.r == 0.f && rgb.g == 0.f && rgb.b == 0.f) ? 1.f : 0.f;
+            // Alpha as stored (formats without alpha read 1); a non-finite alpha contributes nothing.
+            if (IsFinite(rgba.a)) {
+              group3.y = max(group3.y, max(rgba.a, 0.f));
+              group3.z += rgba.a > 1.f ? 1.f : 0.f;
+            }
             if (signal == SIGNAL_PQ || signal == SIGNAL_SCRGB) {
               group2.y += luminance > 203.f ? 1.f : 0.f;
               group2.z += luminance > 400.f ? 1.f : 0.f;
@@ -110,7 +116,10 @@ Output main(float2 position : VPOS) {
           group0.w += merged0.w;
           group1 += tex2Dlod(input1, uv);
           group2 += tex2Dlod(input2, uv);
-          group3 += tex2Dlod(input3, uv);
+          const float4 merged3 = tex2Dlod(input3, uv);
+          group3.x += merged3.x;
+          group3.y = max(group3.y, merged3.y);
+          group3.z += merged3.z;
         }
       }
     }

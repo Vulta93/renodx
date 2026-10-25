@@ -20,6 +20,8 @@
 #define STATS_ABOVE_4000_COUNT 11
 #define STATS_FINITE_COUNT 12
 #define STATS_BLACK_COUNT 13
+#define STATS_MAX_ALPHA_BITS 14
+#define STATS_ALPHA_ABOVE_ONE_COUNT 15
 
 #define SIGNAL_RAW 0
 #define SIGNAL_PQ 1
@@ -42,7 +44,8 @@
 #define COUNT_ABOVE_4000 6
 #define COUNT_FINITE 7
 #define COUNT_BLACK 8
-#define COUNT_KINDS 9
+#define COUNT_ALPHA_ABOVE_ONE 9
+#define COUNT_KINDS 10
 
 // Vulkan uses this same source through a precompiled SPIR-V 1.0 module (watch_region_reduce.comp.spv): the default
 // Slang build emits SPIR-V 1.5, which is invalid on Vulkan 1.0/1.1 devices. After changing this file, regenerate it with
@@ -75,6 +78,7 @@ VULKAN_PUSH_CONSTANT cbuffer Constants CONSTANTS_REGISTER {
 groupshared uint shared_max_luminance[GROUP_THREADS];
 groupshared uint shared_min_luminance_inverted[GROUP_THREADS];
 groupshared uint shared_max_channel[GROUP_THREADS];
+groupshared uint shared_max_alpha[GROUP_THREADS];
 groupshared float shared_luminance_sum[GROUP_THREADS];
 groupshared uint shared_counts[COUNT_KINDS][GROUP_THREADS];
 
@@ -93,11 +97,13 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
   uint max_luminance_bits = 0u;
   uint min_luminance_inverted_bits = 0u;
   uint max_channel_bits = 0u;
+  uint max_alpha_bits = 0u;
   float luminance_sum = 0.f;
-  uint counts[COUNT_KINDS] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+  uint counts[COUNT_KINDS] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
 
   if (dispatch_thread_id.x < region_width && dispatch_thread_id.y < region_height) {
-    const float3 rgb = source.Load(int3(dispatch_thread_id.xy, 0)).rgb;
+    const float4 rgba = source.Load(int3(dispatch_thread_id.xy, 0));
+    const float3 rgb = rgba.rgb;
 
     if (IsNonFinite(rgb.r) || IsNonFinite(rgb.g) || IsNonFinite(rgb.b)) {
       counts[COUNT_NON_FINITE] = 1u;
@@ -128,6 +134,11 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
       counts[COUNT_NEGATIVE] = (rgb.r < 0.f || rgb.g < 0.f || rgb.b < 0.f) ? 1u : 0u;
       counts[COUNT_ABOVE_ONE] = (rgb.r > 1.f || rgb.g > 1.f || rgb.b > 1.f) ? 1u : 0u;
       counts[COUNT_BLACK] = (rgb.r == 0.f && rgb.g == 0.f && rgb.b == 0.f) ? 1u : 0u;
+      // Alpha as stored (formats without alpha read 1); a non-finite alpha contributes nothing.
+      if (!IsNonFinite(rgba.a)) {
+        max_alpha_bits = asuint((rgba.a > 0.f) ? rgba.a : 0.f);
+        counts[COUNT_ALPHA_ABOVE_ONE] = (rgba.a > 1.f) ? 1u : 0u;
+      }
       if (signal != SIGNAL_RAW) {
         counts[COUNT_ABOVE_203] = luminance > 203.f ? 1u : 0u;
         counts[COUNT_ABOVE_400] = luminance > 400.f ? 1u : 0u;
@@ -140,6 +151,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
   shared_max_luminance[group_index] = max_luminance_bits;
   shared_min_luminance_inverted[group_index] = min_luminance_inverted_bits;
   shared_max_channel[group_index] = max_channel_bits;
+  shared_max_alpha[group_index] = max_alpha_bits;
   shared_luminance_sum[group_index] = luminance_sum;
   [unroll]
   for (uint count_index = 0u; count_index < COUNT_KINDS; ++count_index) {
@@ -155,6 +167,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
       shared_max_luminance[group_index] = max(shared_max_luminance[group_index], shared_max_luminance[group_index + stride]);
       shared_min_luminance_inverted[group_index] = max(shared_min_luminance_inverted[group_index], shared_min_luminance_inverted[group_index + stride]);
       shared_max_channel[group_index] = max(shared_max_channel[group_index], shared_max_channel[group_index + stride]);
+      shared_max_alpha[group_index] = max(shared_max_alpha[group_index], shared_max_alpha[group_index + stride]);
       shared_luminance_sum[group_index] += shared_luminance_sum[group_index + stride];
       [unroll]
       for (uint count_index = 0u; count_index < COUNT_KINDS; ++count_index) {
@@ -175,6 +188,7 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
   InterlockedMax(stats[uint2(STATS_MAX_LUMINANCE_BITS, slot)], shared_max_luminance[0]);
   InterlockedMax(stats[uint2(STATS_MIN_LUMINANCE_INVERTED_BITS, slot)], shared_min_luminance_inverted[0]);
   InterlockedMax(stats[uint2(STATS_MAX_CHANNEL_BITS, slot)], shared_max_channel[0]);
+  InterlockedMax(stats[uint2(STATS_MAX_ALPHA_BITS, slot)], shared_max_alpha[0]);
 
   // 64-bit fixed-point sum: split the scaled group sum into high and low words, add the low word and carry into the high
   // word when it wraps.
@@ -196,4 +210,5 @@ void main(uint3 dispatch_thread_id : SV_DispatchThreadID, uint group_index : SV_
   InterlockedAdd(stats[uint2(STATS_ABOVE_400_COUNT, slot)], shared_counts[COUNT_ABOVE_400][0]);
   InterlockedAdd(stats[uint2(STATS_ABOVE_1000_COUNT, slot)], shared_counts[COUNT_ABOVE_1000][0]);
   InterlockedAdd(stats[uint2(STATS_ABOVE_4000_COUNT, slot)], shared_counts[COUNT_ABOVE_4000][0]);
+  InterlockedAdd(stats[uint2(STATS_ALPHA_ABOVE_ONE_COUNT, slot)], shared_counts[COUNT_ALPHA_ABOVE_ONE][0]);
 }

@@ -138,6 +138,8 @@ constexpr std::uint32_t STATS_ABOVE_1000_COUNT = 10u;
 constexpr std::uint32_t STATS_ABOVE_4000_COUNT = 11u;
 constexpr std::uint32_t STATS_FINITE_COUNT = 12u;
 constexpr std::uint32_t STATS_BLACK_COUNT = 13u;
+constexpr std::uint32_t STATS_MAX_ALPHA_BITS = 14u;
+constexpr std::uint32_t STATS_ALPHA_ABOVE_ONE_COUNT = 15u;
 // D3D9: float positions of the same statistics in one row of the stats target (4 pixels of 4 floats). Keep in sync with
 // watch_region_reduce_dx9.ps_3_0.hlsl. The row is converted to the word layout above after the readback.
 constexpr std::uint32_t D3D9_STATS_MAX_LUMINANCE = 0u;
@@ -153,6 +155,8 @@ constexpr std::uint32_t D3D9_STATS_ABOVE_203_COUNT = 9u;
 constexpr std::uint32_t D3D9_STATS_ABOVE_400_COUNT = 10u;
 constexpr std::uint32_t D3D9_STATS_ABOVE_1000_COUNT = 11u;
 constexpr std::uint32_t D3D9_STATS_ABOVE_4000_COUNT = 12u;
+constexpr std::uint32_t D3D9_STATS_MAX_ALPHA = 13u;
+constexpr std::uint32_t D3D9_STATS_ALPHA_ABOVE_ONE_COUNT = 14u;
 // D3D9: the four float4 groups of a row, written to four render targets by the intermediate reduction passes.
 constexpr std::uint32_t D3D9_STATS_GROUPS = 4u;
 constexpr std::uint32_t D3D9_REDUCTION_BLOCK_SIZE = 8u;
@@ -293,10 +297,13 @@ struct RegionStats {
   std::uint32_t above_one_count = 0u;
   std::uint32_t black_count = 0u;
   std::array<std::uint32_t, 4> above_nits_counts = {};
+  // Alpha as stored, of the finite pixels (formats without alpha read 1).
+  std::uint32_t alpha_above_one_count = 0u;
   double max_luminance = 0.0;
   double min_luminance = 0.0;
   double mean_luminance = 0.0;
   double max_channel = 0.0;
+  double max_alpha = 0.0;
 };
 
 // A committed measurement, identified by its position in commit (submission) order.
@@ -369,6 +376,8 @@ struct WriterAggregate {
   std::uint64_t peak_lowered_executions = 0u;
   std::uint64_t peak_raised_executions = 0u;
   std::uint64_t dropped_above_one_executions = 0u;
+  // Executions after which some pixel's alpha was above 1.0 when none was before (a blend or upgrade side effect).
+  std::uint64_t raised_alpha_above_one_executions = 0u;
   std::uint64_t unmeasured_executions = 0u;
   std::uint64_t cross_queue_executions = 0u;
   std::map<UnmeasuredReason, std::uint64_t> unmeasured_reasons = {};
@@ -378,6 +387,7 @@ struct WriterAggregate {
   RunningRange after_peak;
   RunningRange before_mean;
   RunningRange after_mean;
+  RunningRange after_max_alpha;
   std::map<std::int64_t, std::uint64_t> after_peak_buckets;
 };
 
@@ -2790,6 +2800,8 @@ inline void ProcessAtFrameEnd(
         stats_json["minLuminance"] = stats.min_luminance;
         stats_json["meanLuminance"] = stats.mean_luminance;
         stats_json["maxChannel"] = stats.max_channel;
+        stats_json["maxAlpha"] = stats.max_alpha;
+        stats_json["pixelsAlphaAboveOne"] = stats.alpha_above_one_count;
       }
       if (session->signal != Signal::RAW) {
         stats_json["pixelsAboveNits"] = json{
@@ -2889,6 +2901,9 @@ inline void ProcessAtFrameEnd(
           if (before_value.above_one_count != 0u && after_value.above_one_count == 0u) {
             ++aggregate.dropped_above_one_executions;
           }
+          if (before_value.alpha_above_one_count == 0u && after_value.alpha_above_one_count != 0u) {
+            ++aggregate.raised_alpha_above_one_executions;
+          }
           if (before_value.finite_count != 0u) {
             aggregate.before_peak.Add(before_value.max_luminance);
             aggregate.before_mean.Add(before_value.mean_luminance);
@@ -2896,6 +2911,7 @@ inline void ProcessAtFrameEnd(
           if (after_value.finite_count != 0u) {
             aggregate.after_peak.Add(after_value.max_luminance);
             aggregate.after_mean.Add(after_value.mean_luminance);
+            aggregate.after_max_alpha.Add(after_value.max_alpha);
             const auto bucket = (after_value.max_luminance > 0.0)
                                     ? static_cast<std::int64_t>(std::llround(std::log10(after_value.max_luminance) * CEILING_BUCKETS_PER_DECADE))
                                     : (std::numeric_limits<std::int64_t>::min)();
@@ -3079,6 +3095,8 @@ inline void ProcessAtFrameEnd(
             row[STATS_ABOVE_4000_COUNT] = count(D3D9_STATS_ABOVE_4000_COUNT);
             row[STATS_FINITE_COUNT] = count(D3D9_STATS_FINITE_COUNT);
             row[STATS_BLACK_COUNT] = count(D3D9_STATS_BLACK_COUNT);
+            row[STATS_MAX_ALPHA_BITS] = std::bit_cast<std::uint32_t>(values[D3D9_STATS_MAX_ALPHA]);
+            row[STATS_ALPHA_ABOVE_ONE_COUNT] = count(D3D9_STATS_ALPHA_ABOVE_ONE_COUNT);
           }
         }
       }
@@ -3115,10 +3133,12 @@ inline void ProcessAtFrameEnd(
           stats.above_one_count = row[STATS_ABOVE_ONE_COUNT];
           stats.black_count = row[STATS_BLACK_COUNT];
           stats.above_nits_counts = {row[STATS_ABOVE_203_COUNT], row[STATS_ABOVE_400_COUNT], row[STATS_ABOVE_1000_COUNT], row[STATS_ABOVE_4000_COUNT]};
+          stats.alpha_above_one_count = row[STATS_ALPHA_ABOVE_ONE_COUNT];
           if (stats.finite_count != 0u) {
             stats.max_luminance = std::bit_cast<float>(row[STATS_MAX_LUMINANCE_BITS]);
             stats.min_luminance = std::bit_cast<float>(~row[STATS_MIN_LUMINANCE_INVERTED_BITS]);
             stats.max_channel = std::bit_cast<float>(row[STATS_MAX_CHANNEL_BITS]);
+            stats.max_alpha = std::bit_cast<float>(row[STATS_MAX_ALPHA_BITS]);
             const auto luminance_sum = (static_cast<std::uint64_t>(row[STATS_LUMINANCE_SUM_HIGH]) << 32u) | row[STATS_LUMINANCE_SUM_LOW];
             stats.mean_luminance = static_cast<double>(luminance_sum) / (LUMINANCE_SUM_SCALE * static_cast<double>(stats.finite_count));
           }
@@ -3913,6 +3933,8 @@ inline void ProcessAtFrameEnd(
                 {"peakLoweredExecutions", aggregate.peak_lowered_executions},
                 {"peakRaisedExecutions", aggregate.peak_raised_executions},
                 {"droppedAboveOneExecutions", aggregate.dropped_above_one_executions},
+                {"raisedAlphaAboveOneExecutions", aggregate.raised_alpha_above_one_executions},
+                {"afterMaxAlpha", range_to_json(aggregate.after_max_alpha)},
                 {"unmeasuredExecutions", aggregate.unmeasured_executions},
                 {"beforePeak", range_to_json(aggregate.before_peak)},
                 {"afterPeak", range_to_json(aggregate.after_peak)},
@@ -4065,6 +4087,12 @@ inline void ProcessAtFrameEnd(
                   if (rgba[0] == 0.f && rgba[1] == 0.f && rgba[2] == 0.f) {
                     ++cpu_stats.black_count;
                   }
+                  if (std::isfinite(rgba[3])) {
+                    cpu_stats.max_alpha = std::max(cpu_stats.max_alpha, std::max(static_cast<double>(rgba[3]), 0.0));
+                    if (rgba[3] > 1.f) {
+                      ++cpu_stats.alpha_above_one_count;
+                    }
+                  }
                   if (session->signal != Signal::RAW) {
                     for (std::size_t threshold_index = 0u; threshold_index < NITS_THRESHOLDS.size(); ++threshold_index) {
                       if (luminance > NITS_THRESHOLDS[threshold_index]) {
@@ -4113,6 +4141,8 @@ inline void ProcessAtFrameEnd(
                 compare_value("minLuminance", gpu_stats.min_luminance, cpu_stats.min_luminance);
                 compare_value("meanLuminance", gpu_stats.mean_luminance, cpu_stats.mean_luminance);
                 compare_value("maxChannel", gpu_stats.max_channel, cpu_stats.max_channel);
+                compare_count("pixelsAlphaAboveOne", gpu_stats.alpha_above_one_count, cpu_stats.alpha_above_one_count, 0u);
+                compare_value("maxAlpha", gpu_stats.max_alpha, cpu_stats.max_alpha);
 
                 const auto verify_matched = mismatches.empty();
                 summary += std::format("\nVerify (CPU readback of the same measurement point): {}.", (verify_matched ? "match" : "MISMATCH"));

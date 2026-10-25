@@ -53,6 +53,8 @@
 #define STATS_ABOVE_4000_COUNT 11
 #define STATS_FINITE_COUNT 12
 #define STATS_BLACK_COUNT 13
+#define STATS_MAX_ALPHA_BITS 14
+#define STATS_ALPHA_ABOVE_ONE_COUNT 15
 
 #define SIGNAL_RAW 0
 #define SIGNAL_PQ 1
@@ -77,7 +79,8 @@
 #define COUNT_ABOVE_4000 6
 #define COUNT_FINITE 7
 #define COUNT_BLACK 8
-#define COUNT_KINDS 9
+#define COUNT_ALPHA_ABOVE_ONE 9
+#define COUNT_KINDS 10
 
 layout(local_size_x = GROUP_SIZE, local_size_y = GROUP_SIZE, local_size_z = 1) in;
 
@@ -87,6 +90,7 @@ layout(binding = STATS_UNIT, r32ui) uniform coherent uimage2D stats;
 shared uint shared_max_luminance[GROUP_THREADS];
 shared uint shared_min_luminance_inverted[GROUP_THREADS];
 shared uint shared_max_channel[GROUP_THREADS];
+shared uint shared_max_alpha[GROUP_THREADS];
 shared float shared_luminance_sum[GROUP_THREADS];
 shared uint shared_counts[COUNT_KINDS][GROUP_THREADS];
 
@@ -112,12 +116,14 @@ void main() {
   uint max_luminance_bits = 0u;
   uint min_luminance_inverted_bits = 0u;
   uint max_channel_bits = 0u;
+  uint max_alpha_bits = 0u;
   float luminance_sum = 0.0;
-  uint counts[COUNT_KINDS] = uint[COUNT_KINDS](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+  uint counts[COUNT_KINDS] = uint[COUNT_KINDS](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
 
   if (gl_GlobalInvocationID.x < uint(REGION_WIDTH) && gl_GlobalInvocationID.y < uint(REGION_HEIGHT)) {
     ivec2 cell_origin = ivec2(int(slot % uint(ATLAS_COLUMNS)) * REGION_WIDTH, int(slot / uint(ATLAS_COLUMNS)) * REGION_HEIGHT);
-    vec3 rgb = imageLoad(atlas, cell_origin + ivec2(gl_GlobalInvocationID.xy)).rgb;
+    vec4 rgba = imageLoad(atlas, cell_origin + ivec2(gl_GlobalInvocationID.xy));
+    vec3 rgb = rgba.rgb;
 #if SRGB_DECODE
     rgb = vec3(DecodeSrgb(rgb.r), DecodeSrgb(rgb.g), DecodeSrgb(rgb.b));
 #endif
@@ -151,6 +157,11 @@ void main() {
       counts[COUNT_NEGATIVE] = (rgb.r < 0.0 || rgb.g < 0.0 || rgb.b < 0.0) ? 1u : 0u;
       counts[COUNT_ABOVE_ONE] = (rgb.r > 1.0 || rgb.g > 1.0 || rgb.b > 1.0) ? 1u : 0u;
       counts[COUNT_BLACK] = (rgb.r == 0.0 && rgb.g == 0.0 && rgb.b == 0.0) ? 1u : 0u;
+      // Alpha as stored (formats without alpha read 1); a non-finite alpha contributes nothing.
+      if (!IsNonFinite(rgba.a)) {
+        max_alpha_bits = floatBitsToUint((rgba.a > 0.0) ? rgba.a : 0.0);
+        counts[COUNT_ALPHA_ABOVE_ONE] = (rgba.a > 1.0) ? 1u : 0u;
+      }
 #if SIGNAL != SIGNAL_RAW
       counts[COUNT_ABOVE_203] = luminance > 203.0 ? 1u : 0u;
       counts[COUNT_ABOVE_400] = luminance > 400.0 ? 1u : 0u;
@@ -163,6 +174,7 @@ void main() {
   shared_max_luminance[group_index] = max_luminance_bits;
   shared_min_luminance_inverted[group_index] = min_luminance_inverted_bits;
   shared_max_channel[group_index] = max_channel_bits;
+  shared_max_alpha[group_index] = max_alpha_bits;
   shared_luminance_sum[group_index] = luminance_sum;
   for (uint count_index = 0u; count_index < uint(COUNT_KINDS); ++count_index) {
     shared_counts[count_index][group_index] = counts[count_index];
@@ -177,6 +189,7 @@ void main() {
       shared_max_luminance[group_index] = max(shared_max_luminance[group_index], shared_max_luminance[group_index + stride]);
       shared_min_luminance_inverted[group_index] = max(shared_min_luminance_inverted[group_index], shared_min_luminance_inverted[group_index + stride]);
       shared_max_channel[group_index] = max(shared_max_channel[group_index], shared_max_channel[group_index + stride]);
+      shared_max_alpha[group_index] = max(shared_max_alpha[group_index], shared_max_alpha[group_index + stride]);
       shared_luminance_sum[group_index] += shared_luminance_sum[group_index + stride];
       for (uint count_index = 0u; count_index < uint(COUNT_KINDS); ++count_index) {
         shared_counts[count_index][group_index] += shared_counts[count_index][group_index + stride];
@@ -197,6 +210,7 @@ void main() {
   imageAtomicMax(stats, ivec2(STATS_MAX_LUMINANCE_BITS, int(slot)), shared_max_luminance[0]);
   imageAtomicMax(stats, ivec2(STATS_MIN_LUMINANCE_INVERTED_BITS, int(slot)), shared_min_luminance_inverted[0]);
   imageAtomicMax(stats, ivec2(STATS_MAX_CHANNEL_BITS, int(slot)), shared_max_channel[0]);
+  imageAtomicMax(stats, ivec2(STATS_MAX_ALPHA_BITS, int(slot)), shared_max_alpha[0]);
 
   // 64-bit fixed-point sum: split the scaled group sum into high and low words, add the low word and carry into the high
   // word when it wraps.
@@ -217,4 +231,5 @@ void main() {
   imageAtomicAdd(stats, ivec2(STATS_ABOVE_400_COUNT, int(slot)), shared_counts[COUNT_ABOVE_400][0]);
   imageAtomicAdd(stats, ivec2(STATS_ABOVE_1000_COUNT, int(slot)), shared_counts[COUNT_ABOVE_1000][0]);
   imageAtomicAdd(stats, ivec2(STATS_ABOVE_4000_COUNT, int(slot)), shared_counts[COUNT_ABOVE_4000][0]);
+  imageAtomicAdd(stats, ivec2(STATS_ALPHA_ABOVE_ONE_COUNT, int(slot)), shared_counts[COUNT_ALPHA_ABOVE_ONE][0]);
 }
