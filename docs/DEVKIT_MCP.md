@@ -356,9 +356,9 @@ thousands of draws:
 Comparing two frames (`saveBaseline`, `compareWith`): `saveBaseline` (absolute path ending in `.json`; the file is
 overwritten) writes every pass's
 structure: its targets and inputs with the format the game created and the format rendered, their sizes and swap-chain
-flag, its shader hashes, command count and hint types. The file survives a game restart, which most comparisons need
-(upgrades and mod changes act at creation, and resource handles change with a restart). `compareWith` takes such a file
-and adds `comparison`:
+flag, its shader hashes, command count and hint types, and returns the path as `baselineSaved`. The file survives a
+game restart, which most comparisons need (upgrades and mod changes act at creation, and resource handles change with
+a restart). `compareWith` takes such a file and adds `comparison`:
 - Passes are aligned in frame order (longest common subsequence) by kind, the targets as the game created them (format,
   size, swap chain) and blend, so a pass whose target a mod upgraded or cloned still aligns.
 - For each aligned pass, `changes`: `targetRenderedFormat` (a target now upgraded or cloned, or no longer),
@@ -598,7 +598,9 @@ game's own curve (mid grey, shoulder, peak).
 - Also reported: `midGray` (output at mid grey and the log-log slope there; mid grey is a linear 0.18 for a `raw`
   input and 14.4 nits for `scrgb`; a `pq` input is absolute display light with no scene mid grey, so none),
   `peakOutputP99_9`, `highestMedianOutput` and `shoulderInput` (where the median output first reaches 90% of its highest
-  value, reported only when that value is positive). Pixels with any non-finite channel, alpha included, are left out.
+  value, reported only when that value is positive; `null` when only the top bin reaches it: the curve rises into the
+  last bin, and a clip or knee inside that bin is not resolved; more `bins` or a smaller region can).
+  Pixels with any non-finite channel, alpha included, are left out.
 - Validity: both textures are read at the end of the frame, after the whole frame. When the snapshot shows a later
   draw, dispatch or copy writing the input or the output again (a ping-pong chain, UI drawn onto the output), the call
   refuses and lists them (`laterInputWriters`, `laterOutputWriters`); `allowLaterWriters` overrides it when a region

@@ -2070,11 +2070,19 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
   const auto highest_point = std::ranges::max_element(points, {}, &CurvePoint::output);
   result_json["peakOutputP99_9"] = peak_output;
   result_json["highestMedianOutput"] = {{"input", highest_point->input}, {"output", highest_point->output}};
-  // Only a positive curve has a shoulder (a pass picked by mistake can output signed values).
+  // Only a positive curve has a shoulder (a pass picked by mistake can output signed values). When only the top bin
+  // reaches 90% of the highest median, the curve rises into the last bin and no shoulder is resolved below it.
   std::optional<double> shoulder_input = std::nullopt;
+  bool still_rising_at_top = false;
   if (highest_point->output > 0.0) {
-    shoulder_input = std::ranges::find_if(points, [&](const CurvePoint& point) { return point.output >= highest_point->output * 0.9; })->input;
-    result_json["shoulderInput"] = shoulder_input.value();
+    const auto shoulder_point = std::ranges::find_if(points, [&](const CurvePoint& point) { return point.output >= highest_point->output * 0.9; });
+    if (shoulder_point == points.end() - 1) {
+      still_rising_at_top = true;
+      result_json["shoulderInput"] = nullptr;
+    } else {
+      shoulder_input = shoulder_point->input;
+      result_json["shoulderInput"] = shoulder_input.value();
+    }
   }
   result_json["note"] =
       "An effective transfer: median output per log-spaced input bin of the pixels this pass read and wrote in one frame. "
@@ -2095,6 +2103,9 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       highest_point->input);
   if (shoulder_input.has_value()) {
     text += std::format(" 90% of that from input {:.4g}.", shoulder_input.value());
+  }
+  if (still_rising_at_top) {
+    text += " Only the top bin reaches 90% of the highest median: no shoulder resolved below it (a clip or knee inside the top bin is not resolved; a smaller region or more bins can).";
   }
   if (result_json.contains("midGray")) {
     text += std::format(

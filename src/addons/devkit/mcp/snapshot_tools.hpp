@@ -1461,6 +1461,9 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
   if (!comparison.is_null()) {
     result.structured_content["comparison"] = std::move(comparison);
   }
+  if (save_baseline_path.has_value()) {
+    result.structured_content["baselineSaved"] = save_baseline_path.value();
+  }
   return result;
 }
 }  // namespace renodx::addons::devkit::mcp::snapshot_tools
