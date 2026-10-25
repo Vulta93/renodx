@@ -1106,6 +1106,9 @@ inline void EncodePreviewPixel(
       }
     }
 
+    if (pixel_luminance != nullptr) {
+      pixel_luminance->reserve(static_cast<std::size_t>(width) * height);
+    }
     for (uint32_t y = 0; y < height && supported_format; ++y) {
       const auto* row = static_cast<const std::uint8_t*>(mapped_data.data) + (static_cast<size_t>(mapped_data.row_pitch) * y);
       const auto pixel_stride = static_cast<size_t>(reshade::api::format_row_pitch(intermediate_format, 1));
@@ -1142,6 +1145,7 @@ inline void EncodePreviewPixel(
         if (has_nan) ++nan_pixel_count;
         if (has_inf) ++inf_pixel_count;
         if (has_nan || has_inf) {
+          // A non-finite alpha drops the pixel too, as for every statistic here.
           if (pixel_luminance != nullptr) {
             pixel_luminance->push_back(std::numeric_limits<float>::quiet_NaN());
           }
@@ -1960,16 +1964,23 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
   if (pairs.size() < MIN_BIN_PIXELS * 4u) {
     throw std::runtime_error(std::format("Only {} pixels have a finite, positive input: too few for a curve.", pairs.size()));
   }
+  // Two 4K frames of floats are 66 MB; free them before the binning copies (32-bit games have little address space).
+  std::vector<float>().swap(request->curve_input_luminance);
+  std::vector<float>().swap(request->curve_output_luminance);
 
-  // The bins span the input's 0.5th to 99.5th percentile, so a few stray pixels do not stretch them.
-  std::vector<float> sorted_inputs;
-  sorted_inputs.reserve(pairs.size());
+  // The bins span the input's 0.5th to 99.5th percentile, so a few stray pixels do not stretch them. One scratch buffer
+  // serves the input percentiles, then the output peak.
+  std::vector<float> scratch;
+  scratch.reserve(pairs.size());
   for (const auto& [input_value, output_value] : pairs) {
-    sorted_inputs.push_back(input_value);
+    scratch.push_back(input_value);
   }
-  std::ranges::sort(sorted_inputs);
-  const auto input_low = static_cast<double>(sorted_inputs[sorted_inputs.size() / 200u]);
-  const auto input_high = static_cast<double>(sorted_inputs[sorted_inputs.size() - 1u - (sorted_inputs.size() / 200u)]);
+  const auto nth_value = [&scratch](std::size_t index) {
+    std::nth_element(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(index), scratch.end());
+    return static_cast<double>(scratch[index]);
+  };
+  const auto input_low = nth_value(scratch.size() / 200u);
+  const auto input_high = nth_value(scratch.size() - 1u - (scratch.size() / 200u));
   if (!(input_high > input_low)) {
     throw std::runtime_error("The input luminance has no range in this region (a flat area?).");
   }
@@ -1978,10 +1989,9 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
 
   std::vector<std::vector<float>> bin_inputs(bin_count);
   std::vector<std::vector<float>> bin_outputs(bin_count);
-  std::vector<float> all_outputs;
-  all_outputs.reserve(pairs.size());
+  scratch.clear();
   for (const auto& [input_value, output_value] : pairs) {
-    all_outputs.push_back(output_value);
+    scratch.push_back(output_value);
     const auto bin = static_cast<std::int64_t>(std::floor((std::log(static_cast<double>(input_value)) - log_low) / log_step));
     if (bin < 0 || bin >= static_cast<std::int64_t>(bin_count)) continue;
     bin_inputs[static_cast<std::size_t>(bin)].push_back(input_value);
@@ -2032,14 +2042,23 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
     result_json["laterOutputWriters"] = views.later_output_writers;
   }
 
-  // Mid grey: the output at input 0.18 and the log-log slope there, from the two points around it.
-  const auto above_mid_gray = std::ranges::find_if(points, [&](const CurvePoint& point) { return point.input >= MID_GRAY; });
-  if (above_mid_gray != points.begin() && above_mid_gray != points.end()) {
+  // Mid grey: the output at a linear 0.18 (14.4 nits as scRGB) and the log-log slope there, from the two points around
+  // it. A PQ input is absolute display light, which has no scene mid grey, so none is reported for it.
+  std::optional<double> mid_gray_input = std::nullopt;
+  if (input_signal == Signal::RAW) {
+    mid_gray_input = MID_GRAY;
+  } else if (input_signal == Signal::SCRGB) {
+    mid_gray_input = MID_GRAY * 80.0;
+  }
+  const auto above_mid_gray = std::ranges::find_if(points, [&](const CurvePoint& point) {
+    return mid_gray_input.has_value() && point.input >= mid_gray_input.value();
+  });
+  if (mid_gray_input.has_value() && above_mid_gray != points.begin() && above_mid_gray != points.end()) {
     const auto& upper = *above_mid_gray;
     const auto& lower = *(above_mid_gray - 1);
-    const auto fraction = (std::log(MID_GRAY) - std::log(lower.input)) / (std::log(upper.input) - std::log(lower.input));
+    const auto fraction = (std::log(mid_gray_input.value()) - std::log(lower.input)) / (std::log(upper.input) - std::log(lower.input));
     json mid_gray = {
-        {"input", MID_GRAY},
+        {"input", mid_gray_input.value()},
         {"output", lower.output + (fraction * (upper.output - lower.output))},
     };
     if (lower.output > 0.0 && upper.output > 0.0) {
@@ -2047,14 +2066,16 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
     }
     result_json["midGray"] = std::move(mid_gray);
   }
-  const auto peak_index = static_cast<std::ptrdiff_t>((all_outputs.size() - 1u) * 999u / 1000u);
-  std::nth_element(all_outputs.begin(), all_outputs.begin() + peak_index, all_outputs.end());
-  const auto peak_output = static_cast<double>(all_outputs[static_cast<std::size_t>(peak_index)]);
+  const auto peak_output = nth_value((scratch.size() - 1u) * 999u / 1000u);
   const auto highest_point = std::ranges::max_element(points, {}, &CurvePoint::output);
-  const auto shoulder = std::ranges::find_if(points, [&](const CurvePoint& point) { return point.output >= highest_point->output * 0.9; });
   result_json["peakOutputP99_9"] = peak_output;
   result_json["highestMedianOutput"] = {{"input", highest_point->input}, {"output", highest_point->output}};
-  result_json["shoulderInput"] = shoulder->input;
+  // Only a positive curve has a shoulder (a pass picked by mistake can output signed values).
+  std::optional<double> shoulder_input = std::nullopt;
+  if (highest_point->output > 0.0) {
+    shoulder_input = std::ranges::find_if(points, [&](const CurvePoint& point) { return point.output >= highest_point->output * 0.9; })->input;
+    result_json["shoulderInput"] = shoulder_input.value();
+  }
   result_json["note"] =
       "An effective transfer: median output per log-spaced input bin of the pixels this pass read and wrote in one frame. "
       "Grading, LUTs, local effects (bloom, vignette) and UI also move pixels, so read it as the pass's overall mapping, "
@@ -2062,7 +2083,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
 
   auto text = std::format(
       "Tone curve of draw #{} (input slot {}): {} paired pixels, input {:.4g}..{:.4g} in {} bins; peak output (p99.9) {:.4g}, "
-      "highest median {:.4g} at input {:.4g}, 90% of it from input {:.4g}.",
+      "highest median {:.4g} at input {:.4g}.",
       draw_index,
       views.input_slot,
       pairs.size(),
@@ -2071,10 +2092,15 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       points.size(),
       peak_output,
       highest_point->output,
-      highest_point->input,
-      shoulder->input);
+      highest_point->input);
+  if (shoulder_input.has_value()) {
+    text += std::format(" 90% of that from input {:.4g}.", shoulder_input.value());
+  }
   if (result_json.contains("midGray")) {
-    text += std::format(" At input 0.18 the output is {:.4g}.", result_json["midGray"]["output"].get<double>());
+    text += std::format(
+        " At mid grey (input {:.4g}) the output is {:.4g}.",
+        result_json["midGray"]["input"].get<double>(),
+        result_json["midGray"]["output"].get<double>());
   }
   return ToolResult{
       .text = std::move(text),

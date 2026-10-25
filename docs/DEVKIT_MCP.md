@@ -353,7 +353,8 @@ thousands of draws:
     shader's first draw in the pass, for `devkit_get_draw`); at most 16 are listed, the one with the latest first
     candidate pass first, and `sharedShaderCount` counts them all.
 
-Comparing two frames (`saveBaseline`, `compareWith`): `saveBaseline` (absolute path to a `.json` file) writes every pass's
+Comparing two frames (`saveBaseline`, `compareWith`): `saveBaseline` (absolute path ending in `.json`; the file is
+overwritten) writes every pass's
 structure: its targets and inputs with the format the game created and the format rendered, their sizes and swap-chain
 flag, its shader hashes, command count and hint types. The file survives a game restart, which most comparisons need
 (upgrades and mod changes act at creation, and resource handles change with a restart). `compareWith` takes such a file
@@ -594,12 +595,17 @@ game's own curve (mid grey, shoulder, peak).
   `scrgb`/`pq` = nits) is split into `bins` log-spaced bins (default 24) between the input's 0.5th and 99.5th
   percentile; bins with fewer than 16 pixels are left out. Each point is the bin's median input and median output
   (`outputSignal`: `raw`, or nits for `pq`/`scrgb`).
-- Also reported: `midGray` (output at input 0.18 and the log-log slope there), `peakOutputP99_9`,
-  `highestMedianOutput` and `shoulderInput` (where the median output first reaches 90% of its highest value).
+- Also reported: `midGray` (output at mid grey and the log-log slope there; mid grey is a linear 0.18 for a `raw`
+  input and 14.4 nits for `scrgb`; a `pq` input is absolute display light with no scene mid grey, so none),
+  `peakOutputP99_9`, `highestMedianOutput` and `shoulderInput` (where the median output first reaches 90% of its highest
+  value, reported only when that value is positive). Pixels with any non-finite channel, alpha included, are left out.
 - Validity: both textures are read at the end of the frame, after the whole frame. When the snapshot shows a later
-  command writing the input or the output again (a ping-pong chain, UI drawn onto the output), the call refuses and
-  lists them (`laterInputWriters`, `laterOutputWriters`); `allowLaterWriters` overrides it when a region keeps away from
-  what they touch. The snapshot and the read are different frames: take them on the same, still scene.
+  draw, dispatch or copy writing the input or the output again (a ping-pong chain, UI drawn onto the output), the call
+  refuses and lists them (`laterInputWriters`, `laterOutputWriters`); `allowLaterWriters` overrides it when a region
+  keeps away from what they touch. Clears, resolves and uploads after the pass are not seen. The call also refuses while
+  a snapshot is queued or capturing. The snapshot and the read are different frames: take them on the same, still scene.
+  The view handles come from the snapshot; a handle the game recycled since (a D3D12 descriptor, a Vulkan view) would
+  read another texture, as with `devkit_analyze_resource`. Depth buffers are never picked as the input.
 - It is the pass's overall mapping, not a formula: grading, LUTs and local effects (bloom, vignette, local contrast)
   also move pixels, so points scatter where those act. Compare with `devkit_set_shader_source` original vs addon to see
   what a replacement changed.
@@ -742,6 +748,7 @@ the CPU at one measurement point at the end of the watch and compare it with the
   alpha was above 1.0 before the writer and some is after) and `afterMaxAlpha`. This finds the draw that pushes alpha out
   of range after an 8-bit target was upgraded to float (Dead Cells: the glow layer's alpha summed to 3.5-7.2). `verify`
   checks both alpha numbers against the CPU. Same layout on every API (the reduce shaders' slots 14 and 15; D3D9 group 3).
+  A writer that changes only alpha counts as changing the region (`changed`, `changedExecutions`).
 - Writers whose state before or after could not be measured are never dropped: each one is in `trace` with `measured: false`,
   `unmeasuredSide` and `unmeasuredReason`, counted in `writers[].unmeasuredExecutions`/`unmeasuredReasons`, in
   `unmeasured.reasons`, and its frame is listed in `unmeasured.frames`. Reasons: `slot_limit` (more than 1023 measurements in a

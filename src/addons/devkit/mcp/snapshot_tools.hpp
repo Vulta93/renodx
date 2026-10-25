@@ -632,6 +632,11 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       throw std::runtime_error("saveBaseline and compareWith must be absolute paths.");
     }
   }
+  // The baseline file is truncated: a .json extension keeps a mistyped path from wiping another file.
+  if (save_baseline_path.has_value()
+      && internal::ToLowerAscii(std::filesystem::path(save_baseline_path.value()).extension().string()) != ".json") {
+    throw std::runtime_error("saveBaseline must end in '.json'.");
+  }
   const auto device_index = internal::ResolveDeviceIndex(arguments, context);
   const auto input = context.collect_frame_overview(device_index);
 
@@ -644,19 +649,6 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
   constexpr std::size_t MAX_COMPARED_SHADERS = 4u;
   constexpr std::size_t MAX_COMPARED_PASSES_LISTED = 32u;
 
-  const auto is_float_format = [](reshade::api::format format) {
-    switch (reshade::api::format_to_default_typed(format)) {
-      case reshade::api::format::r16g16b16a16_float:
-      case reshade::api::format::r11g11b10_float:
-      case reshade::api::format::r32g32b32a32_float:
-      case reshade::api::format::r32g32b32_float:
-      case reshade::api::format::r16g16_float:
-      case reshade::api::format::r9g9b9e5:
-        return true;
-      default:
-        return false;
-    }
-  };
   const auto is_sdr_format = [](reshade::api::format format) {
     switch (reshade::api::format_to_default_typed(format)) {
       case reshade::api::format::r8g8b8a8_unorm:
@@ -828,7 +820,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     if (pass.blend_known && pass.blend_enabled) continue;
     if (!is_large(target)) continue;
     const auto float_input = std::ranges::find_if(pass.inputs, [&](const TextureInfo& texture) {
-      return is_float_format(rendered_format(texture)) && texture.width == target.width && texture.height == target.height;
+      return frame_overview::IsFloatFormat(rendered_format(texture)) && texture.width == target.width && texture.height == target.height;
     });
     if (float_input == pass.inputs.end()) continue;
     std::string rule;
@@ -843,7 +835,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           formatting::StreamToString(rendered_format(*float_input)),
           formatting::StreamToString(target.original_format),
           formatting::StreamToString(rendered_format(target)));
-    } else if (target.is_swapchain && is_float_format(rendered_format(target))) {
+    } else if (target.is_swapchain && frame_overview::IsFloatFormat(rendered_format(target))) {
       // A mod that upgrades the swap chain when the game creates it leaves no SDR format to compare with, and an
       // HDR-native game presents a float swap chain too; the pass that fills it from the scene is still the candidate.
       rule = std::format(
@@ -864,7 +856,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     // swap chain can also be an HDR10 output. A swap-chain writer whose float input the game created as non-float (float only
     // through a mod's clone or in-place upgrade) is the game's final pass (AA, upscale, composite) reading an intermediate
     // the mod upgraded; the snapshot never records passes an add-on draws through the ReShade API.
-    const bool float_only_through_mod = !is_float_format(float_input->original_format);
+    const bool float_only_through_mod = !frame_overview::IsFloatFormat(float_input->original_format);
     if (target.is_swapchain) {
       rule += "; writes the swap chain, so it may be the output pass instead";
       if (float_only_through_mod) {
@@ -1006,12 +998,9 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     if (input.snapshot_pending || input.commands.empty()) {
       throw std::runtime_error("saveBaseline and compareWith need a finished snapshot (devkit_queue_snapshot).");
     }
-    const auto game_format = [](const TextureInfo& texture) {
-      return (texture.is_upgraded ? texture.original_format : texture.format);
-    };
     const auto texture_signature = [&](const TextureInfo& texture) {
       return json{
-          {"gameFormat", formatting::StreamToString(game_format(texture))},
+          {"gameFormat", formatting::StreamToString(texture.original_format)},
           {"renderedFormat", formatting::StreamToString(rendered_format(texture))},
           {"width", texture.width},
           {"height", texture.height},
@@ -1032,7 +1021,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       for (const auto& target : pass.targets) {
         key += std::format(
             "|{} {}x{}{}",
-            formatting::StreamToString(game_format(target)),
+            formatting::StreamToString(target.original_format),
             target.width,
             target.height,
             (target.is_swapchain ? " swapchain" : ""));
@@ -1071,14 +1060,48 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
         throw std::runtime_error(std::format("compareWith: cannot open '{}'.", compare_with_path.value()));
       }
       const auto baseline = json::parse(baseline_file, nullptr, false);
-      if (baseline.is_discarded() || !baseline.contains("passes") || !baseline["passes"].is_array()) {
-        throw std::runtime_error(std::format("compareWith: '{}' is not a saveBaseline file.", compare_with_path.value()));
+      // Every field the comparison reads is checked once here: const json lookups of missing keys are unchecked in
+      // release builds and would crash the game.
+      const auto is_texture_list = [](const json& textures) {
+        return textures.is_array() && std::ranges::all_of(textures, [](const json& texture) {
+                 return texture.is_object()
+                        && texture.contains("renderedFormat") && texture["renderedFormat"].is_string()
+                        && texture.contains("width") && texture["width"].is_number_unsigned()
+                        && texture.contains("height") && texture["height"].is_number_unsigned();
+               });
+      };
+      const auto is_pass_signature = [&](const json& pass_signature) {
+        return pass_signature.is_object()
+               && pass_signature.contains("key") && pass_signature["key"].is_string()
+               && pass_signature.contains("pass") && pass_signature["pass"].is_number_unsigned()
+               && pass_signature.contains("firstDraw") && pass_signature["firstDraw"].is_number_unsigned()
+               && pass_signature.contains("commandCount") && pass_signature["commandCount"].is_number_unsigned()
+               && pass_signature.contains("targets") && is_texture_list(pass_signature["targets"])
+               && pass_signature.contains("inputs") && is_texture_list(pass_signature["inputs"])
+               && pass_signature.contains("shaderHashes") && pass_signature["shaderHashes"].is_array()
+               && pass_signature.contains("hints") && pass_signature["hints"].is_array();
+      };
+      if (baseline.is_discarded() || !baseline.is_object()
+          || !baseline.contains("version") || baseline["version"] != 1
+          || !baseline.contains("passes") || !baseline["passes"].is_array()
+          || !std::ranges::all_of(baseline["passes"], is_pass_signature)) {
+        throw std::runtime_error(std::format("compareWith: '{}' is not a version 1 saveBaseline file.", compare_with_path.value()));
       }
       const auto& baseline_passes = baseline["passes"];
       const auto baseline_count = baseline_passes.size();
       const auto current_count = pass_signatures.size();
       if (baseline_count * current_count > MAX_COMPARED_PASS_PAIRS) {
         throw std::runtime_error(std::format("compareWith: {} x {} passes is too many to align.", baseline_count, current_count));
+      }
+      std::vector<std::string> baseline_keys;
+      std::vector<std::string> current_keys;
+      baseline_keys.reserve(baseline_count);
+      current_keys.reserve(current_count);
+      for (const auto& pass_signature : baseline_passes) {
+        baseline_keys.push_back(pass_signature["key"].get<std::string>());
+      }
+      for (const auto& pass_signature : pass_signatures) {
+        current_keys.push_back(pass_signature["key"].get<std::string>());
       }
 
       // Longest common subsequence of the pass keys, in frame order.
@@ -1088,7 +1111,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       };
       for (auto baseline_index = baseline_count; baseline_index-- > 0u;) {
         for (auto current_index = current_count; current_index-- > 0u;) {
-          if (baseline_passes[baseline_index]["key"] == pass_signatures[current_index]["key"]) {
+          if (baseline_keys[baseline_index] == current_keys[current_index]) {
             common_length(baseline_index, current_index) = common_length(baseline_index + 1u, current_index + 1u) + 1u;
           } else {
             common_length(baseline_index, current_index) = std::max(
@@ -1134,11 +1157,13 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       std::size_t current_index = 0u;
       while (baseline_index < baseline_count || current_index < current_count) {
         const bool both_left = (baseline_index < baseline_count && current_index < current_count);
-        if (both_left && baseline_passes[baseline_index]["key"] == pass_signatures[current_index]["key"]) {
+        if (both_left && baseline_keys[baseline_index] == current_keys[current_index]) {
           const auto& baseline_pass = baseline_passes[baseline_index];
           const auto& current_pass = pass_signatures[current_index];
           json changes = json::array();
-          for (std::size_t target_index = 0u; target_index < current_pass["targets"].size(); ++target_index) {
+          // Equal keys mean equal target counts, unless the file was edited.
+          const auto target_count = std::min(baseline_pass["targets"].size(), current_pass["targets"].size());
+          for (std::size_t target_index = 0u; target_index < target_count; ++target_index) {
             const auto& baseline_target = baseline_pass["targets"][target_index];
             const auto& current_target = current_pass["targets"][target_index];
             if (baseline_target["renderedFormat"] != current_target["renderedFormat"]) {
@@ -1242,6 +1267,10 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
           {"capturedCommands", input.commands.size()},
           {"passes", std::move(pass_signatures)},
       }.dump();
+      baseline_file.close();
+      if (baseline_file.fail()) {
+        throw std::runtime_error(std::format("saveBaseline: writing '{}' failed.", save_baseline_path.value()));
+      }
       comparison_text += std::format(" Saved the pass list as a baseline to '{}'.", save_baseline_path.value());
     }
   }

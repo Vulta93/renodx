@@ -4707,6 +4707,10 @@ devkit_resource_analysis::DrawCurveViews ResolveDrawCurveViewsForMcp(
   }
   auto* device_data = device_data_list[device_index];
   std::shared_lock device_lock(device_data->mutex);
+  // A snapshot being recorded has cleared the list: its draws are a partial new frame, and so would be the later writers.
+  if (snapshot_device == device_data->device || snapshot_queued_device == device_data->device) {
+    throw std::runtime_error("A snapshot is queued or still capturing; measure once it has finished.");
+  }
   const auto& draws = device_data->draw_details_list;
   if (draw_index >= draws.size()) {
     throw std::runtime_error(std::format("Draw #{} is not in the snapshot ({} commands); queue a snapshot first.", draw_index, draws.size()));
@@ -4715,39 +4719,30 @@ devkit_resource_analysis::DrawCurveViews ResolveDrawCurveViewsForMcp(
   if (!draw.IsDraw() || draw.render_targets.empty()) {
     throw std::runtime_error(std::format("Draw #{} is not a draw with a render target.", draw_index));
   }
-  const auto& output = draw.render_targets.begin()->second;
+  const auto& [output_slot, output] = *draw.render_targets.begin();
   const auto& output_texture = output.resource_desc.texture;
 
   const auto rendered_format = [](const ResourceViewDetails& details) {
     return (details.clone_resource.handle != 0u ? details.clone_resource_desc.texture.format : details.resource_desc.texture.format);
   };
-  const auto is_float_format = [](reshade::api::format format) {
-    switch (reshade::api::format_to_default_typed(format)) {
-      case reshade::api::format::r16g16b16a16_float:
-      case reshade::api::format::r11g11b10_float:
-      case reshade::api::format::r32g32b32a32_float:
-      case reshade::api::format::r32g32b32_float:
-      case reshade::api::format::r9g9b9e5:
-        return true;
-      default:
-        return false;
-    }
-  };
   const ResourceViewDetails* input = nullptr;
   uint32_t found_slot = 0u;
   for (const auto& [slot_space, details] : draw.srv_binds) {
     const auto& [slot, space] = slot_space;
-    (void)space;
     if (input_slot.has_value()) {
       if (slot != input_slot.value()) continue;
     } else {
-      const bool same_size = details.resource_desc.type == reshade::api::resource_type::texture_2d
-                             && details.resource_desc.texture.width == output_texture.width
-                             && details.resource_desc.texture.height == output_texture.height
-                             && details.resource.handle != output.resource.handle;
-      if (!same_size) continue;
+      // Depth buffers are read at the target's size too, but are not the colour the pass maps.
+      const bool same_size_colour = details.resource_desc.type == reshade::api::resource_type::texture_2d
+                                    && details.resource_desc.texture.width == output_texture.width
+                                    && details.resource_desc.texture.height == output_texture.height
+                                    && details.resource.handle != output.resource.handle
+                                    && !renodx::utils::bitwise::HasAnyFlag(details.resource_desc.usage, reshade::api::resource_usage::depth_stencil);
+      if (!same_size_colour) continue;
       // The first same-size input, replaced by the first float one.
-      if (input != nullptr && (!is_float_format(rendered_format(details)) || is_float_format(rendered_format(*input)))) continue;
+      if (input != nullptr
+          && (!devkit_frame_overview::IsFloatFormat(rendered_format(details))
+              || devkit_frame_overview::IsFloatFormat(rendered_format(*input)))) continue;
     }
     input = &details;
     found_slot = slot;
@@ -4768,7 +4763,10 @@ devkit_resource_analysis::DrawCurveViews ResolveDrawCurveViewsForMcp(
   const auto writes = [](const DrawDetails& later, reshade::api::resource resource) {
     if (later.copy_destination.handle == resource.handle) return true;
     const auto targets_resource = [&](const auto& binds) {
-      return std::ranges::any_of(binds, [&](const auto& bind) { return bind.second.resource.handle == resource.handle; });
+      return std::ranges::any_of(binds, [&](const auto& bind) {
+        const auto& [bind_slot, bind_details] = bind;
+        return bind_details.resource.handle == resource.handle;
+      });
     };
     return targets_resource(later.render_targets) || targets_resource(later.uav_binds);
   };

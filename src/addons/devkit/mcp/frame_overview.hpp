@@ -19,6 +19,21 @@ namespace renodx::addons::devkit::mcp::frame_overview {
 
 using json = renodx::utils::mcp::json;
 
+// The float formats the overview's tonemap rule and the tone curve's input choice look for.
+[[nodiscard]] inline bool IsFloatFormat(reshade::api::format format) {
+  switch (reshade::api::format_to_default_typed(format)) {
+    case reshade::api::format::r16g16b16a16_float:
+    case reshade::api::format::r11g11b10_float:
+    case reshade::api::format::r32g32b32a32_float:
+    case reshade::api::format::r32g32b32_float:
+    case reshade::api::format::r16g16_float:
+    case reshade::api::format::r9g9b9e5:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // A texture a snapshot command used, described by the resource the game created. With a mod loaded, the resource can be
 // upgraded in place (format is the new one, original_format the game's) or redirected into an active clone.
 struct TextureInfo {
