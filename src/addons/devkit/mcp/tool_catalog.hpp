@@ -166,7 +166,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_load_live_shaders",
         {
             .title = "Load Live Shaders",
-            .description = "Compile and activate shader replacements from the configured live shader directory for the selected device. Each file that failed to compile lists the compiler's message as compilationError (failedCount counts them); its earlier live replacement is removed, so the game's original shader runs. With the Devkit's Live Reload setting on, the Devkit already loads changed files at each present and this call finds nothing new: compile errors are then only in ReShade.log.",
+            .description = "Compile and activate shader replacements from the configured live shader directory for the selected device. Each file that failed to compile lists the compiler's message as compilationError (failedCount counts them); that shader is then left with no replacement at all, so the game's original shader runs even where a game mod replaces it (devkit_unload_live_shaders brings the mod's version back). With the Devkit's Live Reload setting on, the Devkit already loads changed files at each present and this call finds nothing new: compile errors are then only in ReShade.log.",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
@@ -178,7 +178,7 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         "devkit_unload_live_shaders",
         {
             .title = "Unload Live Shaders",
-            .description = "Remove active live shader replacements from the selected device.",
+            .description = "Remove the live shader file replacements from the selected device. Only shaders whose source is a live file are reset; a shader a game mod also replaces goes back to the mod's version, so the mod keeps running. (The overlay's Unload Shaders menu item still removes every runtime replacement, the mod's included.)",
             .input_schema = {
                 .properties = {
                     {"deviceIndex", {.types = {"integer"}, .minimum = 0}},

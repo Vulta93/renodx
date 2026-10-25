@@ -3659,6 +3659,40 @@ void CancelPendingLiveShaderRequest(
   };
 }
 
+void DeactivateShader(reshade::api::device* device, uint32_t shader_hash) {
+  renodx::utils::shader::RemoveRuntimeReplacements(device, {shader_hash});
+}
+
+void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::span<const uint8_t> shader_data) {
+  renodx::utils::shader::AddRuntimeReplacement(device, shader_hash, shader_data);
+}
+
+// Makes the shader draw from the given source from its next bind and records the choice. Returns why a source this
+// shader does not have is refused. The caller holds the device data's mutex.
+[[nodiscard]] std::optional<std::string> SetShaderSource(
+    reshade::api::device* device,
+    ShaderDetails* details,
+    ShaderDetails::ShaderSource source) {
+  const bool has_disk_shader = details->disk_shader.has_value()
+                               && !details->disk_shader->removed
+                               && details->disk_shader->IsCompilationOK();
+  if (source == ShaderDetails::ShaderSource::ADDON_SHADER && details->addon_shader.empty()) {
+    return "No add-on replaces this shader, or the Devkit has not seen the add-on's replacements on this device yet.";
+  }
+  if (source == ShaderDetails::ShaderSource::DISK_SHADER && !has_disk_shader) {
+    return "No live shader file for this shader compiled; load one with devkit_load_live_shaders first.";
+  }
+
+  DeactivateShader(device, details->shader_hash);
+  if (source == ShaderDetails::ShaderSource::ADDON_SHADER) {
+    ActivateShader(device, details->shader_hash, details->addon_shader);
+  } else if (source == ShaderDetails::ShaderSource::DISK_SHADER) {
+    ActivateShader(device, details->shader_hash, details->disk_shader->GetCompilationData());
+  }
+  details->shader_source = source;
+  return std::nullopt;
+}
+
 struct LoadedDiskShaderResult {
   uint32_t shader_hash = 0u;
   std::filesystem::path file_path;
@@ -4569,14 +4603,17 @@ void ProcessPendingLiveShaderRequests(
           size_t reset_count = 0u;
           {
             std::unique_lock device_lock(device_data->mutex);
+            // Only the live files: a game mod's replacements share the same runtime map, so removing every entry
+            // would switch the mod's shaders off too. A shader the mod replaces goes back to the mod's version.
             for (auto& [shader_hash, shader_details] : device_data->shader_details) {
               (void)shader_hash;
-              if (shader_details.shader_source == ShaderDetails::ShaderSource::DISK_SHADER) {
-                shader_details.shader_source = ShaderDetails::ShaderSource::ORIGINAL_SHADER;
-                reset_count += 1u;
-              }
+              if (shader_details.shader_source != ShaderDetails::ShaderSource::DISK_SHADER) continue;
+              const auto fallback_source = (shader_details.addon_shader.empty()
+                                                ? ShaderDetails::ShaderSource::ORIGINAL_SHADER
+                                                : ShaderDetails::ShaderSource::ADDON_SHADER);
+              (void)SetShaderSource(device_data->device, &shader_details, fallback_source);
+              reset_count += 1u;
             }
-            renodx::utils::shader::RemoveRuntimeReplacements(device_data->device);
           }
           setting_live_reload = false;
           (void)renodx::utils::shader::compiler::watcher::CompileSync();
@@ -6996,14 +7033,6 @@ bool OnDrawOrDispatchIndirect(
 
   return OnDraw(cmd_list, is_dispatch ? DrawDetails::DrawMethods::DISPATCH
                                       : DrawDetails::DrawMethods::DRAW_INDEXED);
-}
-
-void DeactivateShader(reshade::api::device* device, uint32_t shader_hash) {
-  renodx::utils::shader::RemoveRuntimeReplacements(device, {shader_hash});
-}
-
-void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::span<const uint8_t> shader_data) {
-  renodx::utils::shader::AddRuntimeReplacement(device, shader_hash, shader_data);
 }
 
 std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device, DeviceData* data, bool activate) {
