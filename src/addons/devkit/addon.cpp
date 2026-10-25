@@ -10935,7 +10935,8 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
         pending_frame_end_requests.begin(),
         pending_frame_end_requests.end());
   } else {
-    devkit_resource_analysis::ProcessPendingRequests(
+    // Multi-frame analyses read at present only, so none comes back unfinished here.
+    (void)devkit_resource_analysis::ProcessPendingRequests(
         pending_frame_end_requests,
         device_index,
         device,
@@ -10992,7 +10993,7 @@ void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain
       queue_analyses.push_back(request);
       return true;
     });
-    devkit_resource_analysis::ProcessPendingRequests(
+    (void)devkit_resource_analysis::ProcessPendingRequests(
         queue_analyses,
         device_index,
         device_data->device,
@@ -11072,12 +11073,19 @@ void OnPresent(
       std::unique_lock device_lock(device_data->mutex);
       pending_requests.swap(device_data->pending_resource_analysis_requests);
     }
-    devkit_resource_analysis::ProcessPendingRequests(
+    auto unfinished_requests = devkit_resource_analysis::ProcessPendingRequests(
         pending_requests,
         device_index,
         device_data->device,
         queue,
         BuildResourceAnalysisProcessingContext());
+    if (!unfinished_requests.empty()) {
+      std::unique_lock device_lock(device_data->mutex);
+      device_data->pending_resource_analysis_requests.insert(
+          device_data->pending_resource_analysis_requests.begin(),
+          unfinished_requests.begin(),
+          unfinished_requests.end());
+    }
     // The Display Proxy's device serves only the measuring tools.
     if (device_data->is_display_proxy) return;
 

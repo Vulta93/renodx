@@ -523,6 +523,18 @@ The PNG is for quick visual inspection, not for HDR truth.
   (the same split the watch uses for its stats signal). Any other texture asked for with `frame_end` on Vulkan is read
   after the present as it is, which is the same as `present` for it.
 
+### Several frames (`frames`)
+
+`frames: N` (1-32) measures N consecutive frames: the request stays queued and is analyzed once per present on the
+game's own thread, so no frame is skipped between samples (each sample carries its frame number). The game stalls while
+each frame is analyzed; a 4K swap chain with `signal` can take seconds in all, and other Devkit tool calls wait. The
+result keeps `analysis` for the last frame and adds `frames`: `samples` with headline numbers per frame (luminance
+mean/max, nan and negative ratios; with a signal nits mean/max/p50/p90/p99/p99.9, shares above 203/400/1000 nits,
+saturation mean/p90) and `summary` with n, mean, stddev, min and max of each. Use it wherever single frames vary: in
+Sleeping Dogs the image alternated between a bright and a dim state from one frame to the next (means 10.6 vs 6.2 nits),
+so two single captures could differ by 70 % with nothing changed. `frames` above 1 needs `measurePoint: present` and no
+`outputPath`.
+
 ### Display Proxy device
 
 A RenoDX Display Proxy (a DX9 or OpenGL proxy mod such as `princeofpersiaww`, or the Devkit's own Device Proxy) copies the

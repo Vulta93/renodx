@@ -80,6 +80,11 @@ struct PendingRequest {
   // uses (the presenting queue can be another one).
   reshade::api::resource frame_end_copy = {0u};
   reshade::api::command_queue* frame_end_queue = nullptr;
+  // frames > 1: one measurement per present on consecutive frames. Only the present thread touches samples and
+  // presents_seen while the request is queued again between presents; the MCP thread reads them after completion.
+  std::uint32_t frames = 1u;
+  std::vector<json> samples;
+  std::uint32_t presents_seen = 0u;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -1565,6 +1570,59 @@ inline void EncodePreviewPixel(
 
 }  // namespace internal
 
+inline constexpr std::uint32_t MAX_ANALYSIS_FRAMES = 32u;
+
+// Headline numbers kept per frame of a multi-frame analysis, by JSON pointer into that frame's analysis. Missing or null
+// ones are left out (nits and colour need a signal).
+inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> FRAME_METRICS = {{
+    {"luminanceMean", "/luminance/mean"},
+    {"luminanceMax", "/luminance/max"},
+    {"nanRatio", "/nanPixels/ratio"},
+    {"negativeRatio", "/pixelsAnyNegative/ratio"},
+    {"nitsMean", "/nits/luminance/mean"},
+    {"nitsMax", "/nits/luminance/max"},
+    {"nitsP50", "/nits/luminancePercentiles/p50"},
+    {"nitsP90", "/nits/luminancePercentiles/p90"},
+    {"nitsP99", "/nits/luminancePercentiles/p99"},
+    {"nitsP99_9", "/nits/luminancePercentiles/p99_9"},
+    {"shareAbove203", "/nits/pixelsLuminanceAbove203/ratio"},
+    {"shareAbove400", "/nits/pixelsLuminanceAbove400/ratio"},
+    {"shareAbove1000", "/nits/pixelsLuminanceAbove1000/ratio"},
+    {"saturationMean", "/color/saturation/mean"},
+    {"saturationP90", "/color/saturationPercentiles/p90"},
+}};
+
+// Per metric of FRAME_METRICS: sample count, mean, population standard deviation, min and max over the given frames.
+[[nodiscard]] inline json SummarizeFrameSamples(const std::vector<json>& frame_samples) {
+  json summary = json::object();
+  for (const auto& [metric_name, metric_path] : FRAME_METRICS) {
+    std::vector<double> values;
+    for (const auto& frame_sample : frame_samples) {
+      if (const auto found = frame_sample.find(metric_name); found != frame_sample.end() && found->is_number()) {
+        values.push_back(found->get<double>());
+      }
+    }
+    if (values.empty()) continue;
+    double sum = 0.0;
+    for (const auto value : values) {
+      sum += value;
+    }
+    const auto mean = sum / static_cast<double>(values.size());
+    double squared_deviation_sum = 0.0;
+    for (const auto value : values) {
+      squared_deviation_sum += (value - mean) * (value - mean);
+    }
+    summary[metric_name] = {
+        {"n", values.size()},
+        {"mean", mean},
+        {"stddev", std::sqrt(squared_deviation_sum / static_cast<double>(values.size()))},
+        {"min", std::ranges::min(values)},
+        {"max", std::ranges::max(values)},
+    };
+  }
+  return summary;
+}
+
 [[nodiscard]] inline ToolResult HandleAnalyzeResourceTool(const json& arguments, const ToolContext& context) {
   if (!context.resolve_device_index || !context.enqueue_request) {
     throw std::runtime_error("AnalyzeResourceToolContext is not initialized.");
@@ -1581,6 +1639,17 @@ inline void EncodePreviewPixel(
   const auto measure_point = mcp_arguments::GetOptional<std::string>(arguments, "measurePoint").value_or("present");
   if (measure_point != "present" && measure_point != "frame_end") {
     throw std::runtime_error("measurePoint must be 'present' or 'frame_end'.");
+  }
+  const auto frames = mcp_arguments::ValidateRange<std::uint32_t>(
+      "frames",
+      mcp_arguments::GetOptional<std::uint32_t>(arguments, "frames").value_or(1u),
+      1u,
+      MAX_ANALYSIS_FRAMES);
+  if (frames > 1u && measure_point != "present") {
+    throw std::runtime_error("frames above 1 needs measurePoint 'present'.");
+  }
+  if (frames > 1u && !output_path_value.empty()) {
+    throw std::runtime_error("frames above 1 cannot write outputPath.");
   }
 
   std::optional<std::filesystem::path> output_path = std::nullopt;
@@ -1608,6 +1677,7 @@ inline void EncodePreviewPixel(
   request->region = region;
   request->signal = signal;
   request->at_frame_end = (measure_point == "frame_end");
+  request->frames = frames;
 
   if (!context.enqueue_request(device_index, request)) {
     const auto error = std::format("Failed to queue the resource analysis request for device #{}.", device_index);
@@ -1649,7 +1719,29 @@ inline void EncodePreviewPixel(
     };
   }
 
-  return request->result.value();
+  auto result = std::move(request->result.value());
+  if (frames == 1u || result.is_error) return result;
+
+  std::vector<json> frame_samples;
+  frame_samples.reserve(request->samples.size());
+  for (const auto& sample : request->samples) {
+    json frame_sample = {{"frame", sample["frame"]}};
+    for (const auto& [metric_name, metric_path] : FRAME_METRICS) {
+      const auto pointer = json::json_pointer(std::string(metric_path));
+      if (sample["analysis"].contains(pointer) && sample["analysis"][pointer].is_number()) {
+        frame_sample[metric_name] = sample["analysis"][pointer];
+      }
+    }
+    frame_samples.push_back(std::move(frame_sample));
+  }
+  result.structured_content["frames"] = {
+      {"count", frame_samples.size()},
+      {"note", "analysis is the last frame; summary covers every frame (consecutive presents, numbered in frame)."},
+      {"summary", SummarizeFrameSamples(frame_samples)},
+      {"samples", std::move(frame_samples)},
+  };
+  result.text += std::format(" Measured {} consecutive frames; per-frame headline numbers and their summary are in frames.", frames);
+  return result;
 }
 
 [[nodiscard]] inline ToolResult HandleDumpResourceWithHashTool(const json& arguments, const ToolContext& context) {
@@ -1720,12 +1812,14 @@ inline void EncodePreviewPixel(
   return request->result.value();
 }
 
-inline void ProcessPendingRequests(
+// Returns the multi-frame requests that still need frames; the caller queues them again for the next present.
+[[nodiscard]] inline std::deque<std::shared_ptr<PendingRequest>> ProcessPendingRequests(
     const std::deque<std::shared_ptr<PendingRequest>>& requests,
     std::uint32_t device_index,
     reshade::api::device* device,
     reshade::api::command_queue* queue,
     const ProcessingContext& context) {
+  std::deque<std::shared_ptr<PendingRequest>> unfinished;
   for (const auto& request : requests) {
     {
       std::scoped_lock request_lock(request->mutex);
@@ -1770,6 +1864,18 @@ inline void ProcessPendingRequests(
       result.structured_content["measurePoint"] = (request->at_frame_end ? "frame_end" : "present");
     }
 
+    ++request->presents_seen;
+    if (request->frames > 1u && !result.is_error) {
+      request->samples.push_back({
+          {"frame", request->presents_seen},
+          {"analysis", result.structured_content["analysis"]},
+      });
+      if (request->samples.size() < request->frames) {
+        unfinished.push_back(request);
+        continue;
+      }
+    }
+
     {
       std::scoped_lock request_lock(request->mutex);
       request->result = std::move(result);
@@ -1777,6 +1883,7 @@ inline void ProcessPendingRequests(
     }
     request->cv.notify_all();
   }
+  return unfinished;
 }
 
 }  // namespace renodx::addons::devkit::mcp::resource_analysis
