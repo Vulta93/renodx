@@ -108,6 +108,16 @@ blocks other Devkit tool calls (worst case 60 s key + 30 s delay + 120 s).
 - `devkit_set_live_shader_path`
 - `devkit_load_live_shaders`
 - `devkit_unload_live_shaders`
+- `devkit_set_shader_source`
+
+`devkit_set_shader_source {shaderHash, source}` is the overlay's per-shader Original/Add-on/File choice over MCP:
+`original` draws the game's shader, `addon` the game mod's replacement (refused when no add-on replaces that hash or the
+Devkit has not synced the add-on's replacements on that device yet), `file` the compiled live shader file. It runs on the
+present thread and takes effect at the shader's next bind. Use it to find which replaced shader causes an artifact, then
+switch back to `addon`. Only that hash changes: the mod's resource upgrades, clones and swap-chain proxy stay, so
+`original` everywhere is not a vanilla view (the mod's Off preset is). With the Devkit loaded every mod replacement is a
+bind-time one (the Devkit sets `use_replace_async`), which is why the switch can undo a mod's shader at all. On D3D12 and
+Vulkan the present queue is waited idle before the switch, because it destroys the replacement pipeline at once.
 
 Default devkit folder layout under the ReShade base path:
 

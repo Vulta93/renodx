@@ -144,6 +144,10 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                                   const renodx::utils::mcp::json& arguments) {
     return live_shaders::HandleUnloadLiveShadersTool(arguments, build_live_shaders_tool_context());
   });
+  register_tool("devkit_set_shader_source", [build_live_shaders_tool_context = context.build_live_shaders_tool_context](
+                                                const renodx::utils::mcp::json& arguments) {
+    return live_shaders::HandleSetShaderSourceTool(arguments, build_live_shaders_tool_context());
+  });
   register_tool("devkit_list_draws", [build_snapshot_tools_context = context.build_snapshot_tools_context](
                                           const renodx::utils::mcp::json& arguments) {
     return snapshot_tools::HandleListDrawsTool(arguments, build_snapshot_tools_context());

@@ -187,6 +187,21 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_set_shader_source",
+        {
+            .title = "Set Shader Source",
+            .description = "Choose what one shader hash draws with from its next bind: 'original' (the game's shader, no replacement), 'addon' (the game mod's replacement, refused when no add-on replaces this hash or the Devkit has not synced its replacements yet) or 'file' (the compiled live shader file, refused without one). Same as the Original/Add-on/File choice in the Devkit overlay; use it to find which replaced shader causes an artifact, and switch back to 'addon' afterwards. Only that hash changes: the mod's resource upgrades, clones and swap-chain proxy stay, so 'original' is not a vanilla view of the game (use the mod's Off preset for that). On D3D12/Vulkan the GPU is waited idle first, since the switch destroys the replacement pipeline at once. Returns previousSource, source, addonReplacesShader and hasLiveFile.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"shaderHash", MakeFlexibleHandleProperty()},
+                    {"source", {.types = {"string"}, .enum_values = {"original", "addon", "file"}}},
+                },
+                .required = {"shaderHash", "source"},
+            },
+        },
+    },
+    {
         "devkit_list_draws",
         {
             .title = "List Draws",

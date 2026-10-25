@@ -248,13 +248,23 @@ struct ShaderDetails {
       "Add-on",
       "File",
   };
+  // The names devkit_set_shader_source takes and the MCP tools report.
+  constexpr static const char* SHADER_SOURCE_MCP_NAMES[] = {
+      "original",
+      "addon",
+      "file",
+  };
 };
 
 struct PendingLiveShaderRequest {
   enum class Operation : std::uint8_t {
     LOAD = 0,
     UNLOAD = 1,
+    SET_SOURCE = 2,
   } operation = Operation::LOAD;
+  // SET_SOURCE only.
+  uint32_t shader_hash = 0u;
+  ShaderDetails::ShaderSource source = ShaderDetails::ShaderSource::ORIGINAL_SHADER;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -3871,28 +3881,20 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   };
 }
 
-[[nodiscard]] ToolResult LoadLiveShadersForMcp(uint32_t device_index) {
-  {
-    std::shared_lock list_lock(device_data_list_mutex);
-    if (device_index >= device_data_list.size()) {
-      const auto error = std::format("Device #{} is not available.", device_index);
-      return ToolResult{
-          .text = error,
-          .structured_content = json{{"error", error}},
-          .is_error = true,
-      };
-    }
-  }
-
-  auto request = std::make_shared<PendingLiveShaderRequest>();
-  request->operation = PendingLiveShaderRequest::Operation::LOAD;
-  if (!EnqueuePendingLiveShaderRequest(device_index, request)) {
-    const auto error = std::format("Device #{} is not available.", device_index);
+// Live shader changes run on the present thread, which owns the device's pipelines; the MCP thread waits for them.
+[[nodiscard]] ToolResult RunLiveShaderRequestForMcp(
+    uint32_t device_index,
+    const std::shared_ptr<PendingLiveShaderRequest>& request,
+    std::string_view request_name) {
+  const auto make_error = [](const std::string& error) {
     return ToolResult{
         .text = error,
         .structured_content = json{{"error", error}},
         .is_error = true,
     };
+  };
+  if (!EnqueuePendingLiveShaderRequest(device_index, request)) {
+    return make_error(std::format("Device #{} is not available.", device_index));
   }
 
   {
@@ -3901,13 +3903,7 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
       request->canceled = true;
       request_lock.unlock();
       CancelPendingLiveShaderRequest(device_index, request);
-      return ToolResult{
-          .text = "Timed out waiting for the next present to process the live shader load request.",
-          .structured_content = json{
-              {"error", "Timed out waiting for the next present to process the live shader load request."},
-          },
-          .is_error = true,
-      };
+      return make_error(std::format("Timed out waiting for the next present to process the {} request.", request_name));
     }
 
     if (!request->completed) {
@@ -3916,73 +3912,37 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   }
 
   if (!request->result.has_value()) {
-    return ToolResult{
-        .text = "The live shader load request completed without a result.",
-        .structured_content = json{
-            {"error", "The live shader load request completed without a result."},
-        },
-        .is_error = true,
-    };
+    return make_error(std::format("The {} request completed without a result.", request_name));
   }
-
   return request->result.value();
 }
 
-[[nodiscard]] ToolResult UnloadLiveShadersForMcp(uint32_t device_index) {
-  {
-    std::shared_lock list_lock(device_data_list_mutex);
-    if (device_index >= device_data_list.size()) {
-      const auto error = std::format("Device #{} is not available.", device_index);
-      return ToolResult{
-          .text = error,
-          .structured_content = json{{"error", error}},
-          .is_error = true,
-      };
-    }
-  }
+[[nodiscard]] ToolResult LoadLiveShadersForMcp(uint32_t device_index) {
+  auto request = std::make_shared<PendingLiveShaderRequest>();
+  request->operation = PendingLiveShaderRequest::Operation::LOAD;
+  return RunLiveShaderRequestForMcp(device_index, request, "live shader load");
+}
 
+[[nodiscard]] ToolResult UnloadLiveShadersForMcp(uint32_t device_index) {
   auto request = std::make_shared<PendingLiveShaderRequest>();
   request->operation = PendingLiveShaderRequest::Operation::UNLOAD;
-  if (!EnqueuePendingLiveShaderRequest(device_index, request)) {
-    const auto error = std::format("Device #{} is not available.", device_index);
-    return ToolResult{
-        .text = error,
-        .structured_content = json{{"error", error}},
-        .is_error = true,
-    };
+  return RunLiveShaderRequestForMcp(device_index, request, "live shader unload");
+}
+
+[[nodiscard]] ToolResult SetShaderSourceForMcp(uint32_t device_index, uint32_t shader_hash, std::string_view source_name) {
+  auto request = std::make_shared<PendingLiveShaderRequest>();
+  request->operation = PendingLiveShaderRequest::Operation::SET_SOURCE;
+  request->shader_hash = shader_hash;
+  if (source_name == "original") {
+    request->source = ShaderDetails::ShaderSource::ORIGINAL_SHADER;
+  } else if (source_name == "addon") {
+    request->source = ShaderDetails::ShaderSource::ADDON_SHADER;
+  } else if (source_name == "file") {
+    request->source = ShaderDetails::ShaderSource::DISK_SHADER;
+  } else {
+    throw std::runtime_error("source must be 'original', 'addon' or 'file'.");
   }
-
-  {
-    std::unique_lock request_lock(request->mutex);
-    if (!request->cv.wait_for(request_lock, std::chrono::seconds(15), [&request]() { return request->completed || request->started; })) {
-      request->canceled = true;
-      request_lock.unlock();
-      CancelPendingLiveShaderRequest(device_index, request);
-      return ToolResult{
-          .text = "Timed out waiting for the next present to process the live shader unload request.",
-          .structured_content = json{
-              {"error", "Timed out waiting for the next present to process the live shader unload request."},
-          },
-          .is_error = true,
-      };
-    }
-
-    if (!request->completed) {
-      request->cv.wait(request_lock, [&request]() { return request->completed; });
-    }
-  }
-
-  if (!request->result.has_value()) {
-    return ToolResult{
-        .text = "The live shader unload request completed without a result.",
-        .structured_content = json{
-            {"error", "The live shader unload request completed without a result."},
-        },
-        .is_error = true,
-    };
-  }
-
-  return request->result.value();
+  return RunLiveShaderRequestForMcp(device_index, request, "shader source");
 }
 
 [[nodiscard]] ToolResult SetResourceCloneForMcp(uint32_t device_index, std::uint64_t resource_handle, bool enabled) {
@@ -4566,7 +4526,8 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
 void ProcessPendingLiveShaderRequests(
     const std::deque<std::shared_ptr<PendingLiveShaderRequest>>& requests,
     uint32_t device_index,
-    DeviceData* device_data) {
+    DeviceData* device_data,
+    reshade::api::command_queue* queue) {
   for (const auto& request : requests) {
     {
       std::scoped_lock request_lock(request->mutex);
@@ -4618,6 +4579,45 @@ void ProcessPendingLiveShaderRequests(
           setting_live_reload = false;
           (void)renodx::utils::shader::compiler::watcher::CompileSync();
           result = BuildUnloadLiveShadersResult(device_index, reset_count);
+          break;
+        }
+        case PendingLiveShaderRequest::Operation::SET_SOURCE: {
+          // A switch destroys the replacement pipeline at once; D3D12/Vulkan frames still in flight may use it.
+          const auto device_api = device_data->device->get_api();
+          if (device_api == reshade::api::device_api::d3d12 || device_api == reshade::api::device_api::vulkan) {
+            queue->wait_idle();
+          }
+          std::unique_lock device_lock(device_data->mutex);
+          const auto shader_details = device_data->shader_details.find(request->shader_hash);
+          if (shader_details == device_data->shader_details.end()) {
+            throw std::runtime_error(std::format(
+                "Shader {} has not been seen on device #{}.",
+                FormatShaderHash(request->shader_hash),
+                device_index));
+          }
+          auto& details = shader_details->second;
+          const auto previous_source = details.shader_source;
+          if (const auto error = SetShaderSource(device_data->device, &details, request->source); error.has_value()) {
+            throw std::runtime_error(error.value());
+          }
+          const auto* previous_name = ShaderDetails::SHADER_SOURCE_MCP_NAMES[static_cast<int>(previous_source)];
+          const auto* source_name = ShaderDetails::SHADER_SOURCE_MCP_NAMES[static_cast<int>(details.shader_source)];
+          result = ToolResult{
+              .text = std::format(
+                  "Shader {} on device #{} now draws from '{}' (was '{}') from its next bind.",
+                  FormatShaderHash(request->shader_hash),
+                  device_index,
+                  source_name,
+                  previous_name),
+              .structured_content = json{
+                  {"deviceIndex", device_index},
+                  {"shaderHash", FormatShaderHash(request->shader_hash)},
+                  {"source", source_name},
+                  {"previousSource", previous_name},
+                  {"addonReplacesShader", !details.addon_shader.empty()},
+                  {"hasLiveFile", details.disk_shader.has_value() && !details.disk_shader->removed && details.disk_shader->IsCompilationOK()},
+              },
+          };
           break;
         }
         default:
@@ -5050,6 +5050,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .set_live_shader_path = SetLiveShaderPathForMcp,
                                                     .load_live_shaders = LoadLiveShadersForMcp,
                                                     .unload_live_shaders = UnloadLiveShadersForMcp,
+                                                    .set_shader_source = SetShaderSourceForMcp,
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(true),
@@ -11088,7 +11089,8 @@ void OnPresent(
     ProcessPendingLiveShaderRequests(
         pending_live_shader_requests,
         device_index,
-        device_data);
+        device_data,
+        queue);
   }
 
   const bool has_stale_proxy_ui_state =
