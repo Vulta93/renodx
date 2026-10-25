@@ -3395,11 +3395,76 @@ std::vector<DeviceData*> device_data_list;
   return true;
 }
 
+void DeactivateShader(reshade::api::device* device, uint32_t shader_hash) {
+  renodx::utils::shader::RemoveRuntimeReplacements(device, {shader_hash});
+}
+
+void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::span<const uint8_t> shader_data) {
+  renodx::utils::shader::AddRuntimeReplacement(device, shader_hash, shader_data);
+}
+
+// Makes the shader draw from the given source from its next bind and records the choice. Returns why a source this
+// shader does not have is refused. The caller holds the device data's mutex.
+[[nodiscard]] std::optional<std::string> SetShaderSource(
+    reshade::api::device* device,
+    ShaderDetails* details,
+    ShaderDetails::ShaderSource source) {
+  const bool has_disk_shader = details->disk_shader.has_value()
+                               && !details->disk_shader->removed
+                               && details->disk_shader->IsCompilationOK();
+  if (source == ShaderDetails::ShaderSource::ADDON_SHADER && details->addon_shader.empty()) {
+    return "No add-on replaces this shader, or the Devkit has not seen the add-on's replacements on this device yet.";
+  }
+  if (source == ShaderDetails::ShaderSource::DISK_SHADER && !has_disk_shader) {
+    return "No live shader file for this shader compiled; load one with devkit_load_live_shaders first.";
+  }
+
+  DeactivateShader(device, details->shader_hash);
+  if (source == ShaderDetails::ShaderSource::ADDON_SHADER) {
+    ActivateShader(device, details->shader_hash, details->addon_shader);
+  } else if (source == ShaderDetails::ShaderSource::DISK_SHADER) {
+    ActivateShader(device, details->shader_hash, details->disk_shader->GetCompilationData());
+  }
+  details->shader_source = source;
+  return std::nullopt;
+}
+
 [[nodiscard]] devkit_resource_analysis::ProcessingContext BuildResourceAnalysisProcessingContext() {
   return devkit_resource_analysis::ProcessingContext{
       .format_handle = [](uint64_t value) { return FormatHandle(value); },
       .format_format = [](reshade::api::format format) { return StreamToString(format); },
       .build_resource_view_summary = [](reshade::api::resource_view resource_view, reshade::api::device* device) { return BuildResourceViewSummary(GetResourceViewDetails(resource_view, device)); },
+      .set_shader_source = [](reshade::api::device* device, uint32_t shader_hash, std::string_view source_name) {
+        auto* data = renodx::utils::data::Get<DeviceData>(device);
+        if (data == nullptr || data->is_display_proxy) {
+          throw std::runtime_error("Shader A/B needs the game's device, not the Display Proxy's.");
+        }
+        const auto device_api = device->get_api();
+        if (device_api == reshade::api::device_api::d3d12 || device_api == reshade::api::device_api::vulkan) {
+          throw std::runtime_error(
+              "Shader A/B switches the shader every few frames, which this version does only on D3D9, D3D10, D3D11 and "
+              "OpenGL: on D3D12/Vulkan a switch destroys a pipeline that frames still in flight may use.");
+        }
+        const auto* const source_names_end = std::end(ShaderDetails::SHADER_SOURCE_MCP_NAMES);
+        const auto* const found_name = std::find_if(
+            std::begin(ShaderDetails::SHADER_SOURCE_MCP_NAMES),
+            source_names_end,
+            [&](const char* name) { return source_name == name; });
+        if (found_name == source_names_end) {
+          throw std::runtime_error("The shader source must be 'original', 'addon' or 'file'.");
+        }
+        std::unique_lock device_lock(data->mutex);
+        const auto shader_details = data->shader_details.find(shader_hash);
+        if (shader_details == data->shader_details.end()) {
+          throw std::runtime_error(std::format("Shader {} has not been seen on this device.", FormatShaderHash(shader_hash)));
+        }
+        const std::string previous_source = ShaderDetails::SHADER_SOURCE_MCP_NAMES[static_cast<int>(shader_details->second.shader_source)];
+        const auto source = static_cast<ShaderDetails::ShaderSource>(found_name - std::begin(ShaderDetails::SHADER_SOURCE_MCP_NAMES));
+        if (const auto error = SetShaderSource(device, &shader_details->second, source); error.has_value()) {
+          throw std::runtime_error(error.value());
+        }
+        return previous_source;
+      },
   };
 }
 
@@ -3667,40 +3732,6 @@ void CancelPendingLiveShaderRequest(
       .available = false,
       .error = "Decompilation is unavailable for this shader.",
   };
-}
-
-void DeactivateShader(reshade::api::device* device, uint32_t shader_hash) {
-  renodx::utils::shader::RemoveRuntimeReplacements(device, {shader_hash});
-}
-
-void ActivateShader(reshade::api::device* device, uint32_t shader_hash, std::span<const uint8_t> shader_data) {
-  renodx::utils::shader::AddRuntimeReplacement(device, shader_hash, shader_data);
-}
-
-// Makes the shader draw from the given source from its next bind and records the choice. Returns why a source this
-// shader does not have is refused. The caller holds the device data's mutex.
-[[nodiscard]] std::optional<std::string> SetShaderSource(
-    reshade::api::device* device,
-    ShaderDetails* details,
-    ShaderDetails::ShaderSource source) {
-  const bool has_disk_shader = details->disk_shader.has_value()
-                               && !details->disk_shader->removed
-                               && details->disk_shader->IsCompilationOK();
-  if (source == ShaderDetails::ShaderSource::ADDON_SHADER && details->addon_shader.empty()) {
-    return "No add-on replaces this shader, or the Devkit has not seen the add-on's replacements on this device yet.";
-  }
-  if (source == ShaderDetails::ShaderSource::DISK_SHADER && !has_disk_shader) {
-    return "No live shader file for this shader compiled; load one with devkit_load_live_shaders first.";
-  }
-
-  DeactivateShader(device, details->shader_hash);
-  if (source == ShaderDetails::ShaderSource::ADDON_SHADER) {
-    ActivateShader(device, details->shader_hash, details->addon_shader);
-  } else if (source == ShaderDetails::ShaderSource::DISK_SHADER) {
-    ActivateShader(device, details->shader_hash, details->disk_shader->GetCompilationData());
-  }
-  details->shader_source = source;
-  return std::nullopt;
 }
 
 struct LoadedDiskShaderResult {

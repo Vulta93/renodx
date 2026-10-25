@@ -535,6 +535,17 @@ Sleeping Dogs the image alternated between a bright and a dim state from one fra
 so two single captures could differ by 70 % with nothing changed. `frames` above 1 needs `measurePoint: present` and no
 `outputPath`.
 
+`abShaderHash` turns it into an A/B of one shader: `frames` samples per side, on consecutive frames in the order A, B,
+B, A, ... (which balances a scene that flips between two states each frame). The game's thread switches the shader's
+source between `abSourceA` (default `original`) and `abSourceB` (default `addon`), each `original`, `addon` or `file` as
+in `devkit_set_shader_source`, starting after one warm-up frame, and puts the shader's previous source back at the end,
+also when a frame or a switch fails. The result adds `ab` with each side's summary, `difference` (B minus A of each
+mean, and `rangesOverlap` when the two sides' min-max ranges overlap: a difference within frame noise) and
+`restoredSource`; `frames.samples` carry their `side`. Run A against A first (`abSourceA` = `abSourceB`) to see the
+noise floor of the spot. Limits: `measurePoint: present`, no `outputPath`, the game's device (not a Display Proxy), and
+D3D9/D3D10/D3D11/OpenGL only, since on D3D12/Vulkan a switch destroys a pipeline that frames still in flight may use.
+Only that shader changes: the mod's resource upgrades and swap-chain proxy stay, so `original` is not a vanilla view.
+
 ### Display Proxy device
 
 A RenoDX Display Proxy (a DX9 or OpenGL proxy mod such as `princeofpersiaww`, or the Devkit's own Device Proxy) copies the

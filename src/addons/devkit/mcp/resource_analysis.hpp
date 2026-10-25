@@ -37,6 +37,7 @@
 #include "../../../utils/resource.hpp"
 #include "resource_handle.hpp"
 #include "resource_view_summary.hpp"
+#include "shader_hash.hpp"
 
 namespace renodx::addons::devkit::mcp::resource_analysis {
 
@@ -85,6 +86,12 @@ struct PendingRequest {
   std::uint32_t frames = 1u;
   std::vector<json> samples;
   std::uint32_t presents_seen = 0u;
+  // A/B: frames alternate between shader sources ab_sources[0] (A) and [1] (B) of ab_shader_hash, A, B, B, A, ...; the
+  // present thread switches the source between frames and puts ab_restore_source back when the request ends.
+  std::optional<std::uint32_t> ab_shader_hash = std::nullopt;
+  std::array<std::string, 2> ab_sources = {"original", "addon"};
+  std::optional<std::string> ab_restore_source = std::nullopt;
+  std::size_t ab_current_side = 0u;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -103,6 +110,9 @@ struct ProcessingContext {
   std::function<std::string(std::uint64_t value)> format_handle;
   std::function<std::string(reshade::api::format format)> format_format;
   std::function<resource_view_summary::ResourceViewSummary(reshade::api::resource_view resource_view, reshade::api::device* device)> build_resource_view_summary;
+  // Makes a shader draw from 'original', 'addon' or 'file' from its next bind and returns its previous source; throws
+  // why it cannot. Called on the present thread.
+  std::function<std::string(reshade::api::device* device, std::uint32_t shader_hash, std::string_view source)> set_shader_source;
 };
 
 namespace internal {
@@ -1651,6 +1661,24 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
   if (frames > 1u && !output_path_value.empty()) {
     throw std::runtime_error("frames above 1 cannot write outputPath.");
   }
+  std::optional<std::uint32_t> ab_shader_hash = std::nullopt;
+  if (arguments.contains("abShaderHash") && !arguments["abShaderHash"].is_null()) {
+    ab_shader_hash = shader_hash::GetRequired(arguments, "abShaderHash");
+  }
+  const std::array<std::string, 2> ab_sources = {
+      mcp_arguments::GetOptional<std::string>(arguments, "abSourceA").value_or("original"),
+      mcp_arguments::GetOptional<std::string>(arguments, "abSourceB").value_or("addon"),
+  };
+  if (ab_shader_hash.has_value()) {
+    for (const auto& ab_source : ab_sources) {
+      if (ab_source != "original" && ab_source != "addon" && ab_source != "file") {
+        throw std::runtime_error("abSourceA and abSourceB must be 'original', 'addon' or 'file'.");
+      }
+    }
+    if (measure_point != "present" || !output_path_value.empty()) {
+      throw std::runtime_error("abShaderHash needs measurePoint 'present' and no outputPath.");
+    }
+  }
 
   std::optional<std::filesystem::path> output_path = std::nullopt;
   if (!output_path_value.empty()) {
@@ -1677,7 +1705,10 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
   request->region = region;
   request->signal = signal;
   request->at_frame_end = (measure_point == "frame_end");
-  request->frames = frames;
+  // A/B takes frames per side.
+  request->frames = (ab_shader_hash.has_value() ? frames * 2u : frames);
+  request->ab_shader_hash = ab_shader_hash;
+  request->ab_sources = ab_sources;
 
   if (!context.enqueue_request(device_index, request)) {
     const auto error = std::format("Failed to queue the resource analysis request for device #{}.", device_index);
@@ -1720,17 +1751,24 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
   }
 
   auto result = std::move(request->result.value());
-  if (frames == 1u || result.is_error) return result;
+  if (request->frames == 1u || result.is_error) return result;
 
   std::vector<json> frame_samples;
+  std::array<std::vector<json>, 2> side_samples;
   frame_samples.reserve(request->samples.size());
   for (const auto& sample : request->samples) {
     json frame_sample = {{"frame", sample["frame"]}};
+    if (sample.contains("side")) {
+      frame_sample["side"] = sample["side"];
+    }
     for (const auto& [metric_name, metric_path] : FRAME_METRICS) {
       const auto pointer = json::json_pointer(std::string(metric_path));
       if (sample["analysis"].contains(pointer) && sample["analysis"][pointer].is_number()) {
         frame_sample[metric_name] = sample["analysis"][pointer];
       }
+    }
+    if (sample.contains("side")) {
+      side_samples[(sample["side"] == "a" ? 0u : 1u)].push_back(frame_sample);
     }
     frame_samples.push_back(std::move(frame_sample));
   }
@@ -1740,7 +1778,39 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       {"summary", SummarizeFrameSamples(frame_samples)},
       {"samples", std::move(frame_samples)},
   };
-  result.text += std::format(" Measured {} consecutive frames; per-frame headline numbers and their summary are in frames.", frames);
+  if (!ab_shader_hash.has_value()) {
+    result.text += std::format(" Measured {} consecutive frames; per-frame headline numbers and their summary are in frames.", frames);
+    return result;
+  }
+
+  const auto summary_a = SummarizeFrameSamples(side_samples[0]);
+  const auto summary_b = SummarizeFrameSamples(side_samples[1]);
+  json difference = json::object();
+  for (const auto& [metric_name, metric_stats_a] : summary_a.items()) {
+    if (!summary_b.contains(metric_name)) continue;
+    const auto& metric_stats_b = summary_b[metric_name];
+    const auto overlap_low = std::max(metric_stats_a["min"].get<double>(), metric_stats_b["min"].get<double>());
+    const auto overlap_high = std::min(metric_stats_a["max"].get<double>(), metric_stats_b["max"].get<double>());
+    difference[metric_name] = {
+        {"meanBMinusA", metric_stats_b["mean"].get<double>() - metric_stats_a["mean"].get<double>()},
+        {"rangesOverlap", overlap_low <= overlap_high},
+    };
+  }
+  result.structured_content["ab"] = {
+      {"shaderHash", std::format("0x{:08X}", ab_shader_hash.value())},
+      {"a", {{"source", ab_sources[0]}, {"summary", summary_a}}},
+      {"b", {{"source", ab_sources[1]}, {"summary", summary_b}}},
+      {"difference", std::move(difference)},
+      {"restoredSource", request->ab_restore_source.value_or("")},
+      {"note", "Frames alternate A, B, B, A, ... from the frame after the first switch; each side has frames samples. A difference whose ranges overlap is within frame-to-frame noise; run A against A (abSourceA = abSourceB) to see the noise floor."},
+  };
+  result.text += std::format(
+      " A/B on shader 0x{:08X}: {} frames of '{}' (A) and of '{}' (B), alternating A, B, B, A; summaries and B minus A in ab. The shader's source is back to '{}'.",
+      ab_shader_hash.value(),
+      frames,
+      ab_sources[0],
+      ab_sources[1],
+      request->ab_restore_source.value_or(""));
   return result;
 }
 
@@ -1831,12 +1901,48 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
       request->started = true;
     }
     request->cv.notify_all();
+    ++request->presents_seen;
 
-    ToolResult result = {
-        .text = "Unknown resource analysis failure.",
-        .structured_content = json{{"error", "Unknown resource analysis failure."}},
-        .is_error = true,
+    const auto make_error = [](const std::string& error) {
+      return ToolResult{
+          .text = error,
+          .structured_content = json{{"error", error}},
+          .is_error = true,
+      };
     };
+    const auto complete = [&request](ToolResult result) {
+      {
+        std::scoped_lock request_lock(request->mutex);
+        request->result = std::move(result);
+        request->completed = true;
+      }
+      request->cv.notify_all();
+    };
+    // A/B ends with the shader's source as it was, whether the request finishes or fails. Returns why that failed.
+    const auto restore_ab_source = [&]() -> std::optional<std::string> {
+      if (!request->ab_restore_source.has_value()) return std::nullopt;
+      try {
+        (void)context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_restore_source.value());
+      } catch (const std::exception& exception) {
+        return std::string(exception.what());
+      }
+      return std::nullopt;
+    };
+
+    // A/B: the first present only switches to side A, since the frame it ends was drawn before the switch.
+    if (request->ab_shader_hash.has_value() && !request->ab_restore_source.has_value()) {
+      try {
+        request->ab_restore_source = context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_sources[0]);
+      } catch (const std::exception& exception) {
+        complete(make_error(exception.what()));
+        continue;
+      }
+      request->ab_current_side = 0u;
+      unfinished.push_back(request);
+      continue;
+    }
+
+    ToolResult result = make_error("Unknown resource analysis failure.");
     try {
       result = internal::PerformResourceAnalysis(
           context,
@@ -1854,34 +1960,53 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> F
           request->signal,
           request->frame_end_copy);
     } catch (const std::exception& exception) {
-      result = ToolResult{
-          .text = exception.what(),
-          .structured_content = json{{"error", exception.what()}},
-          .is_error = true,
-      };
+      result = make_error(exception.what());
     }
     if (!result.is_error && result.structured_content.is_object()) {
       result.structured_content["measurePoint"] = (request->at_frame_end ? "frame_end" : "present");
     }
 
-    ++request->presents_seen;
     if (request->frames > 1u && !result.is_error) {
-      request->samples.push_back({
+      json sample = {
           {"frame", request->presents_seen},
           {"analysis", result.structured_content["analysis"]},
-      });
+      };
+      if (request->ab_shader_hash.has_value()) {
+        sample["side"] = (request->ab_current_side == 0u ? "a" : "b");
+      }
+      request->samples.push_back(std::move(sample));
       if (request->samples.size() < request->frames) {
+        if (request->ab_shader_hash.has_value()) {
+          // A, B, B, A, ...: balances a scene that alternates between two states from frame to frame.
+          const auto sample_index = request->samples.size() % 4u;
+          const std::size_t next_side = ((sample_index == 0u || sample_index == 3u) ? 0u : 1u);
+          if (next_side != request->ab_current_side) {
+            try {
+              (void)context.set_shader_source(device, request->ab_shader_hash.value(), request->ab_sources[next_side]);
+            } catch (const std::exception& exception) {
+              const auto restore_error = restore_ab_source();
+              complete(make_error(std::format(
+                  "Switching to side {} failed: {}{}",
+                  (next_side == 0u ? "A" : "B"),
+                  exception.what(),
+                  (restore_error.has_value() ? std::format(" Restoring the shader's source failed too: {}", restore_error.value()) : ""))));
+              continue;
+            }
+            request->ab_current_side = next_side;
+          }
+        }
         unfinished.push_back(request);
         continue;
       }
     }
 
-    {
-      std::scoped_lock request_lock(request->mutex);
-      request->result = std::move(result);
-      request->completed = true;
+    if (const auto restore_error = restore_ab_source(); restore_error.has_value()) {
+      result = make_error(std::format(
+          "The A/B finished, but restoring shader source '{}' failed: {}",
+          request->ab_restore_source.value(),
+          restore_error.value()));
     }
-    request->cv.notify_all();
+    complete(std::move(result));
   }
   return unfinished;
 }
