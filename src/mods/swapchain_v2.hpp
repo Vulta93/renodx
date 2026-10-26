@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <include/reshade_api_device.hpp>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -92,8 +93,8 @@ struct __declspec(uuid("d8712fa7-66e5-45e2-9e07-80fe6354f507")) DeviceData {
 
   HWND primary_swapchain_window = nullptr;
 
-  // <swap_chain_back_buffer_handle, SwapchainProxyPass*>
-  std::unordered_map<uint64_t, renodx::utils::draw::SwapchainProxyPass*> swapchain_proxy_passes;
+  // <swap_chain_back_buffer_handle, SwapchainProxyPass>
+  std::unordered_map<uint64_t, std::unique_ptr<renodx::utils::draw::SwapchainProxyPass>> swapchain_proxy_passes;
   reshade::api::swapchain_desc swapchain_desc = {};
 };
 
@@ -1232,7 +1233,7 @@ inline void OnPresent(
   auto pass_pointer = data->swapchain_proxy_passes.find(back_buffer_handle);
   renodx::utils::draw::SwapchainProxyPass* proxy_pass = nullptr;
   if (pass_pointer == data->swapchain_proxy_passes.end()) {
-    proxy_pass = new renodx::utils::draw::SwapchainProxyPass{
+    auto new_pass = std::unique_ptr<renodx::utils::draw::SwapchainProxyPass>(new renodx::utils::draw::SwapchainProxyPass{
         .vertex_shader = data->swap_chain_proxy_vertex_shader,
         .pixel_shader = data->swap_chain_proxy_pixel_shader,
         .expected_constant_buffer_index = data->expected_constant_buffer_index,
@@ -1242,15 +1243,17 @@ inline void OnPresent(
         .proxy_format = swap_chain_proxy_format,
         .shader_injection = shader_injection,
         .shader_injection_size = shader_injection_size,
-    };
-    data->swapchain_proxy_passes[back_buffer_handle] = proxy_pass;
+    });
+    proxy_pass = new_pass.get();
+    data->swapchain_proxy_passes[back_buffer_handle] = std::move(new_pass);
   } else {
-    proxy_pass = pass_pointer->second;
+    proxy_pass = pass_pointer->second.get();
   }
   assert(proxy_pass != nullptr);
 
   if (!proxy_pass->Render(swapchain, queue)) {
     proxy_pass->Destroy(device);
+    // Erasing the map entry frees the pass (proxy_pass is dangling after this).
     data->swapchain_proxy_passes.erase(back_buffer_handle);
   }
 }
