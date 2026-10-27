@@ -547,6 +547,14 @@ Do not use the PNG alone to decide whether HDR survived. Use:
 
 The PNG is for quick visual inspection, not for HDR truth.
 
+### Formats
+
+`devkit_analyze_resource` decodes RGBA8/BGRA8 (UNORM and sRGB, with or without alpha), R10G10B10A2/B10G10R10A2,
+R11G11B10 float, R9G9B9E5, RGBA16 UNORM and float, RGBA32 float, and the one- and two-channel R8, R16 UNORM, R16 float,
+R32 float, R8G8, R16G16 UNORM/float and R32G32 float (for example a 1x1 auto-exposure texture). One- and two-channel
+values land in `channels.r` (and `channels.g`) with B = 0, so the luminance fields mean nothing there and a `signal`
+is refused. Depth formats are not read. `devkit_watch_region` reads fewer formats (see its limits below).
+
 ### Regions and nits
 
 `devkit_analyze_resource` also accepts:

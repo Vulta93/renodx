@@ -744,6 +744,75 @@ inline void EncodePreviewPixel(
       channel_count = 1u;
       return true;
     }
+    case reshade::api::format::r8_unorm: {
+      rgba[0] = pixel[0] / 255.f;
+      rgba[1] = 0.f;
+      rgba[2] = 0.f;
+      rgba[3] = 1.f;
+      channel_count = 1u;
+      return true;
+    }
+    case reshade::api::format::r16_unorm: {
+      rgba[0] = *reinterpret_cast<const uint16_t*>(pixel) / 65535.f;
+      rgba[1] = 0.f;
+      rgba[2] = 0.f;
+      rgba[3] = 1.f;
+      channel_count = 1u;
+      return true;
+    }
+    case reshade::api::format::r32_float: {
+      rgba[0] = *reinterpret_cast<const float*>(pixel);
+      rgba[1] = 0.f;
+      rgba[2] = 0.f;
+      rgba[3] = 1.f;
+      channel_count = 1u;
+      return true;
+    }
+    case reshade::api::format::r8g8_unorm: {
+      rgba[0] = pixel[0] / 255.f;
+      rgba[1] = pixel[1] / 255.f;
+      rgba[2] = 0.f;
+      rgba[3] = 1.f;
+      channel_count = 2u;
+      return true;
+    }
+    case reshade::api::format::r16g16_unorm: {
+      const auto* packed = reinterpret_cast<const uint16_t*>(pixel);
+      rgba[0] = packed[0] / 65535.f;
+      rgba[1] = packed[1] / 65535.f;
+      rgba[2] = 0.f;
+      rgba[3] = 1.f;
+      channel_count = 2u;
+      return true;
+    }
+    case reshade::api::format::r16g16_float: {
+      const auto* packed = reinterpret_cast<const uint16_t*>(pixel);
+      rgba[0] = DecodeFloat16(packed[0]);
+      rgba[1] = DecodeFloat16(packed[1]);
+      rgba[2] = 0.f;
+      rgba[3] = 1.f;
+      channel_count = 2u;
+      return true;
+    }
+    case reshade::api::format::r32g32_float: {
+      const auto* packed = reinterpret_cast<const float*>(pixel);
+      rgba[0] = packed[0];
+      rgba[1] = packed[1];
+      rgba[2] = 0.f;
+      rgba[3] = 1.f;
+      channel_count = 2u;
+      return true;
+    }
+    case reshade::api::format::r9g9b9e5: {
+      // Three 9-bit mantissas sharing one 5-bit exponent (bias 15), no implicit leading one.
+      const auto packed = *reinterpret_cast<const uint32_t*>(pixel);
+      const auto exponent = static_cast<int>(packed >> 27u) - 15 - 9;
+      rgba[0] = std::ldexp(static_cast<float>((packed >> 0u) & 0x1FFu), exponent);
+      rgba[1] = std::ldexp(static_cast<float>((packed >> 9u) & 0x1FFu), exponent);
+      rgba[2] = std::ldexp(static_cast<float>((packed >> 18u) & 0x1FFu), exponent);
+      rgba[3] = 1.f;
+      return true;
+    }
     case reshade::api::format::r16g16b16a16_float: {
       const auto* packed = reinterpret_cast<const uint16_t*>(pixel);
       rgba[0] = DecodeFloat16(packed[0]);
@@ -1068,6 +1137,8 @@ inline void EncodePreviewPixel(
     uint64_t pixels_any_above_two = 0u;
     uint64_t pixels_any_above_four = 0u;
     bool supported_format = true;
+    // One- and two-channel formats decode into R (and G) with B = 0, so display light and colour make no sense there.
+    bool signal_without_rgb = false;
     std::vector<std::uint8_t> preview_pixels;
     std::vector<std::uint8_t> raw_png_pixels;
     std::vector<float> exr_pixels;
@@ -1109,7 +1180,7 @@ inline void EncodePreviewPixel(
     if (pixel_luminance != nullptr) {
       pixel_luminance->reserve(static_cast<std::size_t>(width) * height);
     }
-    for (uint32_t y = 0; y < height && supported_format; ++y) {
+    for (uint32_t y = 0; y < height && supported_format && !signal_without_rgb; ++y) {
       const auto* row = static_cast<const std::uint8_t*>(mapped_data.data) + (static_cast<size_t>(mapped_data.row_pitch) * y);
       const auto pixel_stride = static_cast<size_t>(reshade::api::format_row_pitch(intermediate_format, 1));
       for (uint32_t x = 0; x < width; ++x) {
@@ -1118,6 +1189,10 @@ inline void EncodePreviewPixel(
         const auto* pixel = row + (pixel_stride * x);
         if (!DecodePixelToLinear(analysis_format, pixel, rgba, decoded_channel_count)) {
           supported_format = false;
+          break;
+        }
+        if (signal != Signal::RAW && decoded_channel_count < 3u) {
+          signal_without_rgb = true;
           break;
         }
         if (!preview_pixels.empty()) {
@@ -1238,9 +1313,15 @@ inline void EncodePreviewPixel(
       }
     }
 
-    if (!supported_format) {
+    if (!supported_format || signal_without_rgb) {
       device->unmap_texture_region(intermediate, 0);
-      const auto error = std::format("Readback is not implemented for format {}.", FormatFormat(context, analysis_format));
+      const auto error = (supported_format
+                              ? std::format(
+                                    "Format {} has fewer than three channels, so signal '{}' (nits and colour) does not apply; "
+                                    "analyze it without a signal and read channels.r (and channels.g).",
+                                    FormatFormat(context, analysis_format),
+                                    GetSignalName(signal))
+                              : std::format("Readback is not implemented for format {}.", FormatFormat(context, analysis_format)));
       tool_result = ToolResult{
           .text = error,
           .structured_content = json{{"error", error}},
