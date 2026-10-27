@@ -559,6 +559,8 @@ struct Session {
   bool with_snapshot = false;
   bool used_clone = false;
   reshade::api::format scratch_format = reshade::api::format::unknown;
+  // One- and two-channel formats: the peak is the largest channel, since BT.709 luminance of (R, G, 0) means nothing.
+  bool peak_is_max_channel = false;
   std::string resource_format_name;
 
   // D3D12/Vulkan: measurements are copies in the game's command lists, reduced at the end of the frame.
@@ -2887,15 +2889,17 @@ inline void ProcessAtFrameEnd(
         if (before_stats.has_value() && after_stats.has_value()) {
           const auto& before_value = before_stats.value();
           const auto& after_value = after_stats.value();
+          const auto before_peak = (session->peak_is_max_channel ? before_value.max_channel : before_value.max_luminance);
+          const auto after_peak = (session->peak_is_max_channel ? after_value.max_channel : after_value.max_luminance);
           const auto changed = before_value.raw != after_value.raw;
           if (changed) {
             ++session->events_changed;
             ++aggregate.changed_executions;
           }
-          if (after_value.max_luminance < before_value.max_luminance * (1.0 - PEAK_TOLERANCE)) {
+          if (after_peak < before_peak * (1.0 - PEAK_TOLERANCE)) {
             ++aggregate.peak_lowered_executions;
           }
-          if (after_value.max_luminance > before_value.max_luminance * (1.0 + PEAK_TOLERANCE)) {
+          if (after_peak > before_peak * (1.0 + PEAK_TOLERANCE)) {
             ++aggregate.peak_raised_executions;
           }
           if (before_value.above_one_count != 0u && after_value.above_one_count == 0u) {
@@ -2905,15 +2909,15 @@ inline void ProcessAtFrameEnd(
             ++aggregate.raised_alpha_above_one_executions;
           }
           if (before_value.finite_count != 0u) {
-            aggregate.before_peak.Add(before_value.max_luminance);
+            aggregate.before_peak.Add(before_peak);
             aggregate.before_mean.Add(before_value.mean_luminance);
           }
           if (after_value.finite_count != 0u) {
-            aggregate.after_peak.Add(after_value.max_luminance);
+            aggregate.after_peak.Add(after_peak);
             aggregate.after_mean.Add(after_value.mean_luminance);
             aggregate.after_max_alpha.Add(after_value.max_alpha);
-            const auto bucket = (after_value.max_luminance > 0.0)
-                                    ? static_cast<std::int64_t>(std::llround(std::log10(after_value.max_luminance) * CEILING_BUCKETS_PER_DECADE))
+            const auto bucket = (after_peak > 0.0)
+                                    ? static_cast<std::int64_t>(std::llround(std::log10(after_peak) * CEILING_BUCKETS_PER_DECADE))
                                     : (std::numeric_limits<std::int64_t>::min)();
             ++aggregate.after_peak_buckets[bucket];
           }
@@ -2921,7 +2925,7 @@ inline void ProcessAtFrameEnd(
           entry["before"] = stats_to_json(before_value);
           entry["after"] = stats_to_json(after_value);
           if (before_value.finite_count != 0u && after_value.finite_count != 0u) {
-            entry["peakDelta"] = after_value.max_luminance - before_value.max_luminance;
+            entry["peakDelta"] = after_peak - before_peak;
           }
           list_in_trace = changed || session->include_unchanged;
         } else {
@@ -4032,7 +4036,7 @@ inline void ProcessAtFrameEnd(
             result_json["endOfWatch"] = stats_to_json(end_stats);
             summary += std::format(
                 "\nEnd of the last frame (after every add-on's present handler): peak {:.4f}, mean {:.4f}, {} pixel(s) above 1.0.",
-                end_stats.max_luminance,
+                (session->peak_is_max_channel ? end_stats.max_channel : end_stats.max_luminance),
                 end_stats.mean_luminance,
                 end_stats.above_one_count);
           }
@@ -4236,8 +4240,8 @@ inline void ProcessAtFrameEnd(
       continue;
     }
 
-    // A typeless resource is measured as its view types it (R16_TYPELESS viewed as R16_UNORM is not half floats); the
-    // non-sRGB variant is kept because the sRGB decode happens in the view the reduction reads through.
+    // A typeless resource is measured as its view types it (R16_TYPELESS viewed as R16_UNORM is not half floats). The
+    // non-sRGB variant is used throughout, so an sRGB texture is measured in its stored (encoded) values.
     const auto view_format = target.resolved_view_desc.format;
     const bool view_types_resource = (reshade::api::format_is_typeless(resource_desc.texture.format)
                                       && view_format != reshade::api::format::unknown
@@ -4259,6 +4263,7 @@ inline void ProcessAtFrameEnd(
         scratch_format = reshade::api::format::r8g8b8a8_unorm_srgb;
       }
     }
+    bool few_channel_format = false;
     switch (scratch_format) {
       case reshade::api::format::r8g8b8a8_unorm:
       case reshade::api::format::r8g8b8a8_unorm_srgb:
@@ -4272,7 +4277,7 @@ inline void ProcessAtFrameEnd(
         break;
       // The reduction loads float4 and missing channels read 0, so one- and two-channel values are measured in R (and G):
       // the peak is the largest channel, the luminance means nothing and a signal is refused. OpenGL has no image format
-      // for R9G9B9E5; D3D9 was not tried.
+      // for R9G9B9E5; D3D9 was not tried. Sampling these formats is optional in Vulkan, so the scratch format is checked.
       case reshade::api::format::r8_unorm:
       case reshade::api::format::r16_unorm:
       case reshade::api::format::r16_float:
@@ -4289,7 +4294,14 @@ inline void ProcessAtFrameEnd(
                                         formatting::StreamToString(scratch_format))));
           continue;
         }
-        if (request->signal != Signal::RAW && scratch_format != reshade::api::format::r9g9b9e5) {
+        if (!device->check_format_support(scratch_format, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest)) {
+          complete_request(request, make_error(std::format(
+                                        "This device cannot sample format {}, so it cannot be watched.",
+                                        formatting::StreamToString(scratch_format))));
+          continue;
+        }
+        few_channel_format = (scratch_format != reshade::api::format::r9g9b9e5);
+        if (request->signal != Signal::RAW && few_channel_format) {
           complete_request(request, make_error(std::format(
                                         "Format {} has fewer than three channels, so a signal (nits) does not apply; watch it "
                                         "without a signal and read the peak (its largest channel).",
@@ -4544,6 +4556,7 @@ inline void ProcessAtFrameEnd(
     new_session->with_snapshot = request->with_snapshot;
     new_session->verify = request->verify;
     new_session->scratch_format = scratch_format;
+    new_session->peak_is_max_channel = few_channel_format;
     new_session->used_clone = target.used_clone;
     new_session->resource_format_name = formatting::StreamToString(scratch_format);
     new_session->device_api = device_api;

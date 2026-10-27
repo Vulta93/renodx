@@ -557,15 +557,17 @@ values land in `channels.r` (and `channels.g`) with B = 0, so the luminance fiel
 is refused (with `frames`, `rMean` and `gMean` carry them per frame). Depth views (D16/D24/D32) are not read; a
 depth buffer seen through its R32_FLOAT or R16_UNORM shader view decodes as one channel, read whole (a region is refused:
 D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource); `devkit_watch_region` refuses depth-stencil resources. R9G9B9E5 is refused on OpenGL
-(ReShade's GL readback of it is not valid). `devkit_watch_region` reads the same formats except on D3D9 (see its limits
-below).
+(ReShade's GL readback of it is not valid). `devkit_watch_region` reads the one- and two-channel formats and R9G9B9E5
+too, but not on D3D9 (nor R9G9B9E5 on OpenGL), and BGRX8/BGR10A2 only on D3D9 (see its limits below).
 
 ### Signal hints
 
 Every `devkit_analyze_resource` result has `analysis.pixelsAnyChannelExactly1` and `analysis.signalHints`, a list of
-facts each labelled with the rule that produced it: `unormStorage` (a UNORM format: anything brighter than 1 was clipped
-when the texture was written), `aboveOne` (a float format holding values above 1), `atOne` (at least 1% of pixels have
-a channel exactly at 1.0: a saturate or clamp at or before this write), `negative` and `nonFinite`. They are candidates
+facts each labelled with the rule that produced it: `unormStorage` (a UNORM format stores 0 to 1; whether that clipped
+light depends on the encoding, PQ in 10 bits covers 0 to 10000 nits), `aboveOne` (a float format holding values above 1),
+`atOne` (a float format with at least 1% of pixels exactly at 1.0: consistent with a saturate or clamp, or white
+content), `negative` and `nonFinite`. For one- and two-channel data (motion vectors, normals, masks) only
+`unormStorage` and `nonFinite` are given. They are candidates
 for classifying a signal as untonemapped, neutral SDR or graded SDR, which still has to be proven with the snapshot, the
 shader and `devkit_watch_region`; the values alone cannot tell linear from gamma-encoded data, so no such guess is made.
 
@@ -573,15 +575,18 @@ shader and `devkit_watch_region`; the values alone cannot tell linear from gamma
 
 `devkit_analyze_resource` with `banding: true` (one frame, no A/B) adds `analysis.banding`: per channel, the steps
 between neighbouring pixels in the values as stored (UNORM formats in codes, an sRGB format re-encoded first; float
-formats as the step relative to the value, log-binned). `smoothShare` is the share of neighbour pairs at most 4 codes
-(or 2% of the value) apart, `equalShare` the share of equal pairs, `medianStepCodes` (UNORM) or `medianStepRelative` and
-`medianStepAbsolute` (float) the typical smooth non-zero step. A band is a horizontal run of equal values bounded by small
-non-zero steps on both sides: `bands`, `meanBandLength`, `longestBand`, `bandsAtLeast8px`. Use a region on a smooth
-gradient (sky, fog); with too few smooth steps the block says so. Long bands bounded by 1-code steps are visible banding;
-dither reads as many short bands and is fine. To tell whether a mod's float clone still carries 8-bit steps from
-upstream, compare the clone (`preferClone: true`) with the RGBA8 original (`preferClone: false`) on the same region.
-Rows are streamed (only the previous row is kept), so a full 4K frame costs no extra memory, only time on the game's
-thread.
+formats as the step relative to the value and as the absolute step, log-binned). A step is smooth when it is at most 4
+codes, or for a float at most 2% of the value or 4/255. `smoothShare` is the share of smooth or equal neighbour pairs,
+`equalShare` the share of equal pairs, `medianStepCodes` (UNORM) or `medianStepRelative`, `medianStepAbsolute` and
+`medianStepIn8BitCodes` (float, the absolute step x 255) the typical smooth non-zero step. A band is a horizontal run of
+at least two equal values bounded by smooth non-zero steps on both sides: `bands`, `meanBandLength`, `longestBand`,
+`bandsAtLeast8px`. Use a region on a smooth gradient (sky, fog); with too few smooth steps the block says so. Long bands
+bounded by 1-code steps are visible banding; dither reads as many short bands and is fine. To tell whether a mod's float
+clone still carries 8-bit steps from upstream, compare the clone (`preferClone: true`) with the RGBA8 original
+(`preferClone: false`) on the same region: `medianStepIn8BitCodes` of the clone matches `medianStepCodes` of the original
+only when both hold the same encoding (a linear float clone of an sRGB-encoded target does not). Rows are streamed (only
+the previous row is kept), so memory does not grow, but a float frame costs several logarithms per pixel on the game's
+thread: use a region.
 
 ### Regions and nits
 
@@ -928,10 +933,11 @@ into its cell of a grid atlas, and one compute dispatch at the end of the frame 
 - The region rectangle is passed unchanged to ReShade's `copy_texture_region`, exactly like `devkit_analyze_resource`, so both
   tools read the same pixels. ReShade's copy from the default framebuffer flips rows, so on the back buffer the rectangle may
   count rows from the bottom (OpenGL's origin); check with a known pixel before trusting a corner region.
-- The atlas is the non-sRGB twin of an sRGB source (`glCopyImageSubData` copies the bits and the shader applies the sRGB
-  decode, like D3D11's sRGB view); the default framebuffer is measured as stored. Supported: RGBA8 (also sRGB), RGB10A2,
-  R11G11B10F, RGBA16, RGBA16F, RGBA32F colour textures, renderbuffers and the default framebuffer (a back buffer without
-  alpha bits, reported as an x8 format, is watched as RGBA8). Refused: multisampled,
+- The atlas is the non-sRGB twin of an sRGB source (`glCopyImageSubData` copies the bits), so an sRGB texture is measured
+  in its stored, encoded values, as on every API (`devkit_analyze_resource` decodes it instead); the default framebuffer is
+  measured as stored. Supported: RGBA8 (also sRGB), RGB10A2, R11G11B10F, RGBA16, RGBA16F, RGBA32F, R8, R16, R16F, R32F,
+  RG8, RG16, RG16F, RG32F colour textures, renderbuffers and the default framebuffer (a back buffer without alpha bits,
+  reported as an x8 format, is watched as RGBA8). Refused: multisampled,
   depth/stencil and three-channel formats (`GL_RGB8`, `GL_RGB16F`, `GL_RGB32F` have no image format), and draws into
   `glTextureView` views of the watched texture are not seen.
 - The frame-end pass changes four things in the game's GL state and restores them: the current program, `GL_ALPHA_TEST`

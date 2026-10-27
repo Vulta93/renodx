@@ -1574,14 +1574,24 @@ inline void EncodePreviewPixel(
       pixel_luminance->reserve(static_cast<std::size_t>(width) * height);
     }
     // Banding (opt-in): steps between neighbouring pixels in the values as stored (an sRGB format re-encoded), per
-    // channel. UNORM formats are measured in codes, float formats by the step relative to the value. A step of at most
-    // BANDING_SMOOTH_CODES codes (or BANDING_SMOOTH_RELATIVE of the value) is smooth; a horizontal run of equal values
-    // bounded by smooth non-zero steps on both sides is a band. Rows are streamed: only the previous row is kept.
+    // channel. UNORM formats are measured in codes; a float step is smooth when it is at most BANDING_SMOOTH_RELATIVE of
+    // the value or at most BANDING_SMOOTH_CODES 8-bit codes (so 8-bit steps carried in a float are smooth in dark areas
+    // too). A horizontal run of at least two equal values bounded by smooth non-zero steps on both sides is a band. Rows
+    // are streamed: only the previous row is kept.
     constexpr std::int64_t BANDING_SMOOTH_CODES = 4;
     constexpr double BANDING_SMOOTH_RELATIVE = 0.02;
     constexpr std::size_t BANDING_LOG_BINS = 64u;
-    constexpr double BANDING_LOG_MIN = 1e-7;
+    constexpr double BANDING_RELATIVE_LOG_MIN = 1e-7;
+    constexpr double BANDING_RELATIVE_LOG_MAX = 1.0;
+    // HDR and scRGB values reach thousands, so absolute steps get a wider range.
+    constexpr double BANDING_ABSOLUTE_LOG_MIN = 1e-7;
+    constexpr double BANDING_ABSOLUTE_LOG_MAX = 1e4;
     constexpr std::uint32_t BANDING_LONG_RUN = 8u;
+    enum class BandingStep : std::uint8_t {
+      EQUAL,
+      SMOOTH,
+      LARGE,
+    };
     const double unorm_max_code = [&]() {
       switch (analysis_format) {
         case reshade::api::format::r8g8b8a8_unorm:
@@ -1628,36 +1638,36 @@ inline void EncodePreviewPixel(
     std::array<std::uint64_t, 3> banding_band_pixels = {};
     std::array<std::uint64_t, 3> banding_long_bands = {};
     std::array<std::uint32_t, 3> banding_longest_band = {};
-    // Log-spaced bins from BANDING_LOG_MIN to 1 for float steps.
-    const auto banding_log_bin = [&](double value) {
-      const auto position = std::log10(std::max(value, BANDING_LOG_MIN) / BANDING_LOG_MIN) / std::log10(1.0 / BANDING_LOG_MIN);
-      return std::min(static_cast<std::size_t>(position * BANDING_LOG_BINS), BANDING_LOG_BINS - 1u);
+    // Log-spaced bins over [log_min, log_max] for float steps.
+    const auto banding_log_bin = [&](double value, double log_min, double log_max) {
+      const auto position = std::log10(std::max(value, log_min) / log_min) / std::log10(log_max / log_min);
+      return std::min(static_cast<std::size_t>(std::max(position, 0.0) * BANDING_LOG_BINS), BANDING_LOG_BINS - 1u);
     };
-    // Classifies one neighbour step and counts it: 0 = equal, 1 = smooth non-zero, 2 = larger.
+    // Classifies one neighbour step and counts it.
     const auto banding_measure_step = [&](std::size_t channel, float from, float to) {
       ++banding_pairs[channel];
       if (unorm_max_code > 0.0) {
         const auto code_step = std::llabs(std::llround(to * unorm_max_code) - std::llround(from * unorm_max_code));
         if (code_step == 0) {
           ++banding_zero_pairs[channel];
-          return 0;
+          return BandingStep::EQUAL;
         }
-        if (code_step > BANDING_SMOOTH_CODES) return 2;
+        if (code_step > BANDING_SMOOTH_CODES) return BandingStep::LARGE;
         ++banding_code_histogram[channel][static_cast<std::size_t>(code_step)];
         ++banding_smooth_steps[channel];
-        return 1;
+        return BandingStep::SMOOTH;
       }
       const auto step = std::abs(static_cast<double>(to) - static_cast<double>(from));
       if (step == 0.0) {
         ++banding_zero_pairs[channel];
-        return 0;
+        return BandingStep::EQUAL;
       }
       const auto relative_step = step / std::max({std::abs(static_cast<double>(from)), std::abs(static_cast<double>(to)), 1e-6});
-      if (relative_step > BANDING_SMOOTH_RELATIVE) return 2;
-      ++banding_relative_histogram[channel][banding_log_bin(relative_step)];
-      ++banding_absolute_histogram[channel][banding_log_bin(step)];
+      if (relative_step > BANDING_SMOOTH_RELATIVE && step > (BANDING_SMOOTH_CODES / 255.0)) return BandingStep::LARGE;
+      ++banding_relative_histogram[channel][banding_log_bin(relative_step, BANDING_RELATIVE_LOG_MIN, BANDING_RELATIVE_LOG_MAX)];
+      ++banding_absolute_histogram[channel][banding_log_bin(step, BANDING_ABSOLUTE_LOG_MIN, BANDING_ABSOLUTE_LOG_MAX)];
       ++banding_smooth_steps[channel];
-      return 1;
+      return BandingStep::SMOOTH;
     };
     for (uint32_t y = 0; y < height && supported_format && !signal_without_rgb; ++y) {
       banding_left_valid = false;
@@ -1696,20 +1706,23 @@ inline void EncodePreviewPixel(
             const auto row_index = (static_cast<std::size_t>(x) * 3u) + channel;
             if (banding_left_valid) {
               switch (banding_measure_step(channel, banding_left[channel], stored)) {
-                case 0:
+                case BandingStep::EQUAL:
                   ++banding_run_length[channel];
                   break;
-                case 1:
-                  if (banding_run_bounded[channel]) {
+                case BandingStep::SMOOTH:
+                  // A single pixel between two steps is a ramp, not a band.
+                  if (banding_run_bounded[channel] && banding_run_length[channel] >= 2u) {
                     ++banding_band_count[channel];
                     banding_band_pixels[channel] += banding_run_length[channel];
                     banding_longest_band[channel] = std::max(banding_longest_band[channel], banding_run_length[channel]);
-                    if (banding_run_length[channel] >= BANDING_LONG_RUN) ++banding_long_bands[channel];
+                    if (banding_run_length[channel] >= BANDING_LONG_RUN) {
+                      ++banding_long_bands[channel];
+                    }
                   }
                   banding_run_length[channel] = 1u;
                   banding_run_bounded[channel] = true;
                   break;
-                default:
+                case BandingStep::LARGE:
                   banding_run_length[channel] = 1u;
                   banding_run_bounded[channel] = false;
                   break;
@@ -2097,26 +2110,30 @@ inline void EncodePreviewPixel(
           return (pixel_count == 0u ? 0.0 : static_cast<double>(count) / static_cast<double>(pixel_count));
         };
         json signal_hints = json::array();
+        // One- and two-channel data is often not colour (motion vectors, normals, masks): the colour rules are skipped.
+        const bool colour_data = (channel_count >= 3u);
         if (unorm_max_code > 0.0) {
           signal_hints.push_back(json{
               {"type", "unormStorage"},
-              {"rule", "A UNORM format stores 0 to 1: anything brighter was clipped when this texture was written."},
+              {"rule", "A UNORM format stores values from 0 to 1; whether that clipped light depends on the encoding (PQ in 10 bits covers 0 to 10000 nits)."},
           });
-        } else if (pixels_any_above_one != 0u) {
+        } else if (colour_data && pixels_any_above_one != 0u) {
           signal_hints.push_back(json{
               {"type", "aboveOne"},
               {"rule", "A float format with values above 1.0: not clamped here (an untonemapped scene, scRGB, or a mod's upgrade)."},
               {"share", share_of(pixels_any_above_one)},
           });
         }
-        if (share_of(pixels_any_exactly_one) >= CLIP_SHARE) {
+        // In a UNORM format 1.0 is only the top code, which white content reaches too; in a float format it is consistent
+        // with a saturate or clamp.
+        if (unorm_max_code == 0.0 && colour_data && share_of(pixels_any_exactly_one) >= CLIP_SHARE) {
           signal_hints.push_back(json{
               {"type", "atOne"},
-              {"rule", "At least 1% of pixels have a channel exactly at 1.0: a saturate or clamp at or before this write (in UNORM, the top code)."},
+              {"rule", "A float format with at least 1% of pixels having a channel exactly at 1.0: consistent with a saturate or clamp at or before this write (or white content)."},
               {"share", share_of(pixels_any_exactly_one)},
           });
         }
-        if (pixels_any_negative != 0u) {
+        if (colour_data && pixels_any_negative != 0u) {
           signal_hints.push_back(json{
               {"type", "negative"},
               {"rule", "Negative values: wide gamut encoded in BT.709 primaries (scRGB), or a math error."},
@@ -2126,7 +2143,7 @@ inline void EncodePreviewPixel(
         if (nan_pixel_count + inf_pixel_count != 0u) {
           signal_hints.push_back(json{
               {"type", "nonFinite"},
-              {"rule", "NaN or infinite values: usually a division or log of zero or a negative, often after a resource upgrade."},
+              {"rule", "NaN or infinite values."},
               {"share", share_of(nan_pixel_count + inf_pixel_count)},
           });
         }
@@ -2136,7 +2153,9 @@ inline void EncodePreviewPixel(
         // Nearest bin holding the middle step of a histogram; nullopt when it is empty.
         const auto median_bin = []<std::size_t BIN_COUNT>(const std::array<std::uint64_t, BIN_COUNT>& histogram) -> std::optional<std::size_t> {
           std::uint64_t total = 0u;
-          for (const auto count : histogram) total += count;
+          for (const auto count : histogram) {
+            total += count;
+          }
           if (total == 0u) return std::nullopt;
           std::uint64_t seen = 0u;
           for (std::size_t bin = 0u; bin < BIN_COUNT; ++bin) {
@@ -2145,8 +2164,8 @@ inline void EncodePreviewPixel(
           }
           return BIN_COUNT - 1u;
         };
-        const auto log_bin_center = [&](std::size_t bin) {
-          return BANDING_LOG_MIN * std::pow(1.0 / BANDING_LOG_MIN, (static_cast<double>(bin) + 0.5) / BANDING_LOG_BINS);
+        const auto log_bin_center = [&](std::size_t bin, double log_min, double log_max) {
+          return log_min * std::pow(log_max / log_min, (static_cast<double>(bin) + 0.5) / BANDING_LOG_BINS);
         };
         json banding_channels_json = json::array();
         std::uint64_t smooth_steps_total = 0u;
@@ -2172,8 +2191,20 @@ inline void EncodePreviewPixel(
           } else {
             const auto median_relative = median_bin(banding_relative_histogram[channel]);
             const auto median_absolute = median_bin(banding_absolute_histogram[channel]);
-            channel_json["medianStepRelative"] = (median_relative.has_value() ? json(log_bin_center(median_relative.value())) : json(nullptr));
-            channel_json["medianStepAbsolute"] = (median_absolute.has_value() ? json(log_bin_center(median_absolute.value())) : json(nullptr));
+            channel_json["medianStepRelative"] =
+                (median_relative.has_value()
+                     ? json(log_bin_center(median_relative.value(), BANDING_RELATIVE_LOG_MIN, BANDING_RELATIVE_LOG_MAX))
+                     : json(nullptr));
+            if (median_absolute.has_value()) {
+              const auto median_step = log_bin_center(median_absolute.value(), BANDING_ABSOLUTE_LOG_MIN, BANDING_ABSOLUTE_LOG_MAX);
+              channel_json["medianStepAbsolute"] = median_step;
+              // In 8-bit codes of the same values: comparable with medianStepCodes of an RGBA8 read only when both hold
+              // the same encoding (a linear float clone of an sRGB-encoded RGBA8 target is not).
+              channel_json["medianStepIn8BitCodes"] = median_step * 255.0;
+            } else {
+              channel_json["medianStepAbsolute"] = nullptr;
+              channel_json["medianStepIn8BitCodes"] = nullptr;
+            }
           }
           smooth_steps_total += banding_smooth_steps[channel];
           banding_channels_json.push_back(std::move(channel_json));
@@ -2182,7 +2213,7 @@ inline void EncodePreviewPixel(
             {"domain",
              (unorm_max_code > 0.0
                   ? std::format("codes of 1/{}{}", unorm_max_code, (banding_srgb ? ", sRGB-encoded values" : ""))
-                  : std::string("float: step relative to the value (log-binned)"))},
+                  : std::string("float: step relative to the value, and absolute (log-binned)"))},
             {"smoothStepMaxCodes", BANDING_SMOOTH_CODES},
             {"smoothStepMaxRelative", BANDING_SMOOTH_RELATIVE},
             {"channels", std::move(banding_channels_json)},
