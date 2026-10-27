@@ -4031,9 +4031,6 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   auto& coverage = device_data->shader_coverage;
 
   if (action == "start") {
-    if (device_data->shader_coverage_active.load(std::memory_order_relaxed)) {
-      return make_error("A coverage recording is already running on this device: call with action 'stop' first.");
-    }
     std::unordered_map<uint32_t, std::string> watched;
     {
       std::shared_lock device_lock(device_data->mutex);
@@ -4049,13 +4046,17 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
     }
     const auto watched_count = watched.size();
     {
+      // Checked and set under the lock, so two clients starting at once cannot reset each other's recording.
       std::unique_lock coverage_lock(coverage.mutex);
+      if (device_data->shader_coverage_active.load(std::memory_order_relaxed)) {
+        return make_error("A coverage recording is already running on this device: call with action 'stop' first.");
+      }
       coverage.frame = 0u;
       coverage.started = std::chrono::steady_clock::now();
       coverage.watched = std::move(watched);
       coverage.entries.clear();
+      device_data->shader_coverage_active.store(true, std::memory_order_relaxed);
     }
-    device_data->shader_coverage_active.store(true, std::memory_order_relaxed);
     return ToolResult{
         .text = std::format(
             "Recording which of the {} replaced shaders on device #{} draw. Play through what should be covered (menus, "
@@ -4066,9 +4067,11 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
     };
   }
 
-  if (action == "stop" && device_data->shader_coverage_active.exchange(false, std::memory_order_relaxed)) {
+  if (action == "stop") {
     std::unique_lock coverage_lock(coverage.mutex);
-    coverage.stopped = std::chrono::steady_clock::now();
+    if (device_data->shader_coverage_active.exchange(false, std::memory_order_relaxed)) {
+      coverage.stopped = std::chrono::steady_clock::now();
+    }
   }
   // At most this many shaders are listed per group; the counts are complete.
   constexpr std::size_t MAX_LISTED = 64u;
@@ -6708,21 +6711,20 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         return coverage.watched.contains(bound.shader_hash);
       });
     }();
-    std::unique_lock coverage_lock(coverage.mutex, std::defer_lock);
     if (watched_shader_bound) {
-      coverage_lock.lock();
-    }
-    for (const auto& [stage, shader_hash] : coverage_shaders.shaders) {
-      if (!watched_shader_bound || !coverage.watched.contains(shader_hash)) continue;
-      auto& entry = coverage.entries[shader_hash];
-      if (entry.draws == 0u) {
-        entry.first_frame = coverage.frame;
+      std::unique_lock coverage_lock(coverage.mutex);
+      for (const auto& [stage, shader_hash] : coverage_shaders.shaders) {
+        if (!coverage.watched.contains(shader_hash)) continue;
+        auto& entry = coverage.entries[shader_hash];
+        if (entry.draws == 0u) {
+          entry.first_frame = coverage.frame;
+        }
+        if (entry.draws == 0u || entry.last_frame != coverage.frame) {
+          ++entry.frames_seen;
+        }
+        entry.last_frame = coverage.frame;
+        ++entry.draws;
       }
-      if (entry.draws == 0u || entry.last_frame != coverage.frame) {
-        ++entry.frames_seen;
-      }
-      entry.last_frame = coverage.frame;
-      ++entry.draws;
     }
   }
 

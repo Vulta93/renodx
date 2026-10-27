@@ -2446,8 +2446,10 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   const auto device_index = context.resolve_device_index(arguments);
   const auto output_path_value = mcp_arguments::GetOptional<std::string>(arguments, "outputPath").value_or("");
   // A .json outputPath writes the finished result (frames and A/B summaries included) instead of an image, so two runs can
-  // be compared outside the game; it is the one output allowed with frames and abShaderHash.
-  const bool json_output = (std::filesystem::path(output_path_value).extension() == L".json");
+  // be compared outside the game; it is the one output allowed with frames and abShaderHash. The argument is UTF-8: a
+  // narrow std::filesystem::path would decode it with the ANSI code page (and throw on a double-byte one).
+  const auto json_candidate_path = std::filesystem::path(std::u8string(output_path_value.begin(), output_path_value.end()));
+  const bool json_output = (json_candidate_path.extension() == L".json");
   const auto preview_mode_value = mcp_arguments::GetOptional<std::string>(arguments, "previewMode").value_or("clamped");
   const auto preview_mode = internal::ParsePreviewMode(preview_mode_value);
   const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
@@ -2487,12 +2489,10 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   std::optional<std::filesystem::path> json_output_path;
   std::optional<std::filesystem::path> output_path = std::nullopt;
   if (json_output) {
-    // The argument is UTF-8; a narrow std::filesystem::path would decode it with the ANSI code page.
-    const auto requested_path = std::filesystem::path(std::u8string(output_path_value.begin(), output_path_value.end()));
-    if (!requested_path.is_absolute()) {
+    if (!json_candidate_path.is_absolute()) {
       throw std::runtime_error("outputPath must be an absolute path.");
     }
-    json_output_path = requested_path.lexically_normal();
+    json_output_path = json_candidate_path.lexically_normal();
   } else if (!output_path_value.empty()) {
     auto requested_path = std::filesystem::path(output_path_value);
     if (!requested_path.is_absolute()) {
