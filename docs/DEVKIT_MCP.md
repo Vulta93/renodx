@@ -555,8 +555,10 @@ R11G11B10 float, R9G9B9E5, RGBA16 UNORM and float, RGBA32 float, and the one- an
 R32 float, R8G8, R16G16 UNORM/float and R32G32 float (for example a 1x1 auto-exposure texture). One- and two-channel
 values land in `channels.r` (and `channels.g`) with B = 0, so the luminance fields mean nothing there and a `signal`
 is refused (with `frames`, `rMean` and `gMean` carry them per frame). Depth views (D16/D24/D32) are not read; a
-depth buffer seen through its R32_FLOAT or R16_UNORM shader view decodes as one channel. R9G9B9E5 is refused on OpenGL
-(ReShade's GL readback of it is not valid). `devkit_watch_region` reads fewer formats (see its limits below).
+depth buffer seen through its R32_FLOAT or R16_UNORM shader view decodes as one channel, read whole (a region is refused:
+D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource); `devkit_watch_region` refuses depth-stencil resources. R9G9B9E5 is refused on OpenGL
+(ReShade's GL readback of it is not valid). `devkit_watch_region` reads the same formats except on D3D9 (see its limits
+below).
 
 ### Regions and nits
 
@@ -1095,8 +1097,10 @@ Refused or limited cases on D3D12/Vulkan, all stated in the output:
   If a Vulkan game crashes, fails to create images, or runs slower only with the Devkit, try the setting off first.
 - The measurement copies and barriers cost GPU time and VRAM; use a region or `shaderHash` for long watches.
 
-Limits on every API: 2D, non-MSAA textures in 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats; up to 1023 measured
-writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that hit it or the scratch budget).
+Limits on every API: 2D, non-MSAA textures in RGBA 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats, and except on
+D3D9 the one- and two-channel R8, R16, R16F, R32F, R8G8, R16G16, R16G16F and R32G32F and R9G9B9E5 (not on OpenGL). One-
+and two-channel values are measured in R (and G): the peak is the largest channel and a `signal` is refused. Up to 1023
+measured writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that hit it or the scratch budget).
 
 - Only commands the game issues are hooked. Passes that add-ons draw through the ReShade API (for example a mod's swap chain
   proxy pass at present) are not reported as writers; their effect lands in the end-of-frame measurement. When a mod

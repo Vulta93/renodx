@@ -4230,8 +4230,19 @@ inline void ProcessAtFrameEnd(
       complete_request(request, make_error("Multisampled resources cannot be watched."));
       continue;
     }
+    // The watch copies a box of the texture; D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource.
+    if (renodx::utils::bitwise::HasAnyFlag(resource_desc.usage, reshade::api::resource_usage::depth_stencil)) {
+      complete_request(request, make_error("Depth-stencil resources cannot be watched."));
+      continue;
+    }
 
-    auto scratch_format = reshade::api::format_to_default_typed(resource_desc.texture.format, 0);
+    // A typeless resource is measured as its view types it (R16_TYPELESS viewed as R16_UNORM is not half floats); the
+    // non-sRGB variant is kept because the sRGB decode happens in the view the reduction reads through.
+    const auto view_format = target.resolved_view_desc.format;
+    const bool view_types_resource = (reshade::api::format_is_typeless(resource_desc.texture.format)
+                                      && view_format != reshade::api::format::unknown
+                                      && reshade::api::format_to_typeless(view_format) == resource_desc.texture.format);
+    auto scratch_format = reshade::api::format_to_default_typed((view_types_resource ? view_format : resource_desc.texture.format), 0);
     if (device_api == reshade::api::device_api::opengl
         && (scratch_format == reshade::api::format::r8g8b8x8_unorm || scratch_format == reshade::api::format::b8g8r8x8_unorm)
         && static_cast<unsigned int>(target.resolved_resource.handle >> 40u) == gl_enum::FRAMEBUFFER_DEFAULT) {
@@ -4258,6 +4269,33 @@ inline void ProcessAtFrameEnd(
       case reshade::api::format::r16g16b16a16_unorm:
       case reshade::api::format::r16g16b16a16_float:
       case reshade::api::format::r32g32b32a32_float:
+        break;
+      // The reduction loads float4 and missing channels read 0, so one- and two-channel values are measured in R (and G):
+      // the peak is the largest channel, the luminance means nothing and a signal is refused. OpenGL has no image format
+      // for R9G9B9E5; D3D9 was not tried.
+      case reshade::api::format::r8_unorm:
+      case reshade::api::format::r16_unorm:
+      case reshade::api::format::r16_float:
+      case reshade::api::format::r32_float:
+      case reshade::api::format::r8g8_unorm:
+      case reshade::api::format::r16g16_unorm:
+      case reshade::api::format::r16g16_float:
+      case reshade::api::format::r32g32_float:
+      case reshade::api::format::r9g9b9e5:
+        if (device_api == reshade::api::device_api::d3d9
+            || (device_api == reshade::api::device_api::opengl && scratch_format == reshade::api::format::r9g9b9e5)) {
+          complete_request(request, make_error(std::format(
+                                        "Watching format {} is not supported on this API.",
+                                        formatting::StreamToString(scratch_format))));
+          continue;
+        }
+        if (request->signal != Signal::RAW && scratch_format != reshade::api::format::r9g9b9e5) {
+          complete_request(request, make_error(std::format(
+                                        "Format {} has fewer than three channels, so a signal (nits) does not apply; watch it "
+                                        "without a signal and read the peak (its largest channel).",
+                                        formatting::StreamToString(scratch_format))));
+          continue;
+        }
         break;
       // D3D9 back buffers (D3DFMT_X8R8G8B8, D3DFMT_A2R10G10B10); not tried on the other APIs.
       case reshade::api::format::b8g8r8x8_unorm:
@@ -4366,6 +4404,38 @@ inline void ProcessAtFrameEnd(
         case reshade::api::format::r16g16b16a16_float:
           opengl_atlas_format = reshade::api::format::r16g16b16a16_float;
           opengl_image_qualifier = "rgba16f";
+          break;
+        case reshade::api::format::r8_unorm:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "r8";
+          break;
+        case reshade::api::format::r16_unorm:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "r16";
+          break;
+        case reshade::api::format::r16_float:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "r16f";
+          break;
+        case reshade::api::format::r32_float:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "r32f";
+          break;
+        case reshade::api::format::r8g8_unorm:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "rg8";
+          break;
+        case reshade::api::format::r16g16_unorm:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "rg16";
+          break;
+        case reshade::api::format::r16g16_float:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "rg16f";
+          break;
+        case reshade::api::format::r32g32_float:
+          opengl_atlas_format = scratch_format;
+          opengl_image_qualifier = "rg32f";
           break;
         default:
           opengl_atlas_format = reshade::api::format::r32g32b32a32_float;

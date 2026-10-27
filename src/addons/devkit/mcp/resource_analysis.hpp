@@ -1343,6 +1343,15 @@ inline void EncodePreviewPixel(
   const auto subresource = first_level + (first_layer * levels);
   const auto texture_width = std::max<uint32_t>(target.resolved_resource_desc.texture.width >> first_level, 1u);
   const auto texture_height = std::max<uint32_t>(target.resolved_resource_desc.texture.height >> first_level, 1u);
+  // D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource: only the whole subresource is read.
+  if (region.has_value()
+      && renodx::utils::bitwise::HasAnyFlag(target.resolved_resource_desc.usage, reshade::api::resource_usage::depth_stencil)) {
+    return ToolResult{
+        .text = "A depth-stencil resource is read whole: leave the region out.",
+        .structured_content = json{{"error", "A depth-stencil resource is read whole: leave the region out."}},
+        .is_error = true,
+    };
+  }
   if (region.has_value() && (region->right > texture_width || region->bottom > texture_height)) {
     const auto error = std::format(
         "The region {}x{} at ({}, {}) does not fit the {}x{} texture.",
