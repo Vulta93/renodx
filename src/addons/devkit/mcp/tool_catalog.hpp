@@ -202,6 +202,21 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_set_draw_bypass",
+        {
+            .title = "Set Draw Bypass",
+            .description = "Skip (bypass true) or draw again (bypass false) the draws (draw, draw_indexed, dispatch, indirect draw/dispatch; not mesh or ray dispatches) that have this shader hash bound in any stage, like the overlay's per-shader Draw button (both set the same flag). It is applied at the next present, so it needs a presenting game (minimized or loading: the call times out after 15 s), and it affects command lists recorded after that: D3D12 bundles and command lists the game records once and executes again keep their draws. It applies in every pass the shader draws in (devkit_frame_overview sharedShaders shows where one shader is shared) and stays until set back or the game restarts. Use it to find which shader produces an artifact by removing it. The result lists every bypassed shader (bypassedShaders); devkit_list_shaders shows bypassDraw per shader. A bypassed draw still appears as a writer in devkit_watch_region, which measures before each draw, with no change to the region. Refused for a hash the device has not seen. A draw another add-on already skipped is not drawn either way.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"shaderHash", MakeFlexibleHandleProperty()},
+                    {"bypass", {.types = {"boolean"}}},
+                },
+                .required = {"shaderHash", "bypass"},
+            },
+        },
+    },
+    {
         "devkit_list_draws",
         {
             .title = "List Draws",

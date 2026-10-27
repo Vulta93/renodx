@@ -109,6 +109,7 @@ blocks other Devkit tool calls (worst case 60 s key + 30 s delay + 120 s).
 - `devkit_load_live_shaders`
 - `devkit_unload_live_shaders`
 - `devkit_set_shader_source`
+- `devkit_set_draw_bypass`
 
 `devkit_set_shader_source {shaderHash, source}` is the overlay's per-shader Original/Add-on/File choice over MCP:
 `original` draws the game's shader, `addon` the game mod's replacement (refused when no add-on replaces that hash or the
@@ -120,6 +121,15 @@ bind-time one (the Devkit sets `use_replace_async`), which is why the switch can
 Vulkan the present queue is waited idle before the switch, because it destroys the replacement pipeline at once. That
 does not cover other queues (async compute, a separate present queue) or command lists already recorded for the next
 frame, so a device loss is still possible there; the overlay's combo has the same risk.
+
+`devkit_set_draw_bypass {shaderHash, bypass}` sets the flag behind the overlay's per-shader Draw button: while it is true,
+draws, indexed draws, dispatches and indirect draws/dispatches with that shader bound in any stage are skipped (mesh and
+ray dispatches are not), in every pass the shader draws in (check `sharedShaders` in `devkit_frame_overview`). It is set
+on the present thread, so the game must be presenting (the call times out after 15 s otherwise), and it acts on command
+lists recorded afterwards: D3D12 bundles and command lists recorded once and executed again keep their draws. It sets the
+value rather than toggling it, so repeated calls and the overlay button stay consistent; the result lists every bypassed
+shader. Use it to remove a draw and see what disappears (bloom, fog, a UI layer). In `devkit_watch_region` a bypassed draw
+still appears as a writer, with no change to the region.
 
 Default devkit folder layout under the ReShade base path:
 

@@ -29,6 +29,7 @@ struct ToolContext {
   std::function<ToolResult(std::uint32_t device_index)> load_live_shaders;
   std::function<ToolResult(std::uint32_t device_index)> unload_live_shaders;
   std::function<ToolResult(std::uint32_t device_index, std::uint32_t shader_hash, std::string_view source)> set_shader_source;
+  std::function<ToolResult(std::uint32_t device_index, std::uint32_t shader_hash, bool bypass_draw)> set_draw_bypass;
 };
 
 inline ToolResult HandleDumpShaderTool(const json& arguments, const ToolContext& context) {
@@ -75,6 +76,16 @@ inline ToolResult HandleSetShaderSourceTool(const json& arguments, const ToolCon
   const auto shader_hash = shader_hash::GetRequired(arguments, "shaderHash");
   const auto source = mcp_arguments::GetRequired<std::string>(arguments, "source");
   return context.set_shader_source(context.resolve_device_index(arguments), shader_hash, source);
+}
+
+inline ToolResult HandleSetDrawBypassTool(const json& arguments, const ToolContext& context) {
+  if (!context.resolve_device_index || !context.set_draw_bypass) {
+    throw std::runtime_error("The live shader tool context is not configured.");
+  }
+
+  const auto shader_hash = shader_hash::GetRequired(arguments, "shaderHash");
+  const auto bypass_draw = mcp_arguments::GetRequired<bool>(arguments, "bypass");
+  return context.set_draw_bypass(context.resolve_device_index(arguments), shader_hash, bypass_draw);
 }
 
 }  // namespace renodx::addons::devkit::mcp::live_shaders

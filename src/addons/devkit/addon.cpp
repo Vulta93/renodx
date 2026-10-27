@@ -272,10 +272,14 @@ struct PendingLiveShaderRequest {
     LOAD = 0,
     UNLOAD = 1,
     SET_SOURCE = 2,
+    SET_BYPASS = 3,
   } operation = Operation::LOAD;
-  // SET_SOURCE only.
+  // SET_SOURCE and SET_BYPASS.
   uint32_t shader_hash = 0u;
+  // SET_SOURCE.
   ShaderDetails::ShaderSource source = ShaderDetails::ShaderSource::ORIGINAL_SHADER;
+  // SET_BYPASS.
+  bool bypass_draw = false;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -3981,6 +3985,14 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   return RunLiveShaderRequestForMcp(device_index, request, "shader source");
 }
 
+[[nodiscard]] ToolResult SetDrawBypassForMcp(uint32_t device_index, uint32_t shader_hash, bool bypass_draw) {
+  auto request = std::make_shared<PendingLiveShaderRequest>();
+  request->operation = PendingLiveShaderRequest::Operation::SET_BYPASS;
+  request->shader_hash = shader_hash;
+  request->bypass_draw = bypass_draw;
+  return RunLiveShaderRequestForMcp(device_index, request, "draw bypass");
+}
+
 [[nodiscard]] ToolResult SetResourceCloneForMcp(uint32_t device_index, std::uint64_t resource_handle, bool enabled) {
   std::shared_lock list_lock(device_data_list_mutex);
   if (device_index >= device_data_list.size()) {
@@ -4666,6 +4678,46 @@ void ProcessPendingLiveShaderRequests(
           };
           break;
         }
+        case PendingLiveShaderRequest::Operation::SET_BYPASS: {
+          std::unique_lock device_lock(device_data->mutex);
+          const auto shader_details = device_data->shader_details.find(request->shader_hash);
+          if (shader_details == device_data->shader_details.end()) {
+            throw std::runtime_error(std::format(
+                "Shader {} has not been seen on device #{}.",
+                FormatShaderHash(request->shader_hash),
+                device_index));
+          }
+          auto& details = shader_details->second;
+          const auto previous_bypass_draw = details.bypass_draw;
+          // The overlay's Draw button toggles and counts; change the count only when the value changes so both stay in step.
+          if (previous_bypass_draw != request->bypass_draw) {
+            details.bypass_draw = request->bypass_draw;
+            skip_draw_count += (details.bypass_draw ? +1 : -1);
+          }
+          json bypassed_shaders = json::array();
+          for (const auto& [shader_hash, other_details] : device_data->shader_details) {
+            if (other_details.bypass_draw) {
+              bypassed_shaders.push_back(FormatShaderHash(shader_hash));
+            }
+          }
+          result = ToolResult{
+              .text = std::format(
+                  "Draws with shader {} on device #{} are {} (was {}). Bypassed shaders: {}.",
+                  FormatShaderHash(request->shader_hash),
+                  device_index,
+                  details.bypass_draw ? "skipped" : "drawn",
+                  previous_bypass_draw ? "skipped" : "drawn",
+                  bypassed_shaders.size()),
+              .structured_content = json{
+                  {"deviceIndex", device_index},
+                  {"shaderHash", FormatShaderHash(request->shader_hash)},
+                  {"bypassDraw", details.bypass_draw},
+                  {"previousBypassDraw", previous_bypass_draw},
+                  {"bypassedShaders", bypassed_shaders},
+              },
+          };
+          break;
+        }
         default:
           break;
       }
@@ -5183,6 +5235,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .load_live_shaders = LoadLiveShadersForMcp,
                                                     .unload_live_shaders = UnloadLiveShadersForMcp,
                                                     .set_shader_source = SetShaderSourceForMcp,
+                                                    .set_draw_bypass = SetDrawBypassForMcp,
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(true),
