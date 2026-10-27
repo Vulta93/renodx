@@ -1892,7 +1892,7 @@ inline void EncodePreviewPixel(
               if (!WritePngPreview(output_path.value(), width, height, preview_pixels)) {
                 output_error = std::format(
                     "Failed to write preview PNG to '{}'.",
-                    output_path->string());
+                    renodx::utils::path::ToUtf8(output_path.value()));
               } else {
                 output_json = json{
                     {"path", renodx::utils::path::ToUtf8(output_path.value())},
@@ -1941,7 +1941,7 @@ inline void EncodePreviewPixel(
               } catch (const std::exception& exception) {
                 output_error = std::format(
                     "Failed to write RGBA16F EXR dump to '{}': {}",
-                    output_path->string(),
+                    renodx::utils::path::ToUtf8(output_path.value()),
                     exception.what());
               }
               break;
@@ -1955,7 +1955,7 @@ inline void EncodePreviewPixel(
         if (directory_error) {
           output_error = std::format(
               "Failed to create output directory '{}': {}",
-              output_directory->string(),
+              renodx::utils::path::ToUtf8(output_directory.value()),
               directory_error.message());
         } else if (!TryBuildRawPngPixels(intermediate_format, mapped_data, width, height, raw_png_pixels)) {
           output_error = std::format(
@@ -2316,7 +2316,7 @@ inline void EncodePreviewPixel(
               analyzed_view_handle,
               device_index,
               preview_mode_name,
-              output_path->string(),
+              renodx::utils::path::ToUtf8(output_path.value()),
               pixels_any_above_one);
         } else {
           text = std::format(
@@ -2327,7 +2327,7 @@ inline void EncodePreviewPixel(
               analyzed_view_label,
               analyzed_view_handle,
               device_index,
-              output_path->string(),
+              renodx::utils::path::ToUtf8(output_path.value()),
               pixels_any_above_one);
         }
         if (!hash_dump_json.is_null()) {
