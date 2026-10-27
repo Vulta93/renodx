@@ -110,6 +110,7 @@ blocks other Devkit tool calls (worst case 60 s key + 30 s delay + 120 s).
 - `devkit_unload_live_shaders`
 - `devkit_set_shader_source`
 - `devkit_set_draw_bypass`
+- `devkit_write_shader_stub`
 
 `devkit_set_shader_source {shaderHash, source}` is the overlay's per-shader Original/Add-on/File choice over MCP:
 `original` draws the game's shader, `addon` the game mod's replacement (refused when no add-on replaces that hash or the
@@ -130,6 +131,18 @@ lists recorded afterwards: D3D12 bundles and command lists recorded once and exe
 value rather than toggling it, so repeated calls and the overlay button stay consistent; the result lists every bypassed
 shader. Use it to remove a draw and see what disappears (bloom, fog, a UI layer). In `devkit_watch_region` a bypassed draw
 still appears as a writer, with no change to the region.
+
+`devkit_write_shader_stub {shaderHash, outputDirectory?}` writes a shader's decompilation (the text `devkit_get_shader`
+shows) to `0x<HASH>.<stage>_<major>_<minor>.hlsl`, the name the live-shader loader parses, so a replacement starts from
+the shader's own signature and constant buffer layout instead of a hand-written one. It covers DXBC shader model 4 and 5
+(D3D10/11, D3D12 SM5; SM 5.1 stubs are untested and may lose register spaces) once the shader has been bound, and refuses
+when the folder already holds a file for that hash. The default folder is the dump folder, outside the default live
+folder (refused if the live path was set to a folder containing it). The edit loop: write the stub, check it against the
+original (copy it into the live folder, `devkit_load_live_shaders`, then `devkit_analyze_resource` on a small region of
+the target the shader writes, with `abShaderHash`, `abSourceA: original`, `abSourceB: file`, after an A-against-A run
+for the noise floor: overlapping ranges mean no measurable difference in the region's statistics, not a pixel-exact
+match), then replace a constant such as `cb0[3].x` with a number, reload and compare again. That answers "what does this
+constant do" without a constant override tool.
 
 Default devkit folder layout under the ReShade base path:
 

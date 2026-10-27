@@ -3993,6 +3993,135 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   return RunLiveShaderRequestForMcp(device_index, request, "draw bypass");
 }
 
+[[nodiscard]] ToolResult WriteShaderStubForMcp(
+    uint32_t device_index,
+    uint32_t shader_hash,
+    const std::optional<std::string>& output_directory) {
+  const auto make_error = [](const std::string& error) {
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  };
+
+  std::optional<renodx::utils::shader::compiler::directx::DxilProgramVersion> program_version;
+  {
+    std::shared_lock list_lock(device_data_list_mutex);
+    if (device_index >= device_data_list.size()) {
+      return make_error(std::format("Device #{} is not available.", device_index));
+    }
+    auto* device_data = device_data_list[device_index];
+    std::shared_lock device_lock(device_data->mutex);
+    const auto iterator = device_data->shader_details.find(shader_hash);
+    if (iterator == device_data->shader_details.end()) {
+      return make_error(std::format("Shader {} is not tracked on device #{}.", FormatShaderHash(shader_hash), device_index));
+    }
+    program_version = iterator->second.program_version;
+  }
+  // The live-shader loader compiles <hash>.<stage>_<major>_<minor>.hlsl with fxc, which takes shader model 4 and 5;
+  // DXIL (SM6) decompilations and SPIR-V/GLSL sources are not built to compile back.
+  if (!program_version.has_value()) {
+    return make_error(std::format(
+        "The shader model of {} is not known yet (it is decoded when a DirectX pipeline with it is bound; OpenGL and "
+        "Vulkan shaders have none). Let the game draw with it, then try again.",
+        FormatShaderHash(shader_hash)));
+  }
+  if (program_version->GetMajor() < 4 || program_version->GetMajor() > 5) {
+    return make_error(std::format(
+        "Shader {} is shader model {}.{}; stubs are written for DXBC shader model 4 and 5 (D3D10/11, D3D12 SM5) only. "
+        "devkit_get_shader still shows its decompilation.",
+        FormatShaderHash(shader_hash),
+        program_version->GetMajor(),
+        program_version->GetMinor()));
+  }
+
+  const auto directory = (output_directory.has_value()
+                              ? std::filesystem::path(output_directory.value())
+                              : renodx::utils::path::GetDumpOutputPath());
+  if (!directory.is_absolute()) {
+    return make_error(std::format("outputDirectory must be an absolute path: '{}'.", directory.string()));
+  }
+  // The watcher scans the live folder recursively: a live path set to an ancestor of the dump folder would compile and
+  // activate a default stub at once. An explicit outputDirectory inside the live folder is the caller's choice.
+  if (!output_directory.has_value()) {
+    const auto live_directory = GetEffectiveLiveDirectory(renodx::utils::shader::compiler::watcher::GetLivePath());
+    const auto relative_to_live = directory.lexically_normal().lexically_relative(live_directory.lexically_normal());
+    if (!relative_to_live.empty() && *relative_to_live.begin() != "..") {
+      return make_error(std::format(
+          "The dump folder '{}' is inside the live shader folder '{}', where a stub would be compiled and activated; "
+          "pass outputDirectory.",
+          directory.string(),
+          live_directory.string()));
+    }
+  }
+  std::error_code directory_error;
+  std::filesystem::create_directories(directory, directory_error);
+  if (!std::filesystem::is_directory(directory)) {
+    return make_error(std::format("Cannot create or use the folder '{}'.", directory.string()));
+  }
+
+  // Any file named for this hash counts (mods name theirs <name>_0x<HASH>.<target>.hlsl): the loader would see two.
+  const auto hash_marker = std::format("0X{:08X}.", shader_hash);
+  for (const auto& entry : std::filesystem::directory_iterator(directory, directory_error)) {
+    auto file_name = entry.path().filename().string();
+    std::ranges::transform(file_name, file_name.begin(), [](unsigned char character) {
+      return static_cast<char>(std::toupper(character));
+    });
+    if (file_name.find(hash_marker) != std::string::npos) {
+      return make_error(std::format(
+          "'{}' already holds a file for {} ('{}'); nothing was overwritten.",
+          directory.string(),
+          FormatShaderHash(shader_hash),
+          entry.path().filename().string()));
+    }
+  }
+
+  const auto shader_target = std::format(
+      "{}_{}_{}",
+      program_version->GetKindAbbr(),
+      program_version->GetMajor(),
+      program_version->GetMinor());
+  const auto file_path = directory / std::format("0x{:08X}.{}.hlsl", shader_hash, shader_target);
+
+  const auto decompilation = BuildMcpShaderDecompilationSection(device_index, shader_hash);
+  if (!decompilation.available) {
+    return make_error(std::format(
+        "Shader {} could not be decompiled: {}",
+        FormatShaderHash(shader_hash),
+        decompilation.error.value_or("no decompilation")));
+  }
+  {
+    // Binary, so line endings stay as the decompiler wrote them.
+    std::ofstream stub_file(file_path, std::ios::binary);
+    stub_file.write(decompilation.text.data(), static_cast<std::streamsize>(decompilation.text.size()));
+    stub_file.close();
+    if (!stub_file) {
+      return make_error(std::format("Failed to write '{}'.", file_path.string()));
+    }
+  }
+
+  // cmd_Decompiler output for SM 5.1 (D3D12) may drop register spaces and resource arrays.
+  const bool is_shader_model_5_1 = (program_version->GetMajor() == 5 && program_version->GetMinor() == 1);
+  return ToolResult{
+      .text = std::format(
+          "Wrote the decompiled {} shader {} to '{}' ({} bytes). Edit it, put it in the live shader folder, then "
+          "devkit_load_live_shaders and devkit_set_shader_source 'file' (or an A/B with abSourceB 'file').{}",
+          shader_target,
+          FormatShaderHash(shader_hash),
+          file_path.string(),
+          decompilation.text.size(),
+          is_shader_model_5_1 ? " SM 5.1: check its register spaces and resource arrays against the disassembly before loading it." : ""),
+      .structured_content = json{
+          {"deviceIndex", device_index},
+          {"shaderHash", FormatShaderHash(shader_hash)},
+          {"shaderTarget", shader_target},
+          {"path", file_path.string()},
+          {"bytes", decompilation.text.size()},
+      },
+  };
+}
+
 [[nodiscard]] ToolResult SetResourceCloneForMcp(uint32_t device_index, std::uint64_t resource_handle, bool enabled) {
   std::shared_lock list_lock(device_data_list_mutex);
   if (device_index >= device_data_list.size()) {
@@ -5236,6 +5365,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .unload_live_shaders = UnloadLiveShadersForMcp,
                                                     .set_shader_source = SetShaderSourceForMcp,
                                                     .set_draw_bypass = SetDrawBypassForMcp,
+                                                    .write_shader_stub = WriteShaderStubForMcp,
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(true),

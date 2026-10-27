@@ -217,6 +217,21 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_write_shader_stub",
+        {
+            .title = "Write Shader Stub",
+            .description = "Write a tracked shader's decompiled HLSL (cmd_Decompiler output, the same text as devkit_get_shader's decompilation) to a file named the way the live-shader loader expects, 0x<HASH>.<stage>_<major>_<minor>.hlsl (e.g. 0x67843125.ps_5_0.hlsl), as the starting point of a replacement: the decompiler keeps the shader's own input/output signature and constant buffer layout. DXBC shader model 4 and 5 only (D3D10/11, D3D12 SM5; SM 5.1 stubs are untested and may lose register spaces, the result says so); refused for SM6 (DXIL), D3D9, OpenGL and Vulkan shaders, and for a shader not bound yet (its model is not known). outputDirectory (absolute; created if missing) defaults to the Devkit's dump folder, outside the default live folder; refused when the live path was set to a folder that contains it. Refused when the folder already holds any file named for this hash (0x<HASH>.), so nothing is overwritten. Then edit it, copy it into the live shader folder and run devkit_load_live_shaders (or point outputDirectory at the live folder: with the Devkit's Live Reload on, a file written there is compiled and activated at once, replacing a game mod's own shader for that hash). Check a fresh stub first with an A/B (devkit_analyze_resource abShaderHash, abSourceA 'original', abSourceB 'file') on a small region of the target the shader writes, after an A-against-A run for the noise floor: overlapping ranges mean no measurable difference in the region's statistics, not a pixel-exact match.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"shaderHash", MakeFlexibleHandleProperty()},
+                    {"outputDirectory", {.types = {"string"}}},
+                },
+                .required = {"shaderHash"},
+            },
+        },
+    },
+    {
         "devkit_list_draws",
         {
             .title = "List Draws",
