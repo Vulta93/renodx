@@ -35,6 +35,7 @@
 #include "../../../utils/exr.hpp"
 #include "../../../utils/mcp/types.hpp"
 #include "../../../utils/mcp/arguments.hpp"
+#include "../../../utils/path.hpp"
 #include "../../../utils/png.hpp"
 #include "../../../utils/resource.hpp"
 #include "resource_handle.hpp"
@@ -1254,9 +1255,9 @@ inline void EncodePreviewPixel(
       }
       csv_file.close();
       if (csv_file) {
-        csv_json = lut->csv_path->string();
+        csv_json = renodx::utils::path::ToUtf8(lut->csv_path.value());
       } else {
-        csv_error = std::format("Failed to write '{}'.", lut->csv_path->string());
+        csv_error = std::format("Failed to write '{}'.", renodx::utils::path::ToUtf8(lut->csv_path.value()));
       }
     }
 
@@ -1883,7 +1884,7 @@ inline void EncodePreviewPixel(
         if (filesystem_error) {
           output_error = std::format(
               "Failed to create output directory '{}': {}",
-              output_path->parent_path().string(),
+              renodx::utils::path::ToUtf8(output_path->parent_path()),
               filesystem_error.message());
         } else {
           switch (output_format) {
@@ -1894,7 +1895,7 @@ inline void EncodePreviewPixel(
                     output_path->string());
               } else {
                 output_json = json{
-                    {"path", output_path->string()},
+                    {"path", renodx::utils::path::ToUtf8(output_path.value())},
                     {"format", "png"},
                     {"mode", preview_mode_name},
                     {"width", width},
@@ -1929,7 +1930,7 @@ inline void EncodePreviewPixel(
                       std::span<const float>(exr_pixels.data(), exr_pixels.size()));
                 }
                 output_json = json{
-                    {"path", output_path->string()},
+                    {"path", renodx::utils::path::ToUtf8(output_path.value())},
                     {"format", "exr"},
                     {"layout", "scanline"},
                     {"compression", "none"},
@@ -1986,10 +1987,10 @@ inline void EncodePreviewPixel(
           if (!WritePngPreview(hash_dump_path, width, height, raw_png_pixels)) {
             output_error = std::format(
                 "Failed to write hash-named PNG dump to '{}'.",
-                hash_dump_path.string());
+                renodx::utils::path::ToUtf8(hash_dump_path));
           } else {
             hash_dump_json = json{
-                {"path", hash_dump_path.string()},
+                {"path", renodx::utils::path::ToUtf8(hash_dump_path)},
                 {"fileName", file_name},
                 {"format", "png"},
                 {"width", width},
@@ -2446,10 +2447,9 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   const auto device_index = context.resolve_device_index(arguments);
   const auto output_path_value = mcp_arguments::GetOptional<std::string>(arguments, "outputPath").value_or("");
   // A .json outputPath writes the finished result (frames and A/B summaries included) instead of an image, so two runs can
-  // be compared outside the game; it is the one output allowed with frames and abShaderHash. The argument is UTF-8: a
-  // narrow std::filesystem::path would decode it with the ANSI code page (and throw on a double-byte one).
-  const auto json_candidate_path = std::filesystem::path(std::u8string(output_path_value.begin(), output_path_value.end()));
-  const bool json_output = (json_candidate_path.extension() == L".json");
+  // be compared outside the game; it is the one output allowed with frames and abShaderHash.
+  auto requested_output_path = renodx::utils::path::FromUtf8(output_path_value);
+  const bool json_output = (requested_output_path.extension() == L".json");
   const auto preview_mode_value = mcp_arguments::GetOptional<std::string>(arguments, "previewMode").value_or("clamped");
   const auto preview_mode = internal::ParsePreviewMode(preview_mode_value);
   const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
@@ -2488,22 +2488,18 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
 
   std::optional<std::filesystem::path> json_output_path;
   std::optional<std::filesystem::path> output_path = std::nullopt;
+  if (!output_path_value.empty() && !requested_output_path.is_absolute()) {
+    throw std::runtime_error("outputPath must be an absolute path.");
+  }
   if (json_output) {
-    if (!json_candidate_path.is_absolute()) {
-      throw std::runtime_error("outputPath must be an absolute path.");
-    }
-    json_output_path = json_candidate_path.lexically_normal();
+    json_output_path = requested_output_path.lexically_normal();
   } else if (!output_path_value.empty()) {
-    auto requested_path = std::filesystem::path(output_path_value);
-    if (!requested_path.is_absolute()) {
-      throw std::runtime_error("outputPath must be an absolute path.");
-    }
-    if (!requested_path.has_extension()) {
-      requested_path.replace_extension(L".png");
-    } else if (requested_path.extension() != L".png" && requested_path.extension() != L".exr") {
+    if (!requested_output_path.has_extension()) {
+      requested_output_path.replace_extension(L".png");
+    } else if (requested_output_path.extension() != L".png" && requested_output_path.extension() != L".exr") {
       throw std::runtime_error("outputPath must end in '.png' or '.exr'.");
     }
-    output_path = requested_path.lexically_normal();
+    output_path = requested_output_path.lexically_normal();
   }
 
   auto request = std::make_shared<PendingRequest>();
@@ -2916,7 +2912,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
   const auto name_prefix = mcp_arguments::GetOptional<std::string>(arguments, "namePrefix");
 
-  auto output_directory = std::filesystem::path(output_directory_value);
+  auto output_directory = renodx::utils::path::FromUtf8(output_directory_value);
   if (!output_directory.is_absolute()) {
     throw std::runtime_error("outputDirectory must be an absolute path.");
   }
@@ -2988,7 +2984,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
     throw std::runtime_error("layout must be 'auto', '3d', 'strip_x' or 'strip_y'.");
   }
   if (const auto output_path = mcp_arguments::GetOptional<std::string>(arguments, "outputPath"); output_path.has_value()) {
-    const auto csv_path = std::filesystem::path(output_path.value());
+    const auto csv_path = renodx::utils::path::FromUtf8(output_path.value());
     if (!csv_path.is_absolute() || csv_path.extension() != ".csv") {
       throw std::runtime_error("outputPath must be an absolute path ending in .csv.");
     }

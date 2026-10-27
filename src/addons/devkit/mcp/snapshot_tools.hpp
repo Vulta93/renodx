@@ -34,6 +34,7 @@
 #include "../../../utils/mcp/types.hpp"
 #include "../../../utils/mcp/arguments.hpp"
 #include "../../../utils/build_info.hpp"
+#include "../../../utils/path.hpp"
 #include "device_summary.hpp"
 #include "device_selection.hpp"
 #include "draw_summary.hpp"
@@ -653,13 +654,14 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
   const auto save_baseline_path = mcp_arguments::GetOptional<std::string>(arguments, "saveBaseline");
   const auto compare_with_path = mcp_arguments::GetOptional<std::string>(arguments, "compareWith");
   for (const auto* path : {&save_baseline_path, &compare_with_path}) {
-    if (path->has_value() && !std::filesystem::path(path->value()).is_absolute()) {
+    if (path->has_value() && !renodx::utils::path::FromUtf8(path->value()).is_absolute()) {
       throw std::runtime_error("saveBaseline and compareWith must be absolute paths.");
     }
   }
   // The baseline file is truncated: a .json extension keeps a mistyped path from wiping another file.
   if (save_baseline_path.has_value()
-      && internal::ToLowerAscii(std::filesystem::path(save_baseline_path.value()).extension().string()) != ".json") {
+      && internal::ToLowerAscii(renodx::utils::path::ToUtf8(renodx::utils::path::FromUtf8(save_baseline_path.value()).extension()))
+             != ".json") {
     throw std::runtime_error("saveBaseline must end in '.json'.");
   }
   const auto device_index = internal::ResolveDeviceIndex(arguments, context);
@@ -1114,7 +1116,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     }
 
     if (compare_with_path.has_value()) {
-      std::ifstream baseline_file(std::filesystem::path(compare_with_path.value()));
+      std::ifstream baseline_file(renodx::utils::path::FromUtf8(compare_with_path.value()));
       if (!baseline_file) {
         throw std::runtime_error(std::format("compareWith: cannot open '{}'.", compare_with_path.value()));
       }
@@ -1354,7 +1356,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     }
 
     if (save_baseline_path.has_value()) {
-      std::ofstream baseline_file(std::filesystem::path(save_baseline_path.value()), std::ios::trunc);
+      std::ofstream baseline_file(renodx::utils::path::FromUtf8(save_baseline_path.value()), std::ios::trunc);
       if (!baseline_file) {
         throw std::runtime_error(std::format("saveBaseline: cannot write '{}'.", save_baseline_path.value()));
       }
