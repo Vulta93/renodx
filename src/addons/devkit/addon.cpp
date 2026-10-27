@@ -2047,6 +2047,7 @@ void RenderTextureReplaceabilityCell(
       source_data,
       context.dest_subresource);
   if (source_slice_pitch == 0u) return false;
+  if (!renodx::utils::resource::IsReadableMemory(source_data.data, source_slice_pitch)) return false;
 
   const auto crc32 = renodx::utils::hash::ComputeCRC32(
       static_cast<const std::uint8_t*>(source_data.data),
