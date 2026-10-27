@@ -159,6 +159,8 @@ struct PushConstantSummary {
   std::vector<ValueRangeSummary> unwritten_ranges;
   // Named variables with no word in the captured span (variables past a truncated range are left out).
   std::vector<ValueWordsSummary> names_without_values;
+  // "device": D3D9 float registers read from the device at the draw instead of collected from pushes.
+  std::optional<std::string> values_source = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -185,6 +187,9 @@ inline void to_json(json& j, const PushConstantSummary& value) {
   }
   if (!value.names_without_values.empty()) {
     j["namesWithoutValues"] = value.names_without_values;
+  }
+  if (value.values_source.has_value()) {
+    j["valuesSource"] = value.values_source.value();
   }
 }
 

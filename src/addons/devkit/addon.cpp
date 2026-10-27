@@ -332,6 +332,8 @@ struct PushConstantValues {
   bool values_truncated = false;
   // Recorded draws only: the reflected constants that name these values, std::nullopt when nothing does.
   std::optional<ConstantVariableSource> named_by = std::nullopt;
+  // Recorded D3D9 draws only: float registers read from the device at the draw (Get*ShaderConstantF), not from pushes.
+  bool read_from_device = false;
 };
 
 // Layout handle, layout parameter, stages and, on OpenGL, the program current when the glUniform* call was made (uniform
@@ -394,6 +396,8 @@ struct DrawDetails {
   std::optional<D3D9FixedFunction> d3d9_fixed_function = std::nullopt;
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
   std::shared_ptr<const std::vector<ConstantVariable>> constant_variables;
+  // D3D9: the vertex shader's constant table, which names its float constants.
+  std::shared_ptr<const std::vector<ConstantVariable>> vertex_constant_variables;
 
   reshade::api::resource copy_source = {0u};
   reshade::api::resource copy_destination = {0u};
@@ -3191,15 +3195,16 @@ std::vector<DeviceData*> device_data_list;
     return floats;
   };
 
-  // Names from the active shader's reflection for the words [first_word, first_word + word_count) of one register set,
-  // register and space; std::nullopt when the shader's reflection was not parsed.
-  const auto name_values = [&draw_details](
+  // Names from a shader's reflection (the active shader's, or the D3D9 vertex shader's) for the words
+  // [first_word, first_word + word_count) of one register set, register and space; std::nullopt when it was not parsed.
+  const auto name_values = [](
+                               const std::shared_ptr<const std::vector<ConstantVariable>>& variables,
                                const ConstantVariableSource& source,
                                uint64_t first_word,
                                size_t word_count) -> std::optional<std::vector<devkit_draw_summary::ValueNameSummary>> {
-    if (draw_details.constant_variables == nullptr) return std::nullopt;
+    if (variables == nullptr) return std::nullopt;
     std::vector<devkit_draw_summary::ValueNameSummary> value_names;
-    for (const auto& variable : *draw_details.constant_variables) {
+    for (const auto& variable : *variables) {
       if (variable.register_set != source.register_set || variable.slot != source.slot || variable.space != source.space) {
         continue;
       }
@@ -3248,7 +3253,10 @@ std::vector<DeviceData*> device_data_list;
       constant_buffer.float_values = to_floats(words);
       // The captured words start at the bound offset, where the cbuffer's offset 0 is.
       constant_buffer.value_names = name_values(
-          {.register_set = ConstantVariable::RegisterSet::CONSTANT_BUFFER, .slot = slot, .space = space}, 0u, words.size());
+          draw_details.constant_variables,
+          {.register_set = ConstantVariable::RegisterSet::CONSTANT_BUFFER, .slot = slot, .space = space},
+          0u,
+          words.size());
       constant_buffer.uint_values = std::move(words);
     }
   }
@@ -3262,12 +3270,14 @@ std::vector<DeviceData*> device_data_list;
       std::vector<devkit_draw_summary::ValueWordsSummary> names_without_values;
       if (pushed.named_by.has_value()) {
         const auto& source = pushed.named_by.value();
-        value_names = name_values(source, pushed.first_written, pushed.values.size());
+        const auto& variables = (stages == reshade::api::shader_stage::vertex ? draw_details.vertex_constant_variables
+                                                                              : draw_details.constant_variables);
+        value_names = name_values(variables, source, pushed.first_written, pushed.values.size());
         // Variables of the same register set with no word in the captured span: no recorded call set them, so only their
         // name and absolute word can be listed. Past the capture cap the game may have set them, so they are left out.
-        if (draw_details.constant_variables != nullptr) {
+        if (variables != nullptr) {
           const uint64_t captured_end = static_cast<uint64_t>(pushed.first_written) + pushed.values.size();
-          for (const auto& variable : *draw_details.constant_variables) {
+          for (const auto& variable : *variables) {
             if (variable.register_set != source.register_set || variable.slot != source.slot
                 || variable.space != source.space) {
               continue;
@@ -3311,6 +3321,7 @@ std::vector<DeviceData*> device_data_list;
           .values_truncated = pushed.values_truncated,
           .unwritten_ranges = std::move(unwritten_ranges),
           .names_without_values = std::move(names_without_values),
+          .values_source = (pushed.read_from_device ? std::optional<std::string>("device") : std::nullopt),
       });
     }
     draw_summary.push_constants = std::move(push_constants);
@@ -7200,6 +7211,76 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         }
       }
 
+      // D3D9 float constants as the device holds them at the draw, whoever set them and whenever: pushes only cover calls
+      // made during snapshot frames, and none of a vertex shader's. They replace the pushed float registers (the int and
+      // bool ones stay pushed) over the shader's constant table, or its shader model's registers without one, and every
+      // register the game pushed. Words follow the push layout: register cN at word 4 * N.
+      if (device->get_api() == reshade::api::device_api::d3d9 && !device_data->is_d3d9_pure_device
+          && (stage == reshade::api::pipeline_stage::pixel_shader || stage == reshade::api::pipeline_stage::vertex_shader)) {
+        if (shader_details == nullptr) {
+          shader_details = device_data->GetShaderDetails(shader_hash);
+        }
+        if (!shader_details->resource_binds.has_value()) {
+          GetResourceBindsForShaderDetails(device, device_data, shader_details);
+        }
+        const bool is_pixel_shader = (stage == reshade::api::pipeline_stage::pixel_shader);
+        if (!is_pixel_shader) {
+          draw_details.vertex_constant_variables = shader_details->constant_variables;
+        }
+        // ReShade's D3D9 layout pushes vertex shader float/int/bool registers at parameters 2/3/4, pixel at 5/6/7.
+        const uint32_t float_layout_param = (is_pixel_shader ? 5u : 2u);
+        const auto shader_stage = (is_pixel_shader ? reshade::api::shader_stage::pixel : reshade::api::shader_stage::vertex);
+        uint64_t register_count = 0u;
+        bool has_constant_table = false;
+        if (shader_details->constant_variables != nullptr) {
+          for (const auto& variable : *shader_details->constant_variables) {
+            if (variable.register_set != ConstantVariable::RegisterSet::FLOAT4) continue;
+            has_constant_table = true;
+            register_count = std::max<uint64_t>(register_count, (static_cast<uint64_t>(variable.first_word) + variable.word_count + 3u) / 4u);
+          }
+        }
+        if (!has_constant_table && shader_details->program_version.has_value()) {
+          // Float registers per shader model: ps_1_x 8, ps_2_x 32, ps_3_0 224; vs_1_1 96, vs_2_x and vs_3_0 256.
+          const auto major = shader_details->program_version->GetMajor();
+          if (is_pixel_shader) {
+            register_count = (major <= 1u ? 8u : (major == 2u ? 32u : 224u));
+          } else {
+            register_count = (major <= 1u ? 96u : 256u);
+          }
+        }
+        // Every D3D9 push goes to ReShade's one global layout, so any pushed key names it.
+        uint64_t layout_handle = 0u;
+        for (const auto& [push_constant_key, pushed] : command_list_data->push_constants) {
+          const auto& [pushed_layout_handle, pushed_layout_param, pushed_stages, pushed_gl_program] = push_constant_key;
+          layout_handle = pushed_layout_handle;
+          if (pushed_layout_param == float_layout_param && pushed_stages == shader_stage) {
+            register_count = std::max<uint64_t>(register_count, (pushed.values.size() + 3u) / 4u);
+          }
+        }
+        const uint64_t max_registers = MAX_CAPTURED_PUSH_CONSTANT_VALUES / 4u;
+        const bool values_truncated = register_count > max_registers;
+        register_count = std::min(register_count, max_registers);
+        if (register_count != 0u) {
+          auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(cmd_list->get_native()));
+          std::vector<float> registers(register_count * 4u);
+          const HRESULT result = (is_pixel_shader
+                                      ? native_device->GetPixelShaderConstantF(0u, registers.data(), static_cast<UINT>(register_count))
+                                      : native_device->GetVertexShaderConstantF(0u, registers.data(), static_cast<UINT>(register_count)));
+          if (SUCCEEDED(result)) {
+            std::vector<uint32_t> values(registers.size());
+            std::ranges::transform(registers, values.begin(), [](float value) { return std::bit_cast<uint32_t>(value); });
+            // Inserted first, so the pushed float registers of the same key below do not replace it.
+            draw_details.push_constants[{layout_handle, float_layout_param, shader_stage, 0u}] = PushConstantValues{
+                .first_written = 0u,
+                .values = std::move(values),
+                .written = std::vector<bool>(registers.size(), true),
+                .values_truncated = values_truncated,
+                .named_by = ConstantVariableSource{.register_set = ConstantVariable::RegisterSet::FLOAT4},
+                .read_from_device = true,
+            };
+          }
+        }
+      }
     }
     for (const auto& pipeline_details : active_shaders.pipelines) {
       draw_details.pipeline_binds.push_back(pipeline_details);

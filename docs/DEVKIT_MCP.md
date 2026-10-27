@@ -237,18 +237,29 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     point (the one its descriptor tables are bound with). When no descriptor table was bound since the last root signature
     change, that layout is unknown and the values of every layout pushed during the snapshot are listed (check
     `layoutHandle`).
-  - D3D9 shader constants: `layoutParam` 5/6/7 are the pixel shader's float/int/bool constants. Float and int register N start
-    at word 4 * N; bool register N is word N.
+  - D3D9 shader constants: `layoutParam` 5/6/7 are the pixel shader's float/int/bool constants, 2 the vertex shader's
+    float constants. Float and int register N start at word 4 * N; bool register N is word N. The float constants
+    (`layoutParam` 5 and 2, `valuesSource: "device"`) are read from the device at the draw (`GetPixelShaderConstantF`,
+    `GetVertexShaderConstantF`) rather than collected from pushes: from c0 up to the end of the shader's constant table,
+    or without one the shader model's float registers (ps_1_x 8, ps_2_x 32, ps_3_0 224, vs_1_1 96, vs_2_x/vs_3_0 256),
+    or further when the game pushed higher registers during the snapshot, at most 256 registers. Every word is then
+    known (no `unwrittenRanges`), whenever and by whom it was set: constants set in an earlier frame, by a state block,
+    or by an add-on that injects its own constants (RenoDX shader injection) all show. A ps_1_x shader clamps its
+    constants to [-1, 1] when it reads them; the device holds, and the Devkit reports, the unclamped values. The int and
+    bool registers (`layoutParam` 6/7) stay collected from pushes. On a pure device (`D3DCREATE_PUREDEVICE`), whose
+    `Get*` calls are not reliable, the float constants are collected from pushes too, pixel shader only. `layoutHandle` is
+    ReShade's one D3D9 layout, or 0 when the game pushed no constant during the snapshot.
   - OpenGL `glUniform*`: word 4 * location. Values are kept per program (the one current at each call) and per context,
     and a draw lists only its own program's (`glProgram`), since a location means something different in every program;
     a uniform set on another context of the share group is not seen. Arrays and matrices fill consecutive words from
     4 * location, overlapping the next locations. Values left from a deleted program whose name the driver reused show
     up under the new program. `glProgramUniform*` is not hooked by ReShade, so those writes are missing.
 
-Limits: values are recorded only from calls the game makes during snapshot frames (like the other bindings the snapshot
-records). A constant the game set before the snapshot frame and did not set again is missing, or shows a value from an
-earlier snapshot on D3D9 and the D3D11/OpenGL immediate context, whose state is kept between frames. Vertex shader
-constants are not included, except on OpenGL, where uniforms belong to the whole linked program.
+Limits: values other than the D3D9 float constants are recorded only from calls the game makes during snapshot frames
+(like the other bindings the snapshot records). A constant the game set before the snapshot frame and did not set again
+is missing, or shows a value from an earlier snapshot on D3D9 (int and bool registers) and the D3D11/OpenGL immediate
+context, whose state is kept between frames. Vertex shader constants are not included, except the D3D9 float ones and on
+OpenGL, where uniforms belong to the whole linked program.
 
 `valueNames` labels the words with the active pixel (or compute) shader's own variable names, read from the reflection
 in its disassembly (on OpenGL, the linked program's active uniforms, all stages): each entry is `name`, `index` (into
@@ -263,7 +274,8 @@ in its disassembly (on OpenGL, the linked program's active uniforms, all stages)
   elements start on 16-byte boundaries; `double` and 64-bit integers take 8 bytes, 16-bit types are counted as
   4). Arrays of structs are labelled at element 0 only. `$Globals` is included; structured buffer layouts are not.
   Shipped D3D12 shaders often strip their reflection (`-Qstrip_reflect`), and then the list is empty.
-- D3D9 pixel shader constants (`layoutParam` 5/6/7): the constant table's "Registers" rows (`c`, `i`, `b`).
+- D3D9 shader constants (`layoutParam` 5/6/7, and 2 for the vertex shader's float constants, named from the vertex
+  shader's own table): the constant table's "Registers" rows (`c`, `i`, `b`).
 - Vulkan push constants: the SPIR-V push constant block's `OpMemberName` and `OpMemberDecorate ... Offset` (word =
   Offset / 4, as `vkCmdPushConstants` addresses it; 16-bit members share their 32-bit word). Scalars, vectors, matrices
   (`MatrixStride` per column, per row when `RowMajor`) and arrays (`ArrayStride` per element) are sized from their type;
