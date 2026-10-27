@@ -244,8 +244,7 @@ inline ToolResult HandleStatusTool([[maybe_unused]] const json& arguments, const
     const auto module_path_size = GetModuleFileNameW(devkit_module, module_path.data(), static_cast<DWORD>(module_path.size()));
     if (module_path_size > 0u && module_path_size < module_path.size()) {
       module_path.resize(module_path_size);
-      const auto module_path_utf8 = std::filesystem::path(module_path).u8string();
-      result["serverInfo"]["modulePath"] = std::string(module_path_utf8.begin(), module_path_utf8.end());
+      result["serverInfo"]["modulePath"] = renodx::utils::path::ToUtf8(module_path);
       std::error_code last_write_error;
       const auto last_write = std::filesystem::last_write_time(module_path, last_write_error);
       if (!last_write_error) {
