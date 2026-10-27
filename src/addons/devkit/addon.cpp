@@ -9,6 +9,7 @@
 #include <d3d12.h>
 #include <d3d9.h>
 #include <Windows.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -337,6 +338,29 @@ struct PushConstantValues {
 // values are program state, but ReShade reports them all through one context-wide layout); 0 on other APIs.
 using PushConstantKey = std::tuple<uint64_t, uint32_t, reshade::api::shader_stage, uint32_t>;
 
+// One D3D9 fixed-function texture stage, D3DTSS_* values as the device held them at the draw.
+struct D3D9TextureStage {
+  uint32_t stage = 0u;
+  DWORD color_op = 0u;
+  DWORD color_arg0 = 0u;
+  DWORD color_arg1 = 0u;
+  DWORD color_arg2 = 0u;
+  DWORD alpha_op = 0u;
+  DWORD alpha_arg0 = 0u;
+  DWORD alpha_arg1 = 0u;
+  DWORD alpha_arg2 = 0u;
+  DWORD result_arg = 0u;
+};
+
+struct D3D9FixedFunction {
+  // Stages up to the first whose COLOROP is D3DTOP_DISABLE.
+  std::vector<D3D9TextureStage> stages;
+  DWORD texture_factor = 0u;
+  bool specular_enable = false;
+  // The device had a pixel shader bound although the game bound none: an add-on drew this draw with its own shader.
+  bool device_pixel_shader_bound = false;
+};
+
 constexpr uint64_t MAX_CAPTURED_CONSTANT_BUFFER_BYTES = 4096u;
 constexpr size_t MAX_CAPTURED_PUSH_CONSTANT_VALUES = 1024u;
 
@@ -366,6 +390,8 @@ struct DrawDetails {
   std::vector<PipelineBindDetails> pipeline_binds;
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
+  // D3D9 draws the game issued without a pixel shader.
+  std::optional<D3D9FixedFunction> d3d9_fixed_function = std::nullopt;
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
   std::shared_ptr<const std::vector<ConstantVariable>> constant_variables;
 
@@ -575,6 +601,8 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   HWND primary_swapchain_hwnd = nullptr;
   bool primary_swapchain_is_flip = false;
   bool is_d3d9_ex = false;
+  // D3DCREATE_PUREDEVICE: the device's Get* state calls are not reliable, so the snapshot reads no D3D9 state beyond blending.
+  bool is_d3d9_pure_device = false;
   // The D3D11 device a RenoDX Display Proxy presents the game's frames on. It is listed only for the measuring tools
   // (devkit_analyze_resource, devkit_watch_region): no snapshots, shader tracking, live shaders or clones.
   bool is_display_proxy = false;
@@ -3392,6 +3420,90 @@ std::vector<DeviceData*> device_data_list;
     };
   }
 
+  if (draw_details.d3d9_fixed_function.has_value()) {
+    const auto op_name = [](DWORD op) -> std::string {
+      switch (op) {
+        case D3DTOP_DISABLE:                   return "disable";
+        case D3DTOP_SELECTARG1:                return "select_arg1";
+        case D3DTOP_SELECTARG2:                return "select_arg2";
+        case D3DTOP_MODULATE:                  return "modulate";
+        case D3DTOP_MODULATE2X:                return "modulate2x";
+        case D3DTOP_MODULATE4X:                return "modulate4x";
+        case D3DTOP_ADD:                       return "add";
+        case D3DTOP_ADDSIGNED:                 return "add_signed";
+        case D3DTOP_ADDSIGNED2X:               return "add_signed2x";
+        case D3DTOP_SUBTRACT:                  return "subtract";
+        case D3DTOP_ADDSMOOTH:                 return "add_smooth";
+        case D3DTOP_BLENDDIFFUSEALPHA:         return "blend_diffuse_alpha";
+        case D3DTOP_BLENDTEXTUREALPHA:         return "blend_texture_alpha";
+        case D3DTOP_BLENDFACTORALPHA:          return "blend_factor_alpha";
+        case D3DTOP_BLENDTEXTUREALPHAPM:       return "blend_texture_alpha_pm";
+        case D3DTOP_BLENDCURRENTALPHA:         return "blend_current_alpha";
+        case D3DTOP_PREMODULATE:               return "premodulate";
+        case D3DTOP_MODULATEALPHA_ADDCOLOR:    return "modulate_alpha_add_color";
+        case D3DTOP_MODULATECOLOR_ADDALPHA:    return "modulate_color_add_alpha";
+        case D3DTOP_MODULATEINVALPHA_ADDCOLOR: return "modulate_inv_alpha_add_color";
+        case D3DTOP_MODULATEINVCOLOR_ADDALPHA: return "modulate_inv_color_add_alpha";
+        case D3DTOP_BUMPENVMAP:                return "bump_env_map";
+        case D3DTOP_BUMPENVMAPLUMINANCE:       return "bump_env_map_luminance";
+        case D3DTOP_DOTPRODUCT3:               return "dot_product3";
+        case D3DTOP_MULTIPLYADD:               return "multiply_add";
+        case D3DTOP_LERP:                      return "lerp";
+        default:                               return std::format("unknown_{}", op);
+      }
+    };
+    const auto argument = [](DWORD value) {
+      std::string source;
+      switch (value & D3DTA_SELECTMASK) {
+        case D3DTA_DIFFUSE:  source = "diffuse"; break;
+        case D3DTA_CURRENT:  source = "current"; break;
+        case D3DTA_TEXTURE:  source = "texture"; break;
+        case D3DTA_TFACTOR:  source = "texture_factor"; break;
+        case D3DTA_SPECULAR: source = "specular"; break;
+        case D3DTA_TEMP:     source = "temp"; break;
+        case D3DTA_CONSTANT: source = "constant"; break;
+        default:             source = std::format("unknown_{}", value & D3DTA_SELECTMASK); break;
+      }
+      return devkit_draw_summary::TextureStageArgumentSummary{
+          .source = std::move(source),
+          .complement = (value & D3DTA_COMPLEMENT) != 0u,
+          .alpha_replicate = (value & D3DTA_ALPHAREPLICATE) != 0u,
+      };
+    };
+    // ARG0 is an operand only of the three-operand ops; RESULTARG is listed only when it is not the default CURRENT.
+    const auto uses_arg0 = [](DWORD op) { return op == D3DTOP_MULTIPLYADD || op == D3DTOP_LERP; };
+    const auto& fixed_function = draw_details.d3d9_fixed_function.value();
+    std::vector<devkit_draw_summary::TextureStageSummary> stages;
+    stages.reserve(fixed_function.stages.size());
+    for (const auto& stage : fixed_function.stages) {
+      stages.push_back(devkit_draw_summary::TextureStageSummary{
+          .stage = stage.stage,
+          .color_op = op_name(stage.color_op),
+          .color_arg0 = (uses_arg0(stage.color_op) ? std::optional(argument(stage.color_arg0)) : std::nullopt),
+          .color_arg1 = argument(stage.color_arg1),
+          .color_arg2 = argument(stage.color_arg2),
+          .alpha_op = op_name(stage.alpha_op),
+          .alpha_arg0 = (uses_arg0(stage.alpha_op) ? std::optional(argument(stage.alpha_arg0)) : std::nullopt),
+          .alpha_arg1 = argument(stage.alpha_arg1),
+          .alpha_arg2 = argument(stage.alpha_arg2),
+          .result_arg = (stage.result_arg == D3DTA_CURRENT ? std::nullopt : std::optional(argument(stage.result_arg))),
+      });
+    }
+    // D3DRS_TEXTUREFACTOR is a D3DCOLOR (ARGB, 8 bits per channel).
+    draw_summary.fixed_function = devkit_draw_summary::FixedFunctionSummary{
+        .stages = std::move(stages),
+        .texture_factor_hex = std::format("0x{:08X}", static_cast<uint32_t>(fixed_function.texture_factor)),
+        .texture_factor = {
+            static_cast<float>((fixed_function.texture_factor >> 16u) & 0xFFu) / 255.f,
+            static_cast<float>((fixed_function.texture_factor >> 8u) & 0xFFu) / 255.f,
+            static_cast<float>(fixed_function.texture_factor & 0xFFu) / 255.f,
+            static_cast<float>((fixed_function.texture_factor >> 24u) & 0xFFu) / 255.f,
+        },
+        .specular_enable = fixed_function.specular_enable,
+        .device_pixel_shader_bound = fixed_function.device_pixel_shader_bound,
+    };
+  }
+
   return draw_summary;
 }
 
@@ -5649,6 +5761,12 @@ void OnInitDevice(reshade::api::device* device) {
       std::memory_order_acq_rel,
       std::memory_order_acquire);
   device_data->is_d3d9_ex = renodx::utils::device::IsD3D9ExDevice(device);
+  if (device_api == reshade::api::device_api::d3d9) {
+    D3DDEVICE_CREATION_PARAMETERS creation_parameters = {};
+    auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(device->get_native()));
+    device_data->is_d3d9_pure_device = SUCCEEDED(native_device->GetCreationParameters(&creation_parameters))
+                                       && (creation_parameters.BehaviorFlags & D3DCREATE_PUREDEVICE) != 0u;
+  }
   device_data->watch_region_watcher.begin_linked_snapshot = [device_data]() -> std::optional<uint64_t> {
     if (snapshot_queued_device != nullptr) return std::nullopt;
     // Claimed first, so a snapshot started meanwhile from the overlay or MCP cannot interleave with this one.
@@ -6876,6 +6994,45 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           blend_desc.render_target_write_mask[rtv_index] = static_cast<uint8_t>(render_target_write_masks[rtv_index] & 0xFu);
         }
         draw_details.blend_desc = blend_desc;
+      }
+
+      // Fixed-function texture stages, for draws the game issued without a pixel shader. An add-on that draws one with its
+      // own shader binds it without a ReShade event, so the game's binding decides and the device's is only flagged.
+      const bool game_pixel_shader_bound = std::ranges::any_of(get_bound_shaders().shaders, [](const auto& bound) {
+        return bound.stage == reshade::api::pipeline_stage::pixel_shader;
+      });
+      if (!device_data->is_d3d9_pure_device && !game_pixel_shader_bound) {
+        const auto read_stage_state = [&](DWORD stage, D3DTEXTURESTAGESTATETYPE state) -> DWORD {
+          DWORD value = 0u;
+          native_device->GetTextureStageState(stage, state, &value);
+          return value;
+        };
+        D3D9FixedFunction fixed_function = {};
+        // D3D9 has at most eight texture blending stages.
+        for (DWORD stage = 0u; stage < 8u; ++stage) {
+          const DWORD color_op = read_stage_state(stage, D3DTSS_COLOROP);
+          if (color_op == D3DTOP_DISABLE) break;
+          fixed_function.stages.push_back(D3D9TextureStage{
+              .stage = stage,
+              .color_op = color_op,
+              .color_arg0 = read_stage_state(stage, D3DTSS_COLORARG0),
+              .color_arg1 = read_stage_state(stage, D3DTSS_COLORARG1),
+              .color_arg2 = read_stage_state(stage, D3DTSS_COLORARG2),
+              .alpha_op = read_stage_state(stage, D3DTSS_ALPHAOP),
+              .alpha_arg0 = read_stage_state(stage, D3DTSS_ALPHAARG0),
+              .alpha_arg1 = read_stage_state(stage, D3DTSS_ALPHAARG1),
+              .alpha_arg2 = read_stage_state(stage, D3DTSS_ALPHAARG2),
+              .result_arg = read_stage_state(stage, D3DTSS_RESULTARG),
+          });
+        }
+        native_device->GetRenderState(D3DRS_TEXTUREFACTOR, &fixed_function.texture_factor);
+        DWORD specular_enable = FALSE;
+        native_device->GetRenderState(D3DRS_SPECULARENABLE, &specular_enable);
+        fixed_function.specular_enable = specular_enable != FALSE;
+        Microsoft::WRL::ComPtr<IDirect3DPixelShader9> device_pixel_shader;
+        fixed_function.device_pixel_shader_bound =
+            SUCCEEDED(native_device->GetPixelShader(&device_pixel_shader)) && device_pixel_shader != nullptr;
+        draw_details.d3d9_fixed_function = std::move(fixed_function);
       }
     } else if (device->get_api() == reshade::api::device_api::opengl && draw_method != DrawDetails::DrawMethods::DISPATCH) {
       // OpenGL blending is context state, not part of a pipeline, so read it from the current context at each recorded

@@ -305,6 +305,30 @@ descriptors for them (`vkUpdateDescriptorSets` hook, `vulkan_hooks_device.cpp`, 
 Devkit never sees those bindings. A Vulkan draw whose shader reads constant buffers but shows none (DOOM 2016's output
 draw) most likely uses them. Listing them would need a change in ReShade.
 
+### D3D9 fixed-function stages (`fixedFunction` in `devkit_get_draw`)
+
+A D3D9 draw the game issues without a pixel shader is shaded by the fixed-function texture stages. The snapshot reads them
+from the device at each such draw (`GetTextureStageState`, `GetRenderState`), the same way it reads D3D9 blending, and
+`devkit_get_draw` lists them as `fixedFunction`:
+
+- `stages`: stage 0 onwards, up to the first whose color op is `D3DTOP_DISABLE` (at most eight). Each has `colorOp` and
+  `alphaOp` (D3DTOP names in snake case: `modulate`, `modulate2x`, `select_arg1`, `blend_texture_alpha`, ...),
+  `colorArg1`/`colorArg2` and `alphaArg1`/`alphaArg2` as `{source, complement?, alphaReplicate?}` (source `diffuse`,
+  `current`, `texture`, `texture_factor`, `specular`, `temp` or `constant`; `complement` is D3DTA_COMPLEMENT, 1 - x;
+  `alphaReplicate` is D3DTA_ALPHAREPLICATE), `colorArg0`/`alphaArg0` only for `multiply_add` and `lerp`, which use three
+  operands, and `resultArg` only when the stage writes somewhere else than `current` (usually `temp`).
+- `textureFactor` (D3DRS_TEXTUREFACTOR as RGBA 0-1) with `textureFactorHex` (the raw ARGB value), and `specularEnable`.
+- `devicePixelShaderBound`: the device had a pixel shader bound although the game bound none. An add-on drew the draw with
+  its own shader (a stand-in), which it binds without a ReShade event; the stages are still the game's, which is what the
+  stand-in has to reproduce.
+
+Why it matters for HDR: the stages compute in the hardware's fixed-point range, so `modulate2x`, `modulate4x` and `add`
+stages clamp at white (1.0) before blending, and `add_signed`/`subtract` clamp at 0. A stand-in pixel shader that
+reproduces the stages in float has to clamp the same way where the game relies on it, or decide on purpose not to.
+
+The stages are read only on draws without a game pixel shader, only while a snapshot records, and not on a pure device
+(created with `D3DCREATE_PUREDEVICE`), whose `Get*` state calls are not reliable.
+
 ### Replacement status (`devkit_list_replacements`)
 
 Lists every shader hash a loaded add-on registered a replacement for on the device: `compileTime` (registered for

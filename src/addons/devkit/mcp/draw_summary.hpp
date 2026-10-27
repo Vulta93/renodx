@@ -251,6 +251,77 @@ inline void to_json(json& j, const BlendStateSummary& value) {
   };
 }
 
+struct TextureStageArgumentSummary {
+  std::string source;
+  bool complement = false;
+  bool alpha_replicate = false;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const TextureStageArgumentSummary& value) {
+  j = {{"source", value.source}};
+  if (value.complement) {
+    j["complement"] = true;
+  }
+  if (value.alpha_replicate) {
+    j["alphaReplicate"] = true;
+  }
+}
+
+struct TextureStageSummary {
+  std::uint32_t stage = 0u;
+  std::string color_op;
+  std::optional<TextureStageArgumentSummary> color_arg0 = std::nullopt;
+  TextureStageArgumentSummary color_arg1;
+  TextureStageArgumentSummary color_arg2;
+  std::string alpha_op;
+  std::optional<TextureStageArgumentSummary> alpha_arg0 = std::nullopt;
+  TextureStageArgumentSummary alpha_arg1;
+  TextureStageArgumentSummary alpha_arg2;
+  std::optional<TextureStageArgumentSummary> result_arg = std::nullopt;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const TextureStageSummary& value) {
+  j = {
+      {"stage", value.stage},
+      {"colorOp", value.color_op},
+      {"colorArg1", value.color_arg1},
+      {"colorArg2", value.color_arg2},
+      {"alphaOp", value.alpha_op},
+      {"alphaArg1", value.alpha_arg1},
+      {"alphaArg2", value.alpha_arg2},
+  };
+  if (value.color_arg0.has_value()) {
+    j["colorArg0"] = value.color_arg0.value();
+  }
+  if (value.alpha_arg0.has_value()) {
+    j["alphaArg0"] = value.alpha_arg0.value();
+  }
+  if (value.result_arg.has_value()) {
+    j["resultArg"] = value.result_arg.value();
+  }
+}
+
+struct FixedFunctionSummary {
+  std::vector<TextureStageSummary> stages;
+  std::string texture_factor_hex;
+  std::array<float, 4> texture_factor = {};
+  bool specular_enable = false;
+  bool device_pixel_shader_bound = false;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const FixedFunctionSummary& value) {
+  j = {
+      {"stages", value.stages},
+      {"textureFactorHex", value.texture_factor_hex},
+      {"textureFactor", value.texture_factor},
+      {"specularEnable", value.specular_enable},
+      {"devicePixelShaderBound", value.device_pixel_shader_bound},
+  };
+}
+
 struct RenderTargetSummary {
   std::uint32_t rtv_index = 0u;
   resource_view_summary::ResourceViewSummary resource_view;
@@ -287,6 +358,7 @@ struct DrawSummary {
   std::optional<std::vector<PipelineBindSummary>> pipelines = std::nullopt;
   std::optional<std::vector<ResourceBindSummary>> shader_resource_binds = std::nullopt;
   std::optional<BlendStateSummary> blend_state = std::nullopt;
+  std::optional<FixedFunctionSummary> fixed_function = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -334,6 +406,9 @@ inline void to_json(json& j, const DrawSummary& value) {
   }
   if (value.blend_state.has_value()) {
     j["blendState"] = value.blend_state.value();
+  }
+  if (value.fixed_function.has_value()) {
+    j["fixedFunction"] = value.fixed_function.value();
   }
 }
 
