@@ -363,6 +363,30 @@ struct D3D9FixedFunction {
   bool device_pixel_shader_bound = false;
 };
 
+// D3D9 state a port of the draw has to reproduce, as the device held it at the draw; default values are left out.
+struct D3D9DrawState {
+  DWORD fvf = 0u;
+  // The vertex declaration's elements, without the D3DDECL_END terminator.
+  std::vector<D3DVERTEXELEMENT9> vertex_elements;
+  struct TextureTransform {
+    uint32_t stage = 0u;
+    DWORD flags = 0u;
+  };
+  std::vector<TextureTransform> texture_transforms;
+  struct BumpEnvironment {
+    uint32_t stage = 0u;
+    std::array<float, 4> matrix = {};
+    DWORD address_u = 0u;
+  };
+  std::vector<BumpEnvironment> bump_environments;
+  struct SamplerFilter {
+    uint32_t sampler = 0u;
+    DWORD mag_filter = 0u;
+    DWORD min_filter = 0u;
+  };
+  std::vector<SamplerFilter> sampler_filters;
+};
+
 constexpr uint64_t MAX_CAPTURED_CONSTANT_BUFFER_BYTES = 4096u;
 constexpr size_t MAX_CAPTURED_PUSH_CONSTANT_VALUES = 1024u;
 
@@ -394,6 +418,7 @@ struct DrawDetails {
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
   // D3D9 draws the game issued without a pixel shader.
   std::optional<D3D9FixedFunction> d3d9_fixed_function = std::nullopt;
+  std::optional<D3D9DrawState> d3d9_state = std::nullopt;
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
   std::shared_ptr<const std::vector<ConstantVariable>> constant_variables;
   // D3D9: the vertex shader's constant table, which names its float constants.
@@ -3513,6 +3538,111 @@ std::vector<DeviceData*> device_data_list;
         .specular_enable = fixed_function.specular_enable,
         .device_pixel_shader_bound = fixed_function.device_pixel_shader_bound,
     };
+  }
+
+  if (draw_details.d3d9_state.has_value()) {
+    const auto& state = draw_details.d3d9_state.value();
+    const auto filter_name = [](DWORD filter) -> std::string {
+      switch (filter) {
+        case D3DTEXF_NONE:            return "none";
+        case D3DTEXF_POINT:           return "point";
+        case D3DTEXF_LINEAR:          return "linear";
+        case D3DTEXF_ANISOTROPIC:     return "anisotropic";
+        case D3DTEXF_PYRAMIDALQUAD:   return "pyramidal_quad";
+        case D3DTEXF_GAUSSIANQUAD:    return "gaussian_quad";
+        case D3DTEXF_CONVOLUTIONMONO: return "convolution_mono";
+        default:                      return std::format("unknown_{}", filter);
+      }
+    };
+    const auto address_name = [](DWORD address) -> std::string {
+      switch (address) {
+        case D3DTADDRESS_WRAP:       return "wrap";
+        case D3DTADDRESS_MIRROR:     return "mirror";
+        case D3DTADDRESS_CLAMP:      return "clamp";
+        case D3DTADDRESS_BORDER:     return "border";
+        case D3DTADDRESS_MIRRORONCE: return "mirror_once";
+        default:                     return std::format("unknown_{}", address);
+      }
+    };
+    const auto type_name = [](BYTE type) -> std::string {
+      switch (type) {
+        case D3DDECLTYPE_FLOAT1:    return "float1";
+        case D3DDECLTYPE_FLOAT2:    return "float2";
+        case D3DDECLTYPE_FLOAT3:    return "float3";
+        case D3DDECLTYPE_FLOAT4:    return "float4";
+        case D3DDECLTYPE_D3DCOLOR:  return "d3dcolor";
+        case D3DDECLTYPE_UBYTE4:    return "ubyte4";
+        case D3DDECLTYPE_SHORT2:    return "short2";
+        case D3DDECLTYPE_SHORT4:    return "short4";
+        case D3DDECLTYPE_UBYTE4N:   return "ubyte4n";
+        case D3DDECLTYPE_SHORT2N:   return "short2n";
+        case D3DDECLTYPE_SHORT4N:   return "short4n";
+        case D3DDECLTYPE_USHORT2N:  return "ushort2n";
+        case D3DDECLTYPE_USHORT4N:  return "ushort4n";
+        case D3DDECLTYPE_UDEC3:     return "udec3";
+        case D3DDECLTYPE_DEC3N:     return "dec3n";
+        case D3DDECLTYPE_FLOAT16_2: return "float16_2";
+        case D3DDECLTYPE_FLOAT16_4: return "float16_4";
+        case D3DDECLTYPE_UNUSED:    return "unused";
+        default:                    return std::format("unknown_{}", type);
+      }
+    };
+    const auto usage_name = [](BYTE usage) -> std::string {
+      switch (usage) {
+        case D3DDECLUSAGE_POSITION:     return "position";
+        case D3DDECLUSAGE_BLENDWEIGHT:  return "blend_weight";
+        case D3DDECLUSAGE_BLENDINDICES: return "blend_indices";
+        case D3DDECLUSAGE_NORMAL:       return "normal";
+        case D3DDECLUSAGE_PSIZE:        return "psize";
+        case D3DDECLUSAGE_TEXCOORD:     return "texcoord";
+        case D3DDECLUSAGE_TANGENT:      return "tangent";
+        case D3DDECLUSAGE_BINORMAL:     return "binormal";
+        case D3DDECLUSAGE_TESSFACTOR:   return "tess_factor";
+        case D3DDECLUSAGE_POSITIONT:    return "positiont";
+        case D3DDECLUSAGE_COLOR:        return "color";
+        case D3DDECLUSAGE_FOG:          return "fog";
+        case D3DDECLUSAGE_DEPTH:        return "depth";
+        case D3DDECLUSAGE_SAMPLE:       return "sample";
+        default:                        return std::format("unknown_{}", usage);
+      }
+    };
+    devkit_draw_summary::D3D9StateSummary state_summary = {
+        .fvf_hex = (state.fvf == 0u ? std::nullopt : std::optional(std::format("0x{:X}", static_cast<uint32_t>(state.fvf)))),
+    };
+    for (const auto& element : state.vertex_elements) {
+      state_summary.vertex_elements.push_back(devkit_draw_summary::D3D9VertexElementSummary{
+          .stream = element.Stream,
+          .offset = element.Offset,
+          .type = type_name(element.Type),
+          .method = element.Method,
+          .usage = usage_name(element.Usage),
+          .usage_index = element.UsageIndex,
+      });
+    }
+    for (const auto& transform : state.texture_transforms) {
+      // D3DTTFF_COUNT1..4 in the low byte; D3DTTFF_PROJECTED divides by the last coordinate.
+      state_summary.texture_transforms.push_back(devkit_draw_summary::D3D9TextureTransformSummary{
+          .stage = transform.stage,
+          .flags_hex = std::format("0x{:X}", static_cast<uint32_t>(transform.flags)),
+          .count = static_cast<uint32_t>(transform.flags & 0xFFu),
+          .projected = (transform.flags & D3DTTFF_PROJECTED) != 0u,
+      });
+    }
+    for (const auto& bump_environment : state.bump_environments) {
+      state_summary.bump_environments.push_back(devkit_draw_summary::D3D9BumpEnvironmentSummary{
+          .stage = bump_environment.stage,
+          .matrix = bump_environment.matrix,
+          .address_u = address_name(bump_environment.address_u),
+      });
+    }
+    for (const auto& filter : state.sampler_filters) {
+      state_summary.sampler_filters.push_back(devkit_draw_summary::D3D9SamplerFilterSummary{
+          .sampler = filter.sampler,
+          .mag_filter = filter_name(filter.mag_filter),
+          .min_filter = filter_name(filter.min_filter),
+      });
+    }
+    draw_summary.d3d9_state = std::move(state_summary);
   }
 
   return draw_summary;
@@ -7044,6 +7174,55 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         fixed_function.device_pixel_shader_bound =
             SUCCEEDED(native_device->GetPixelShader(&device_pixel_shader)) && device_pixel_shader != nullptr;
         draw_details.d3d9_fixed_function = std::move(fixed_function);
+      }
+
+      // What a port of the draw has to reproduce beyond its shaders. The runtime can report an FVF derived from a
+      // declaration and a declaration generated from an FVF, so both are kept as the device reports them.
+      if (!device_data->is_d3d9_pure_device) {
+        D3D9DrawState state = {};
+        native_device->GetFVF(&state.fvf);
+        Microsoft::WRL::ComPtr<IDirect3DVertexDeclaration9> vertex_declaration;
+        if (SUCCEEDED(native_device->GetVertexDeclaration(&vertex_declaration)) && vertex_declaration != nullptr) {
+          std::array<D3DVERTEXELEMENT9, MAXD3DDECLLENGTH + 1> elements = {};
+          UINT element_count = static_cast<UINT>(elements.size());
+          if (SUCCEEDED(vertex_declaration->GetDeclaration(elements.data(), &element_count))) {
+            for (UINT index = 0u; index < element_count && elements[index].Stream != 0xFFu; ++index) {
+              state.vertex_elements.push_back(elements[index]);
+            }
+          }
+        }
+        constexpr std::array<D3DTEXTURESTAGESTATETYPE, 4> BUMP_MATRIX_STATES = {
+            D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11};
+        for (DWORD stage = 0u; stage < 8u; ++stage) {
+          DWORD transform_flags = D3DTTFF_DISABLE;
+          native_device->GetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, &transform_flags);
+          if (transform_flags != D3DTTFF_DISABLE) {
+            state.texture_transforms.push_back({.stage = stage, .flags = transform_flags});
+          }
+          std::array<DWORD, BUMP_MATRIX_STATES.size()> bump_matrix = {};
+          for (std::size_t index = 0u; index < BUMP_MATRIX_STATES.size(); ++index) {
+            native_device->GetTextureStageState(stage, BUMP_MATRIX_STATES[index], &bump_matrix[index]);
+          }
+          if (std::ranges::any_of(bump_matrix, [](DWORD entry) { return entry != 0u; })) {
+            D3D9DrawState::BumpEnvironment bump_environment = {.stage = stage};
+            std::ranges::transform(bump_matrix, bump_environment.matrix.begin(), [](DWORD entry) {
+              return std::bit_cast<float>(entry);
+            });
+            native_device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &bump_environment.address_u);
+            state.bump_environments.push_back(bump_environment);
+          }
+        }
+        // Filters of the pixel shader samplers that have a texture bound, unless both are D3DTEXF_POINT (the default).
+        for (DWORD sampler = 0u; sampler < 16u; ++sampler) {
+          Microsoft::WRL::ComPtr<IDirect3DBaseTexture9> texture;
+          if (FAILED(native_device->GetTexture(sampler, &texture)) || texture == nullptr) continue;
+          D3D9DrawState::SamplerFilter filter = {.sampler = sampler, .mag_filter = D3DTEXF_POINT, .min_filter = D3DTEXF_POINT};
+          native_device->GetSamplerState(sampler, D3DSAMP_MAGFILTER, &filter.mag_filter);
+          native_device->GetSamplerState(sampler, D3DSAMP_MINFILTER, &filter.min_filter);
+          if (filter.mag_filter == D3DTEXF_POINT && filter.min_filter == D3DTEXF_POINT) continue;
+          state.sampler_filters.push_back(filter);
+        }
+        draw_details.d3d9_state = std::move(state);
       }
     } else if (device->get_api() == reshade::api::device_api::opengl && draw_method != DrawDetails::DrawMethods::DISPATCH) {
       // OpenGL blending is context state, not part of a pipeline, so read it from the current context at each recorded

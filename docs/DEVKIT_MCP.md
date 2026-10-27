@@ -341,6 +341,26 @@ reproduces the stages in float has to clamp the same way where the game relies o
 The stages are read only on draws without a game pixel shader, only while a snapshot records, and not on a pure device
 (created with `D3DCREATE_PUREDEVICE`), whose `Get*` state calls are not reliable.
 
+### D3D9 porting state (`d3d9State` in `devkit_get_draw`)
+
+What a port of a D3D9 draw has to reproduce beyond its shaders, read from the device at every recorded D3D9 draw (not on
+a pure device). Default values are left out, so most draws carry only a few fields:
+
+- `fvfHex` (the FVF code, when not 0) and `vertexElements` (the vertex declaration: `stream`, `offset`, `type` as the
+  D3DDECLTYPE name such as `float3` or `d3dcolor`, `usage` as the D3DDECLUSAGE name such as `position`, `texcoord`,
+  `color` or `positiont`, `usageIndex`, and `method` when not default). A shader port must declare the same input. The
+  runtime can report an FVF derived from a declaration and a declaration generated from an FVF, so both are listed as
+  the device reports them.
+- `textureTransforms`: stages whose D3DTSS_TEXTURETRANSFORMFLAGS are not `D3DTTFF_DISABLE`, with `flagsHex`, `count`
+  (D3DTTFF_COUNT1..4) and `projected` (D3DTTFF_PROJECTED). ps_1_x and the fixed-function stages honour `projected`; a
+  ps_2_0+ port must reproduce it with `tex2Dproj`.
+- `bumpEnvironments`: stages with a non-zero bump-environment matrix (`matrix` = BUMPENVMAT00, 01, 10, 11), which `texbem`
+  and the `bump_env_map` ops read, and that stage's `addressU` (`wrap`, `mirror`, `clamp`, `border`, `mirror_once`). A
+  port passes the matrix as a constant.
+- `samplerFilters`: samplers 0-15 with a texture bound whose filters are not both `point` (the default): `magFilter` and
+  `minFilter` (`point`, `linear`, `anisotropic`, ...). A port that sets its own filters must restore the game's, or later
+  draws inherit them.
+
 ### Replacement status (`devkit_list_replacements`)
 
 Lists every shader hash a loaded add-on registered a replacement for on the device: `compileTime` (registered for

@@ -327,6 +327,106 @@ inline void to_json(json& j, const FixedFunctionSummary& value) {
   };
 }
 
+struct D3D9VertexElementSummary {
+  std::uint32_t stream = 0u;
+  std::uint32_t offset = 0u;
+  std::string type;
+  std::uint32_t method = 0u;
+  std::string usage;
+  std::uint32_t usage_index = 0u;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const D3D9VertexElementSummary& value) {
+  j = {
+      {"stream", value.stream},
+      {"offset", value.offset},
+      {"type", value.type},
+      {"usage", value.usage},
+      {"usageIndex", value.usage_index},
+  };
+  // D3DDECLMETHOD_DEFAULT (0) is left out.
+  if (value.method != 0u) {
+    j["method"] = value.method;
+  }
+}
+
+struct D3D9TextureTransformSummary {
+  std::uint32_t stage = 0u;
+  std::string flags_hex;
+  std::uint32_t count = 0u;
+  bool projected = false;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const D3D9TextureTransformSummary& value) {
+  j = {
+      {"stage", value.stage},
+      {"flagsHex", value.flags_hex},
+      {"count", value.count},
+      {"projected", value.projected},
+  };
+}
+
+struct D3D9BumpEnvironmentSummary {
+  std::uint32_t stage = 0u;
+  std::array<float, 4> matrix = {};
+  std::string address_u;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const D3D9BumpEnvironmentSummary& value) {
+  j = {
+      {"stage", value.stage},
+      {"matrix", value.matrix},
+      {"addressU", value.address_u},
+  };
+}
+
+struct D3D9SamplerFilterSummary {
+  std::uint32_t sampler = 0u;
+  std::string mag_filter;
+  std::string min_filter;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const D3D9SamplerFilterSummary& value) {
+  j = {
+      {"sampler", value.sampler},
+      {"magFilter", value.mag_filter},
+      {"minFilter", value.min_filter},
+  };
+}
+
+// D3D9 state a port of the draw has to reproduce; empty lists and a zero FVF are left out.
+struct D3D9StateSummary {
+  std::optional<std::string> fvf_hex = std::nullopt;
+  std::vector<D3D9VertexElementSummary> vertex_elements;
+  std::vector<D3D9TextureTransformSummary> texture_transforms;
+  std::vector<D3D9BumpEnvironmentSummary> bump_environments;
+  std::vector<D3D9SamplerFilterSummary> sampler_filters;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const D3D9StateSummary& value) {
+  j = json::object();
+  if (value.fvf_hex.has_value()) {
+    j["fvfHex"] = value.fvf_hex.value();
+  }
+  if (!value.vertex_elements.empty()) {
+    j["vertexElements"] = value.vertex_elements;
+  }
+  if (!value.texture_transforms.empty()) {
+    j["textureTransforms"] = value.texture_transforms;
+  }
+  if (!value.bump_environments.empty()) {
+    j["bumpEnvironments"] = value.bump_environments;
+  }
+  if (!value.sampler_filters.empty()) {
+    j["samplerFilters"] = value.sampler_filters;
+  }
+}
+
 struct RenderTargetSummary {
   std::uint32_t rtv_index = 0u;
   resource_view_summary::ResourceViewSummary resource_view;
@@ -364,6 +464,7 @@ struct DrawSummary {
   std::optional<std::vector<ResourceBindSummary>> shader_resource_binds = std::nullopt;
   std::optional<BlendStateSummary> blend_state = std::nullopt;
   std::optional<FixedFunctionSummary> fixed_function = std::nullopt;
+  std::optional<D3D9StateSummary> d3d9_state = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -414,6 +515,9 @@ inline void to_json(json& j, const DrawSummary& value) {
   }
   if (value.fixed_function.has_value()) {
     j["fixedFunction"] = value.fixed_function.value();
+  }
+  if (value.d3d9_state.has_value()) {
+    j["d3d9State"] = value.d3d9_state.value();
   }
 }
 
