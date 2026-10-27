@@ -126,7 +126,7 @@ $toolDefinitions = @{
     ProductName    = '3Dmigoto cmd_Decompiler'
     DesiredVersion = $script:THREEDMIGOTO_VERSION
     Url            = "https://github.com/bo3b/3Dmigoto/releases/download/$($script:THREEDMIGOTO_VERSION)/cmd_Decompiler-$($script:THREEDMIGOTO_VERSION).zip"
-    ExpectedFiles  = @('cmd_Decompiler.exe')
+    ExpectedFiles  = @('cmd_Decompiler.exe', 'd3dcompiler_46.dll')
     PrimaryFile    = 'cmd_Decompiler.exe'
     VersionCommand = @('--version')
     VersionPattern = '([0-9]+(?:\.[0-9]+){2,3})'
@@ -479,19 +479,22 @@ function Install-ToolFromArchive {
       }
     }
 
-    # Special-case 3Dmigoto decompiler: copy only cmd_Decompiler.exe
+    # Special-case 3Dmigoto decompiler: copy cmd_Decompiler.exe and the d3dcompiler_46.dll it imports (Windows does
+    # not ship that version, so without it the decompiler exits with STATUS_DLL_NOT_FOUND).
     if ($Name -eq '3dmigoto') {
-      try {
-        $exeSrc = Get-ChildItem -Path $temp -Recurse -Filter 'cmd_Decompiler.exe' -ErrorAction Stop | Select-Object -First 1
-        if ($null -ne $exeSrc) {
-          Copy-Item -Path $exeSrc.FullName -Destination (Join-Path $binDir 'cmd_Decompiler.exe') -Force -ErrorAction Stop
-        } else {
-          Write-Warn "cmd_Decompiler.exe not found in archive for 3dmigoto"
+      foreach ($fileName in @('cmd_Decompiler.exe', 'd3dcompiler_46.dll')) {
+        try {
+          $fileSrc = Get-ChildItem -Path $temp -Recurse -Filter $fileName -ErrorAction Stop | Select-Object -First 1
+          if ($null -ne $fileSrc) {
+            Copy-Item -Path $fileSrc.FullName -Destination (Join-Path $binDir $fileName) -Force -ErrorAction Stop
+          } else {
+            Write-Warn "$fileName not found in archive for 3dmigoto"
+            return $false
+          }
+        } catch {
+          Write-Warn "Failed to copy ${fileName}: $($_.Exception.Message)"
           return $false
         }
-      } catch {
-        Write-Warn "Failed to copy cmd_Decompiler.exe: $($_.Exception.Message)"
-        return $false
       }
     }
 

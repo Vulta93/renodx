@@ -47,7 +47,7 @@ Managed tool minimum versions have a single source in `cmake/tool-versions.cmake
 cmake -P .\cmake\tool-versions.cmake
 ```
 
-Manual tool setup is still supported if you prefer to manage `.\bin` yourself. Download the corresponding Windows x64 archives from the release pages linked above, then copy `dxc.exe` with `dxcompiler.dll`, `slangc.exe`, `glslang.exe`, and `cmd_Decompiler.exe` into `.\bin`. CMake checks the reported DXC, Slang, and glslang semantic versions during configuration and warns about versions older than the configured minimums; newer compatible versions are accepted. Run `scripts/setup-dev-env.ps1 -Update` to update managed tools to those configured versions.
+Manual tool setup is still supported if you prefer to manage `.\bin` yourself. Download the corresponding Windows x64 archives from the release pages linked above, then copy `dxc.exe` with `dxcompiler.dll`, `slangc.exe`, `glslang.exe`, and `cmd_Decompiler.exe` with the `d3dcompiler_46.dll` from the same archive (the decompiler cannot start without it) into `.\bin`. CMake checks the reported DXC, Slang, and glslang semantic versions during configuration and warns about versions older than the configured minimums; newer compatible versions are accepted. Run `scripts/setup-dev-env.ps1 -Update` to update managed tools to those configured versions.
 
 Install the Windows SDK if it is not already present. The setup script will attempt this automatically when run with `-Install`, or you can do it manually:
 
