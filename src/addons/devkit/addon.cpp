@@ -531,6 +531,7 @@ struct ShaderCoverage {
   std::shared_mutex mutex;
   uint64_t frame = 0u;
   std::chrono::steady_clock::time_point started;
+  std::chrono::steady_clock::time_point stopped;
   // Replaced hashes at start, with where the replacement comes from ("addon", "file" or both).
   std::unordered_map<uint32_t, std::string> watched;
   std::unordered_map<uint32_t, ShaderCoverageEntry> entries;
@@ -566,9 +567,6 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::vector<SnapshotRow> snapshot_rows;
   uint32_t snapshot_row_layout_key = 0u;
   uint32_t snapshot_rows_generation = 0u;
-  // Read on every draw; the recording itself is guarded by shader_coverage.mutex.
-  std::atomic_bool shader_coverage_active = false;
-  ShaderCoverage shader_coverage;
   bool snapshot_rows_valid = false;
   std::unordered_map<reshade::api::swapchain*, reshade::api::swapchain_desc> swapchain_descs;
   std::unordered_map<reshade::api::swapchain*, HWND> swapchain_windows;
@@ -603,6 +601,10 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
     auto [iterator, is_new] = shader_details.emplace(shader_hash, shader_hash);
     return &iterator->second;
   }
+
+  // Read on every draw; the recording itself is guarded by shader_coverage.mutex. watched only changes while this is false.
+  std::atomic_bool shader_coverage_active = false;
+  ShaderCoverage shader_coverage;
 };
 
 [[nodiscard]] std::vector<uint8_t> LoadShaderDataForShaderHash(reshade::api::device* device, uint32_t shader_hash) {
@@ -4029,6 +4031,9 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   auto& coverage = device_data->shader_coverage;
 
   if (action == "start") {
+    if (device_data->shader_coverage_active.load(std::memory_order_relaxed)) {
+      return make_error("A coverage recording is already running on this device: call with action 'stop' first.");
+    }
     std::unordered_map<uint32_t, std::string> watched;
     {
       std::shared_lock device_lock(device_data->mutex);
@@ -4061,8 +4066,9 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
     };
   }
 
-  if (action == "stop") {
-    device_data->shader_coverage_active.store(false, std::memory_order_relaxed);
+  if (action == "stop" && device_data->shader_coverage_active.exchange(false, std::memory_order_relaxed)) {
+    std::unique_lock coverage_lock(coverage.mutex);
+    coverage.stopped = std::chrono::steady_clock::now();
   }
   // At most this many shaders are listed per group; the counts are complete.
   constexpr std::size_t MAX_LISTED = 64u;
@@ -4070,7 +4076,9 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   if (coverage.watched.empty()) {
     return make_error("No coverage recording was started on this device.");
   }
-  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - coverage.started).count();
+  const bool recording = device_data->shader_coverage_active.load(std::memory_order_relaxed);
+  const auto seconds =
+      std::chrono::duration<double>((recording ? std::chrono::steady_clock::now() : coverage.stopped) - coverage.started).count();
   std::vector<uint32_t> hashes;
   hashes.reserve(coverage.watched.size());
   for (const auto& [shader_hash, source] : coverage.watched) {
@@ -4101,7 +4109,6 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
       });
     }
   }
-  const bool recording = device_data->shader_coverage_active.load(std::memory_order_relaxed);
   return ToolResult{
       .text = std::format(
           "{} {} replaced shaders over {} frames ({:.0f} s): {} drew, {} never drew{}.",
@@ -6694,9 +6701,19 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
   if (device_data->shader_coverage_active.load(std::memory_order_relaxed)) {
     const auto& coverage_shaders = get_bound_shaders();
     auto& coverage = device_data->shader_coverage;
-    std::unique_lock coverage_lock(coverage.mutex);
+    // Most draws use no replaced shader: find that under the shared lock so recording threads do not serialize.
+    const bool watched_shader_bound = [&] {
+      std::shared_lock watched_lock(coverage.mutex);
+      return std::ranges::any_of(coverage_shaders.shaders, [&](const auto& bound) {
+        return coverage.watched.contains(bound.shader_hash);
+      });
+    }();
+    std::unique_lock coverage_lock(coverage.mutex, std::defer_lock);
+    if (watched_shader_bound) {
+      coverage_lock.lock();
+    }
     for (const auto& [stage, shader_hash] : coverage_shaders.shaders) {
-      if (!coverage.watched.contains(shader_hash)) continue;
+      if (!watched_shader_bound || !coverage.watched.contains(shader_hash)) continue;
       auto& entry = coverage.entries[shader_hash];
       if (entry.draws == 0u) {
         entry.first_frame = coverage.frame;

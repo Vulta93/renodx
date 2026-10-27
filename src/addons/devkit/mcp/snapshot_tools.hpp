@@ -845,7 +845,8 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
 
     // Decoded video is usually sampled as YUV 4:2:0 planes: a full-size Y plane and half-size U and V (or UV) planes in
     // one- or two-channel 8-bit textures (Bink and similar decoders). ReShade reports no YUV formats, so only the plane
-    // sizes are checked; noise or mask textures of that shape also match.
+    // sizes are checked; noise or mask textures of that shape also match. Views of one NV12 texture share its size and
+    // are not found.
     std::vector<const TextureInfo*> planes;
     for (const auto& texture : pass.inputs) {
       const auto format = rendered_format(texture);
@@ -866,8 +867,8 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
       pass.hints.push_back({
           {"type", "video"},
           {"rule", std::format(
-                       "reads {} one- or two-channel 8-bit textures, one of them {}x{} at half the size of another (YUV 4:2:0 "
-                       "planes of decoded video)",
+                       "reads one- or two-channel 8-bit textures ({} in all), one of them {}x{} at half the size of "
+                       "another (YUV 4:2:0 planes of decoded video)",
                        planes.size(),
                        (*chroma_plane)->width,
                        (*chroma_plane)->height)},

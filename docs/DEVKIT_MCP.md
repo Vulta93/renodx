@@ -335,9 +335,11 @@ and stop. The report lists `neverDrawn` first, then `drawn` with `draws`, `frame
 replacement is either a scene not visited yet or a hash the game no longer uses.
 
 Counts cover draws, indexed draws, dispatches and indirect calls with the shader bound in any stage. On D3D12/Vulkan a
-command list recorded once and executed again is counted when it is recorded. While recording, every draw costs one lookup
-of the bound shaders; nothing is counted otherwise. Replacements added after start (a live file loaded later) are not
-watched until the next start. Not on a Display Proxy device.
+command list recorded once and executed again is counted when it is recorded. While recording, every draw looks up its
+bound shaders under a shared lock and takes the exclusive lock only when a watched shader draws; nothing is counted
+otherwise. `start` is refused while a recording runs; `stop` first. Replacements added after start (a live file loaded
+later) are not watched until the next start. The recording lives with the device: a game that recreates its device (a
+D3D9 reset path, a mode change) loses it, and the new device needs a new start. Not on a Display Proxy device.
 
 ### Frame overview (`devkit_frame_overview`)
 
@@ -389,8 +391,10 @@ thousands of draws:
     source-alpha blending) was found next to two bloom/glow composites that got this note.
   - `videoPasses`: passes that read two or more one- or two-channel 8-bit 2D textures (R8/R8G8), one of them half the
     width and height of another: the YUV 4:2:0 planes of decoded video (Bink and similar decoders). ReShade reports no YUV
-    formats, so only the plane sizes are checked, and noise or mask textures of that shape match too. Check video
-    brightness and the video's path to the swap chain from there. Take the snapshot while a video plays.
+    formats, so only the plane sizes are checked, and noise or mask textures of that shape match too. Video decoded into
+    one NV12 texture (hardware or Media Foundation decoding, read through R8 and R8G8 views of the same resource) is not
+    found, since both views have the resource's size. Check video brightness and the video's path to the swap chain from
+    there. Take the snapshot while a video plays.
   - `outputPass`: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.
   - `sharedShaders`: shaders (the pixel or compute stage hash each command records) of a tonemap, UI or output candidate
     that also draw in a pass of another role (`ui`, `tonemap`, `output`, `other`; a pass that is both tonemap and output
@@ -697,10 +701,14 @@ conversation turn:
   `.addon64`/`.addon32` so ReShade does not load it (the Devkit alone still loads), launch to the same spot, measure
   again, close the game and rename it back. Unlike an A/B (`original` keeps the mod's upgrades and swap-chain proxy),
   this compares against the game as shipped. Add `devkit_frame_overview` `saveBaseline`/`compareWith` across the two
-  launches to see which passes the mod changed.
+  launches to see which passes the mod changed. Resource handles change with every launch: take a new snapshot and look
+  the target up again. Measure a target that has the same format in both runs, with the same signal. The swap chain does
+  not qualify: with an HDR mod it is HDR10 (or scRGB), without it usually 8-bit sRGB, and `signal` has no SDR decode, so
+  `pq` on the vanilla back buffer gives wrong nits and `raw` values of the two encodings do not compare.
 
-Compare the two files metric by metric: a difference whose min-max ranges overlap is within frame-to-frame noise; a
-single-frame result has no noise floor, so its differences cannot be judged.
+Compare the two files metric by metric, after checking that format, region and signal match: a difference whose min-max
+ranges overlap is within frame-to-frame noise; a single-frame result has no noise floor, so its differences cannot be
+judged.
 
 ### LUTs (`devkit_analyze_lut`)
 

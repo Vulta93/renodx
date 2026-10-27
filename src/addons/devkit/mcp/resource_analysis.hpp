@@ -2487,7 +2487,8 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   std::optional<std::filesystem::path> json_output_path;
   std::optional<std::filesystem::path> output_path = std::nullopt;
   if (json_output) {
-    const auto requested_path = std::filesystem::path(output_path_value);
+    // The argument is UTF-8; a narrow std::filesystem::path would decode it with the ANSI code page.
+    const auto requested_path = std::filesystem::path(std::u8string(output_path_value.begin(), output_path_value.end()));
     if (!requested_path.is_absolute()) {
       throw std::runtime_error("outputPath must be an absolute path.");
     }
@@ -2575,17 +2576,17 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
     };
   }
 
-  const auto finish = [&json_output_path](ToolResult finished) {
+  const auto finish = [&json_output_path, &output_path_value](ToolResult finished) {
     if (!json_output_path.has_value() || finished.is_error) return finished;
     std::ofstream json_file(json_output_path.value(), std::ios::trunc);
     json_file << finished.structured_content.dump(2);
     json_file.close();
     if (json_file) {
-      finished.structured_content["jsonPath"] = json_output_path->string();
-      finished.text += std::format(" Wrote the result to '{}'.", json_output_path->string());
+      finished.structured_content["jsonPath"] = output_path_value;
+      finished.text += std::format(" Wrote the result to '{}'.", output_path_value);
     } else {
-      finished.structured_content["jsonError"] = std::format("Failed to write '{}'.", json_output_path->string());
-      finished.text += std::format(" Failed to write '{}'.", json_output_path->string());
+      finished.structured_content["jsonError"] = std::format("Failed to write '{}'.", output_path_value);
+      finished.text += std::format(" Failed to write '{}'.", output_path_value);
     }
     return finished;
   };
