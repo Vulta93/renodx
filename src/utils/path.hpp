@@ -22,6 +22,17 @@
 namespace renodx::utils::path {
 
 static std::string default_output_folder = "renodx-dev";
+
+// Paths that come from or go into UTF-8 text (JSON, MCP arguments). A narrow std::filesystem::path and path::string()
+// use the ANSI code page instead, which garbles non-ASCII paths and throws for characters it cannot represent.
+inline std::filesystem::path FromUtf8(std::string_view value) {
+  return std::filesystem::path(std::u8string(value.begin(), value.end()));
+}
+
+inline std::string ToUtf8(const std::filesystem::path& path) {
+  const auto value = path.u8string();
+  return std::string(value.begin(), value.end());
+}
 static constexpr std::string_view default_live_subdirectory = "live";
 static constexpr std::string_view default_dump_subdirectory = "dump";
 
