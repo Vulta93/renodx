@@ -163,6 +163,10 @@ Check `devkit_status` and `devkit_select_device` before analyzing anything:
 
 If one device shows `0` draws or `0` tracked shaders, it is usually not the one you want.
 
+`serverInfo.modulePath` and `serverInfo.moduleLastWriteUtc` name the Devkit file the game loaded and its last write time
+(copying keeps the build's time), so they tell which build is installed. With the repository's CMake presets `version`
+stays `unknown` and `buildTimestampUtc` is absent, because they do not inject the `build_info` values.
+
 ## 6. Reading frame structure
 
 Use `devkit_list_draws` to find likely late-frame candidates, then `devkit_get_draw` for the exact pass.

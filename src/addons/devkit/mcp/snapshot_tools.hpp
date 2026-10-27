@@ -28,6 +28,8 @@
 #include <utility>
 #include <vector>
 
+#include <windows.h>
+
 #include "../formatting.hpp"
 #include "../../../utils/mcp/types.hpp"
 #include "../../../utils/mcp/arguments.hpp"
@@ -228,6 +230,29 @@ inline ToolResult HandleStatusTool([[maybe_unused]] const json& arguments, const
   }
   if (renodx::build_info::HasKnownSourceDateEpoch()) {
     result["serverInfo"]["sourceDateEpoch"] = renodx::build_info::kSourceDateEpoch;
+  }
+
+  // The CMake presets do not inject the build_info values, so the loaded Devkit file and its write time tell builds apart.
+  HMODULE devkit_module = nullptr;
+  if (GetModuleHandleExW(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCWSTR>(&HandleStatusTool),
+          &devkit_module)
+      != FALSE) {
+    auto module_path = std::wstring(32768, L'\0');
+    const auto module_path_size = GetModuleFileNameW(devkit_module, module_path.data(), static_cast<DWORD>(module_path.size()));
+    if (module_path_size > 0u && module_path_size < module_path.size()) {
+      module_path.resize(module_path_size);
+      const auto module_path_utf8 = std::filesystem::path(module_path).u8string();
+      result["serverInfo"]["modulePath"] = std::string(module_path_utf8.begin(), module_path_utf8.end());
+      std::error_code last_write_error;
+      const auto last_write = std::filesystem::last_write_time(module_path, last_write_error);
+      if (!last_write_error) {
+        result["serverInfo"]["moduleLastWriteUtc"] = std::format(
+            "{:%Y-%m-%dT%H:%M:%SZ}",
+            std::chrono::floor<std::chrono::seconds>(std::chrono::clock_cast<std::chrono::system_clock>(last_write)));
+      }
+    }
   }
 
   if (device_count == 0u) {
