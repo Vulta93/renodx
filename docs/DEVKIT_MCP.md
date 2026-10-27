@@ -632,25 +632,29 @@ More A/B rules and caveats:
 
 ### LUTs (`devkit_analyze_lut`)
 
-`devkit_analyze_lut {resourceViewHandle, layout?, flipY?, outputPath?}` reads a texture as a colour lookup table at the
+`devkit_analyze_lut {resourceViewHandle, layout?, flipY?, outputPath?, preferClone?}` reads a texture as a colour lookup table at the
 Devkit's next present and summarizes it, so a LUT audit needs no dump script. Layouts: `3d` (an N x N x N 3D texture),
 `strip_x` (N*N x N: N slices side by side, as Unreal's 256x16 and Unity's 1024x32) and `strip_y` (N x N*N); `auto`
-picks one from the shape, the same shapes `devkit_frame_overview` lists as LUT textures. Input point (r, g, b) / (N - 1)
+picks one from the shape (any N from 2 to 256; `devkit_frame_overview` lists the usual sizes as LUT textures). Input point (r, g, b) / (N - 1)
 is in the LUT's own coordinates: many games address their LUT with log, PQ or gamma-encoded colour, so the numbers
 describe the table, not display light.
 
 - `corners`: the outputs at black, red, green, blue, yellow, magenta, cyan and white. Check them first: a primary at the
-  wrong corner means the layout or `flipY` is wrong (some games store green bottom-up).
+  wrong corner means the layout or `flipY` is wrong. `flipY` reads the image bottom-up (green increases upward; for
+  `strip_y` the slice order reverses too).
 - `neutralAxis` and `neutralAxisMonotonic`: the output along (i, i, i), the LUT's tone curve in its own coordinates.
 - `identityDeviation` (mean and max per channel, p99 of each point's largest channel deviation, the worst point) and
-  `isIdentity` (every channel within 1.5/255). For an sRGB format the comparison uses the stored, encoded values.
-- `outputRange`, `valuesAboveOne`, `nonFiniteValues`, `allZero`. All zero usually means the read came before the LUT is
+  `isIdentity` (every channel within 1.5/255, and no NaN or infinite value). For an sRGB format the comparison uses the
+  stored, encoded values.
+- `outputRange`, `valuesAboveOne` and `nonFiniteValues` (both count channel values), `allZero`. All zero usually means the read came before the LUT is
   built in the frame or after its texture was reused; read it again from a pass that samples it.
 - `outputPath` (absolute `.csv`) writes every lattice point with its indices, input and output, for plots
-  (`analysis-graphing` skill).
+  (`analysis-graphing` skill), for N up to 65; it is written on the game's thread, so larger LUTs get `csvError` instead.
 
-3D LUTs are read on D3D10/11/12, Vulkan and OpenGL (refused on D3D9, whose volume readback path is untested); strips on
-every API.
+The view must select the top level of a single texture. 3D LUTs are read on D3D10/11/12 and OpenGL; they are refused on
+D3D9 (ReShade does not copy volume textures there) and on Vulkan (ReShade reads back through LINEAR-tiled images, which
+Vulkan guarantees only for 2D). Strips are read on every API. As in `devkit_analyze_resource`, the copy issues no state
+transition on D3D12/Vulkan, so a LUT in a shader-read state is copied as it is (the validation layers would flag it).
 
 ### Tone curve of a pass (`devkit_measure_tone_curve`)
 
