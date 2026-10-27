@@ -217,6 +217,20 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_shader_coverage",
+        {
+            .title = "Shader Coverage",
+            .description = "Record which replaced shaders (a game mod's replacements and live shader files the Devkit knows on this device) actually draw while the person plays. action 'start' takes the current set of replaced shaders and starts counting; play through what the mod must cover (menus, loading screens, videos, fades, gameplay); 'status' reports without stopping; 'stop' ends the recording and reports. The report lists neverDrawn first (replacements this session did not exercise: test those scenes), then drawn with draws, framesSeen and first/lastFrame (presents since start); at most 64 per group, the counts are complete. Counts cover draws, indexed draws, dispatches and indirect calls with the shader bound in any stage; on D3D12/Vulkan a command list recorded once and executed again is counted when recorded. Costs a shader lookup per draw only while recording. Not on a Display Proxy device.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"action", {.types = {"string"}, .enum_values = {"start", "status", "stop"}}},
+                },
+                .required = {"action"},
+            },
+        },
+    },
+    {
         "devkit_write_shader_stub",
         {
             .title = "Write Shader Stub",

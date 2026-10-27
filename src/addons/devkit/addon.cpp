@@ -519,6 +519,23 @@ ResourceViewDetails GetResourceViewDetails(reshade::api::resource_view resource_
   return details;
 }
 
+// devkit_shader_coverage: which replaced shaders (a game mod's or a live file) drew while a recording ran.
+struct ShaderCoverageEntry {
+  uint64_t draws = 0u;
+  uint64_t frames_seen = 0u;
+  uint64_t first_frame = 0u;
+  uint64_t last_frame = 0u;
+};
+
+struct ShaderCoverage {
+  std::shared_mutex mutex;
+  uint64_t frame = 0u;
+  std::chrono::steady_clock::time_point started;
+  // Replaced hashes at start, with where the replacement comes from ("addon", "file" or both).
+  std::unordered_map<uint32_t, std::string> watched;
+  std::unordered_map<uint32_t, ShaderCoverageEntry> entries;
+};
+
 struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   reshade::api::device* device;
   // The latest snapshot started on this device (see snapshots_started).
@@ -549,6 +566,9 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::vector<SnapshotRow> snapshot_rows;
   uint32_t snapshot_row_layout_key = 0u;
   uint32_t snapshot_rows_generation = 0u;
+  // Read on every draw; the recording itself is guarded by shader_coverage.mutex.
+  std::atomic_bool shader_coverage_active = false;
+  ShaderCoverage shader_coverage;
   bool snapshot_rows_valid = false;
   std::unordered_map<reshade::api::swapchain*, reshade::api::swapchain_desc> swapchain_descs;
   std::unordered_map<reshade::api::swapchain*, HWND> swapchain_windows;
@@ -3987,6 +4007,124 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   return RunLiveShaderRequestForMcp(device_index, request, "draw bypass");
 }
 
+[[nodiscard]] ToolResult ShaderCoverageForMcp(uint32_t device_index, std::string_view action) {
+  const auto make_error = [](const std::string& error) {
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  };
+  if (action != "start" && action != "status" && action != "stop") {
+    return make_error("action must be 'start', 'status' or 'stop'.");
+  }
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (device_index >= device_data_list.size()) {
+    return make_error(std::format("Device #{} is not available.", device_index));
+  }
+  auto* device_data = device_data_list[device_index];
+  if (device_data->is_display_proxy) {
+    return make_error("Coverage needs the game's device, not the Display Proxy's.");
+  }
+  auto& coverage = device_data->shader_coverage;
+
+  if (action == "start") {
+    std::unordered_map<uint32_t, std::string> watched;
+    {
+      std::shared_lock device_lock(device_data->mutex);
+      for (const auto& [shader_hash, details] : device_data->shader_details) {
+        const bool addon = !details.addon_shader.empty();
+        const bool file = details.HasCompiledDiskShader();
+        if (!addon && !file) continue;
+        watched.emplace(shader_hash, (addon && file ? "addon+file" : (addon ? "addon" : "file")));
+      }
+    }
+    if (watched.empty()) {
+      return make_error(std::format("No replaced shader is known on device #{} (no game mod replacement and no live file).", device_index));
+    }
+    const auto watched_count = watched.size();
+    {
+      std::unique_lock coverage_lock(coverage.mutex);
+      coverage.frame = 0u;
+      coverage.started = std::chrono::steady_clock::now();
+      coverage.watched = std::move(watched);
+      coverage.entries.clear();
+    }
+    device_data->shader_coverage_active.store(true, std::memory_order_relaxed);
+    return ToolResult{
+        .text = std::format(
+            "Recording which of the {} replaced shaders on device #{} draw. Play through what should be covered (menus, "
+            "videos, fades, gameplay), then call with action 'stop'.",
+            watched_count,
+            device_index),
+        .structured_content = json{{"deviceIndex", device_index}, {"recording", true}, {"watchedShaders", watched_count}},
+    };
+  }
+
+  if (action == "stop") {
+    device_data->shader_coverage_active.store(false, std::memory_order_relaxed);
+  }
+  // At most this many shaders are listed per group; the counts are complete.
+  constexpr std::size_t MAX_LISTED = 64u;
+  std::shared_lock coverage_lock(coverage.mutex);
+  if (coverage.watched.empty()) {
+    return make_error("No coverage recording was started on this device.");
+  }
+  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - coverage.started).count();
+  std::vector<uint32_t> hashes;
+  hashes.reserve(coverage.watched.size());
+  for (const auto& [shader_hash, source] : coverage.watched) {
+    hashes.push_back(shader_hash);
+  }
+  std::ranges::sort(hashes);
+  json never_drawn = json::array();
+  json drawn = json::array();
+  std::size_t never_drawn_count = 0u;
+  for (const auto shader_hash : hashes) {
+    const auto entry = coverage.entries.find(shader_hash);
+    const auto& source = coverage.watched.at(shader_hash);
+    if (entry == coverage.entries.end()) {
+      ++never_drawn_count;
+      if (never_drawn.size() < MAX_LISTED) {
+        never_drawn.push_back(json{{"shaderHash", FormatShaderHash(shader_hash)}, {"source", source}});
+      }
+      continue;
+    }
+    if (drawn.size() < MAX_LISTED) {
+      drawn.push_back(json{
+          {"shaderHash", FormatShaderHash(shader_hash)},
+          {"source", source},
+          {"draws", entry->second.draws},
+          {"framesSeen", entry->second.frames_seen},
+          {"firstFrame", entry->second.first_frame},
+          {"lastFrame", entry->second.last_frame},
+      });
+    }
+  }
+  const bool recording = device_data->shader_coverage_active.load(std::memory_order_relaxed);
+  return ToolResult{
+      .text = std::format(
+          "{} {} replaced shaders over {} frames ({:.0f} s): {} drew, {} never drew{}.",
+          (recording ? "Recording:" : "Recorded:"),
+          hashes.size(),
+          coverage.frame,
+          seconds,
+          hashes.size() - never_drawn_count,
+          never_drawn_count,
+          (never_drawn_count == 0u ? "" : " (listed first: these replacements were not exercised)")),
+      .structured_content = json{
+          {"deviceIndex", device_index},
+          {"recording", recording},
+          {"frames", coverage.frame},
+          {"seconds", seconds},
+          {"watchedShaders", hashes.size()},
+          {"neverDrawnCount", never_drawn_count},
+          {"neverDrawn", std::move(never_drawn)},
+          {"drawn", std::move(drawn)},
+      },
+  };
+}
+
 [[nodiscard]] ToolResult WriteShaderStubForMcp(
     uint32_t device_index,
     uint32_t shader_hash,
@@ -5379,6 +5517,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .set_shader_source = SetShaderSourceForMcp,
                                                     .set_draw_bypass = SetDrawBypassForMcp,
                                                     .write_shader_stub = WriteShaderStubForMcp,
+                                                    .shader_coverage = ShaderCoverageForMcp,
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(true),
@@ -6551,6 +6690,24 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     }
     return *bound_shaders;
   };
+
+  if (device_data->shader_coverage_active.load(std::memory_order_relaxed)) {
+    const auto& coverage_shaders = get_bound_shaders();
+    auto& coverage = device_data->shader_coverage;
+    std::unique_lock coverage_lock(coverage.mutex);
+    for (const auto& [stage, shader_hash] : coverage_shaders.shaders) {
+      if (!coverage.watched.contains(shader_hash)) continue;
+      auto& entry = coverage.entries[shader_hash];
+      if (entry.draws == 0u) {
+        entry.first_frame = coverage.frame;
+      }
+      if (entry.draws == 0u || entry.last_frame != coverage.frame) {
+        ++entry.frames_seen;
+      }
+      entry.last_frame = coverage.frame;
+      ++entry.draws;
+    }
+  }
 
   if (device == snapshot_device) {
 
@@ -11392,6 +11549,10 @@ void OnPresent(
   if (!data->is_display_proxy) {
     EnsureDevkitMcpServerStarted();
     PumpDeviceProxyOutputWindowMessages();
+  }
+  if (data->shader_coverage_active.load(std::memory_order_relaxed)) {
+    std::unique_lock coverage_lock(data->shader_coverage.mutex);
+    ++data->shader_coverage.frame;
   }
 
   if (auto* device_data = get_data(); device_data != nullptr) {
