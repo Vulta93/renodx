@@ -1582,7 +1582,8 @@ inline void EncodePreviewPixel(
     constexpr double BANDING_SMOOTH_RELATIVE = 0.02;
     constexpr std::size_t BANDING_LOG_BINS = 64u;
     constexpr double BANDING_RELATIVE_LOG_MIN = 1e-7;
-    constexpr double BANDING_RELATIVE_LOG_MAX = 1.0;
+    // |to - from| / max(|from|, |to|) is at most 2 (opposite signs).
+    constexpr double BANDING_RELATIVE_LOG_MAX = 2.0;
     // HDR and scRGB values reach thousands, so absolute steps get a wider range.
     constexpr double BANDING_ABSOLUTE_LOG_MIN = 1e-7;
     constexpr double BANDING_ABSOLUTE_LOG_MAX = 1e4;
@@ -2216,6 +2217,7 @@ inline void EncodePreviewPixel(
                   : std::string("float: step relative to the value, and absolute (log-binned)"))},
             {"smoothStepMaxCodes", BANDING_SMOOTH_CODES},
             {"smoothStepMaxRelative", BANDING_SMOOTH_RELATIVE},
+            {"smoothStepMaxAbsolute", (unorm_max_code > 0.0 ? json(nullptr) : json(BANDING_SMOOTH_CODES / 255.0))},
             {"channels", std::move(banding_channels_json)},
         };
         // Below this many smooth non-zero steps the region holds too little gradient to judge.

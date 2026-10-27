@@ -578,13 +578,14 @@ between neighbouring pixels in the values as stored (UNORM formats in codes, an 
 formats as the step relative to the value and as the absolute step, log-binned). A step is smooth when it is at most 4
 codes, or for a float at most 2% of the value or 4/255. `smoothShare` is the share of smooth or equal neighbour pairs,
 `equalShare` the share of equal pairs, `medianStepCodes` (UNORM) or `medianStepRelative`, `medianStepAbsolute` and
-`medianStepIn8BitCodes` (float, the absolute step x 255) the typical smooth non-zero step. A band is a horizontal run of
+`medianStepIn8BitCodes` (float, the absolute step x 255; log-binned, so within about 20%) the typical smooth non-zero
+step. A band is a horizontal run of
 at least two equal values bounded by smooth non-zero steps on both sides: `bands`, `meanBandLength`, `longestBand`,
 `bandsAtLeast8px`. Use a region on a smooth gradient (sky, fog); with too few smooth steps the block says so. Long bands
 bounded by 1-code steps are visible banding; dither reads as many short bands and is fine. To tell whether a mod's float
 clone still carries 8-bit steps from upstream, compare the clone (`preferClone: true`) with the RGBA8 original
-(`preferClone: false`) on the same region: `medianStepIn8BitCodes` of the clone matches `medianStepCodes` of the original
-only when both hold the same encoding (a linear float clone of an sRGB-encoded target does not). Rows are streamed (only
+(`preferClone: false`) on the same region: `medianStepIn8BitCodes` of the clone approximates `medianStepCodes` of the
+original only when both hold the same encoding (a linear float clone of an sRGB-encoded target does not). Rows are streamed (only
 the previous row is kept), so memory does not grow, but a float frame costs several logarithms per pixel on the game's
 thread: use a region.
 
@@ -1128,7 +1129,8 @@ Refused or limited cases on D3D12/Vulkan, all stated in the output:
 
 Limits on every API: 2D, non-MSAA textures in RGBA 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats, and except on
 D3D9 the one- and two-channel R8, R16, R16F, R32F, R8G8, R16G16, R16G16F and R32G32F and R9G9B9E5 (not on OpenGL). One-
-and two-channel values are measured in R (and G): the peak is the largest channel and a `signal` is refused. Up to 1023
+and two-channel values are measured in R (and G): the peak is the largest channel (`peakMeasure: maxChannel`), the means
+and minimums stay BT.709 luminance of (R, G, 0) and mean nothing there, and a `signal` is refused. Up to 1023
 measured writers per frame (D3D9: the atlas slots; `truncatedFrames` reports frames that hit it or the scratch budget).
 
 - Only commands the game issues are hooked. Passes that add-ons draw through the ReShade API (for example a mod's swap chain

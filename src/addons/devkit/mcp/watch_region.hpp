@@ -3997,6 +3997,9 @@ inline void ProcessAtFrameEnd(
               {"resourceHandle", formatting::FormatHandle(session->watched_resource.handle)},
               {"usedClone", session->used_clone},
               {"format", session->resource_format_name},
+              // One- and two-channel formats: peaks are the largest channel; means and minimums stay BT.709 luminance of
+              // (R, G, 0) and mean nothing there.
+              {"peakMeasure", (session->peak_is_max_channel ? "maxChannel" : "maxLuminance")},
               {"region", json{{"x", session->region.left}, {"y", session->region.top}, {"width", session->width}, {"height", session->height}}},
               {"signal", std::string(resource_analysis::internal::GetSignalName(session->signal))},
               {"units", unit},
@@ -4294,7 +4297,9 @@ inline void ProcessAtFrameEnd(
                                         formatting::StreamToString(scratch_format))));
           continue;
         }
-        if (!device->check_format_support(scratch_format, reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest)) {
+        if (!device->check_format_support(
+                scratch_format,
+                reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source)) {
           complete_request(request, make_error(std::format(
                                         "This device cannot sample format {}, so it cannot be watched.",
                                         formatting::StreamToString(scratch_format))));
