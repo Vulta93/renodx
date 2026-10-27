@@ -560,6 +560,20 @@ D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource); `devkit
 (ReShade's GL readback of it is not valid). `devkit_watch_region` reads the same formats except on D3D9 (see its limits
 below).
 
+### Banding (`banding: true`)
+
+`devkit_analyze_resource` with `banding: true` (one frame, no A/B) adds `analysis.banding`: per channel, the steps
+between neighbouring pixels in the values as stored (UNORM formats in codes, an sRGB format re-encoded first; float
+formats as the step relative to the value, log-binned). `smoothShare` is the share of neighbour pairs at most 4 codes
+(or 2% of the value) apart, `equalShare` the share of equal pairs, `medianStepCodes` (UNORM) or `medianStepRelative` and
+`medianStepAbsolute` (float) the typical smooth non-zero step. A band is a horizontal run of equal values bounded by small
+non-zero steps on both sides: `bands`, `meanBandLength`, `longestBand`, `bandsAtLeast8px`. Use a region on a smooth
+gradient (sky, fog); with too few smooth steps the block says so. Long bands bounded by 1-code steps are visible banding;
+dither reads as many short bands and is fine. To tell whether a mod's float clone still carries 8-bit steps from
+upstream, compare the clone (`preferClone: true`) with the RGBA8 original (`preferClone: false`) on the same region.
+Rows are streamed (only the previous row is kept), so a full 4K frame costs no extra memory, only time on the game's
+thread.
+
 ### Regions and nits
 
 `devkit_analyze_resource` also accepts:
