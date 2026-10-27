@@ -673,8 +673,10 @@ Use it to compare two captures of the same spot with the mod's own toggle or pre
 tone mapper setting against the HDR one), ideally on the same small region: a lower saturation mean or p90 means the mod
 desaturates, a shifted histogram means hue shifts. Compare `pixelsCounted` first: the 1-nit floor selects pixels by
 brightness, so when a preset moves many pixels across it the two captures measure different pixels and the comparison is
-not valid. The Devkit cannot switch a mod's replacements off: compile-time replacements are built into the game's
-pipelines and cannot be undone without recreating them. Not yet tested in a game.
+not valid. For one shader, `devkit_set_shader_source` (or `abShaderHash` with `frames`) switches between the game's
+original and the mod's replacement; the mod's resource upgrades and swap-chain proxy stay, so neither side is a vanilla
+view. `abShaderHash` runs on D3D9, D3D10/11 and OpenGL only; on D3D12 and Vulkan a switch can still lose the device (see
+`devkit_set_shader_source` in section 3).
 
 ### Multisampled resources
 
@@ -704,6 +706,11 @@ The end of a frame is ReShade's `reshade_present` event. ReShade raises `present
 effect runtime, which ends with `reshade_present`, so the end-of-frame measurement includes everything other add-ons wrote in
 their present handlers (for example a mod's swap chain proxy pass), whatever the add-on load order. A swap chain without a
 ReShade effect runtime never reaches `reshade_present`, so a watch on it times out.
+
+To follow one pixel through the frame, watch a 1x1 region (`regionWidth` and `regionHeight` 1) with `frames: 1` and
+`withSnapshot: true`: the trace then lists every writer of that pixel in command order with its value before and after
+(the region statistics of a single pixel) and, through `snapshotDraw`, the draw's shaders and inputs. Add
+`includeUnchanged: true` to also see the writers that left it unchanged.
 
 A watch belongs to one effect runtime (one swap chain): a back buffer is watched by the runtime that presents it, any
 other texture by the first runtime to reach the end of a frame. Only that runtime's frame ends measure, so a game with
