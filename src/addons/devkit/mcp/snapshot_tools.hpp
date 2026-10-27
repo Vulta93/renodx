@@ -808,6 +808,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
   std::vector<std::size_t> final_passes_from_mod_upgrade;
   std::vector<std::size_t> lut_builder_passes;
   std::vector<std::size_t> lut_reader_passes;
+  std::vector<std::size_t> video_passes;
   for (std::size_t pass_index = 0u; pass_index < passes.size(); ++pass_index) {
     auto& pass = passes[pass_index];
     if (pass.kind == CommandKind::COPY || pass.targets.empty()) continue;
@@ -840,6 +841,38 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
                        lut_input->height)},
       });
       lut_reader_passes.push_back(pass_index);
+    }
+
+    // Decoded video is usually sampled as YUV 4:2:0 planes: a full-size Y plane and half-size U and V (or UV) planes in
+    // one- or two-channel 8-bit textures (Bink and similar decoders). ReShade reports no YUV formats, so only the plane
+    // sizes are checked; noise or mask textures of that shape also match.
+    std::vector<const TextureInfo*> planes;
+    for (const auto& texture : pass.inputs) {
+      const auto format = rendered_format(texture);
+      if (texture.type == reshade::api::resource_type::texture_2d
+          && (format == reshade::api::format::r8_unorm || format == reshade::api::format::r8g8_unorm)) {
+        planes.push_back(&texture);
+      }
+    }
+    const auto half_of = [](std::uint32_t full, std::uint32_t half) {
+      return half * 2u == full || half * 2u == full + 1u;
+    };
+    const auto chroma_plane = std::ranges::find_if(planes, [&](const TextureInfo* chroma) {
+      return std::ranges::any_of(planes, [&](const TextureInfo* luma) {
+        return half_of(luma->width, chroma->width) && half_of(luma->height, chroma->height);
+      });
+    });
+    if (chroma_plane != planes.end()) {
+      pass.hints.push_back({
+          {"type", "video"},
+          {"rule", std::format(
+                       "reads {} one- or two-channel 8-bit textures, one of them {}x{} at half the size of another (YUV 4:2:0 "
+                       "planes of decoded video)",
+                       planes.size(),
+                       (*chroma_plane)->width,
+                       (*chroma_plane)->height)},
+      });
+      video_passes.push_back(pass_index);
     }
 
     if (pass.blend_known && pass.blend_enabled) continue;
@@ -1353,7 +1386,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
   if (output_pass.has_value()) {
     list_pass(output_pass.value());
   }
-  for (const auto* candidate_passes : {&ui_passes, &lut_builder_passes, &lut_reader_passes}) {
+  for (const auto* candidate_passes : {&ui_passes, &lut_builder_passes, &lut_reader_passes, &video_passes}) {
     for (const auto pass_index : *candidate_passes) {
       list_pass(pass_index);
     }
@@ -1470,7 +1503,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
     }
     text = std::format(
         "Device #{}: {} commands in {} passes ({} listed). Candidates to verify: {} tonemap, {} LUT texture(s), {} LUT "
-        "reader(s), {} LUT builder(s), {} UI, output pass {}, {} shared shader(s).",
+        "reader(s), {} LUT builder(s), {} UI, {} video, output pass {}, {} shared shader(s).",
         device_index,
         input.commands.size(),
         passes.size(),
@@ -1480,6 +1513,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
         lut_reader_passes.size(),
         lut_builder_passes.size(),
         ui_passes.size(),
+        video_passes.size(),
         output_text,
         shared_shader_count);
   }
@@ -1502,6 +1536,7 @@ inline ToolResult HandleFrameOverviewTool(const json& arguments, const ToolConte
               {"uiPasses", ui_passes},
               {"lutBuilderPasses", lut_builder_passes},
               {"lutReaderPasses", lut_reader_passes},
+              {"videoPasses", video_passes},
               {"lutTextureCount", lut_texture_count},
               {"lutTextures", std::move(lut_textures)},
               {"sharedShaderCount", shared_shader_count},
