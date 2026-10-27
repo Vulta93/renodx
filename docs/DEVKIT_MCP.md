@@ -324,6 +324,21 @@ It answers "is my shader live and drawing here?" without reading `ReShade.log`. 
 of replacements (418 in Gears of War: E-Day). `drawnOnly: true` keeps only the hashes the snapshot drew; `totalRegistered`,
 `totalDrawn` and `totalFiltered` give the counts before paging.
 
+### Shader coverage (`devkit_shader_coverage`)
+
+A snapshot shows one frame; coverage answers "which of my replacements did this play session never exercise?".
+`action: start` takes every shader the device has a replacement for (a game mod's, `source` `addon`; a compiled live file,
+`file`; or both) and counts their draws from then on; `status` reports without stopping, `stop` ends the recording and
+reports. Play through what the mod must handle (menus, loading screens, videos, fades, cutscenes, gameplay) between start
+and stop. The report lists `neverDrawn` first, then `drawn` with `draws`, `framesSeen` and `firstFrame`/`lastFrame`
+(presents since start), at most 64 per group; `watchedShaders` and `neverDrawnCount` are complete. A never-drawn
+replacement is either a scene not visited yet or a hash the game no longer uses.
+
+Counts cover draws, indexed draws, dispatches and indirect calls with the shader bound in any stage. On D3D12/Vulkan a
+command list recorded once and executed again is counted when it is recorded. While recording, every draw costs one lookup
+of the bound shaders; nothing is counted otherwise. Replacements added after start (a live file loaded later) are not
+watched until the next start. Not on a Display Proxy device.
+
 ### Frame overview (`devkit_frame_overview`)
 
 One call that summarizes the current snapshot, so the tonemapper, LUT, UI and output passes can be found without walking
@@ -372,6 +387,10 @@ thousands of draws:
     post-processing (bloom, glow, blur), or of UI drawn into an earlier target. UI drawn from its own art (atlases, fonts
     loaded before the frame) gets no note. In Prince of Persia T2T (D3D9) the HUD pass (122 fixed-function draws, BC3 art,
     source-alpha blending) was found next to two bloom/glow composites that got this note.
+  - `videoPasses`: passes that read two or more one- or two-channel 8-bit 2D textures (R8/R8G8), one of them half the
+    width and height of another: the YUV 4:2:0 planes of decoded video (Bink and similar decoders). ReShade reports no YUV
+    formats, so only the plane sizes are checked, and noise or mask textures of that shape match too. Check video
+    brightness and the video's path to the swap chain from there. Take the snapshot while a video plays.
   - `outputPass`: the last pass in known order that writes a swap-chain back buffer, by draw, dispatch or copy.
   - `sharedShaders`: shaders (the pixel or compute stage hash each command records) of a tonemap, UI or output candidate
     that also draw in a pass of another role (`ui`, `tonemap`, `output`, `other`; a pass that is both tonemap and output
@@ -633,8 +652,8 @@ result keeps `analysis` for the last frame and adds `frames`: `samples` with hea
 mean/max, nan and negative ratios; with a signal nits mean/max/p50/p90/p99/p99.9, shares above 203/400/1000 nits,
 saturation mean/p90) and `summary` with n, mean, stddev, min and max of each. Use it wherever single frames vary: in
 Sleeping Dogs the image alternated between a bright and a dim state from one frame to the next (means 10.6 vs 6.2 nits),
-so two single captures could differ by 70 % with nothing changed. `frames` above 1 needs `measurePoint: present` and no
-`outputPath`.
+so two single captures could differ by 70 % with nothing changed. `frames` above 1 needs `measurePoint: present` and
+writes no image; an `outputPath` ending in `.json` is allowed (see below).
 
 `abShaderHash` turns it into an A/B of one shader: `frames` samples per side, on consecutive frames in the order A, B,
 B, A, ... (which balances a scene that flips between two states each frame). The game's thread switches the shader's
@@ -643,7 +662,7 @@ in `devkit_set_shader_source`, starting after one warm-up frame, and puts the sh
 also when a frame or a switch fails. The result adds `ab` with each side's summary, `difference` (B minus A of each
 mean, and `rangesOverlap` when the two sides' min-max ranges overlap: a difference within frame noise) and
 `restoredSource`; `frames.samples` carry their `side`. Run A against A first (`abSourceA` = `abSourceB`) to see the
-noise floor of the spot. Limits: `measurePoint: present`, no `outputPath`, the game's device (not a Display Proxy), and
+noise floor of the spot. Limits: `measurePoint: present`, no image `outputPath`, the game's device (not a Display Proxy), and
 D3D9/D3D10/D3D11/OpenGL only, since on D3D12/Vulkan a switch destroys a pipeline that frames still in flight may use.
 Only that shader changes: the mod's resource upgrades and swap-chain proxy stay, so `original` is not a vanilla view.
 In an A/B, `frames.summary` is left out (it would mix both sides); `ab.a` and `ab.b` carry the summaries.
@@ -664,6 +683,24 @@ More A/B rules and caveats:
   but not that lag.
 - Samples follow the device's presents. With several swap chains on one device they interleave windows, and `frame`
   counts the presents the request saw, not the game's frame numbers.
+
+### Saving a result to compare runs (`outputPath` ending in `.json`)
+
+An absolute `outputPath` ending in `.json` writes the finished result (the `structuredContent` the call returns, with
+`frames` and `ab` when present) instead of an image, and the result gains `jsonPath` (or `jsonError` when the file could
+not be written; the measurement itself is still returned). It is the one output allowed with `frames` above 1 and with
+`abShaderHash`. Use it for comparisons that span a game restart or a rebuild, where the two results are never in one
+conversation turn:
+
+- Before and after a rebuild: same spot, same region and signal, `frames: 8` or more, one file per build.
+- Mod on against mod off (a vanilla reference in the same scene): measure with the mod, close the game, rename the mod's
+  `.addon64`/`.addon32` so ReShade does not load it (the Devkit alone still loads), launch to the same spot, measure
+  again, close the game and rename it back. Unlike an A/B (`original` keeps the mod's upgrades and swap-chain proxy),
+  this compares against the game as shipped. Add `devkit_frame_overview` `saveBaseline`/`compareWith` across the two
+  launches to see which passes the mod changed.
+
+Compare the two files metric by metric: a difference whose min-max ranges overlap is within frame-to-frame noise; a
+single-frame result has no noise floor, so its differences cannot be judged.
 
 ### LUTs (`devkit_analyze_lut`)
 
