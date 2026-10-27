@@ -4238,7 +4238,7 @@ inline void ProcessAtFrameEnd(
       continue;
     }
     // The watch copies a box of the texture; D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource.
-    if (renodx::utils::bitwise::HasAnyFlag(resource_desc.usage, reshade::api::resource_usage::depth_stencil)) {
+    if (resource_analysis::internal::IsDepthStencilResource(device, target.resolved_resource, resource_desc)) {
       complete_request(request, make_error("Depth-stencil resources cannot be watched."));
       continue;
     }

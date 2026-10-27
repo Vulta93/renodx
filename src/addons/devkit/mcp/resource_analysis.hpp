@@ -232,6 +232,14 @@ inline void to_json(json& j, const RatioStats& value) {
   };
 }
 
+// The tracked description is the one the game created the resource with; the device's own is asked as well, so a
+// depth-stencil resource is recognized even if a tracked record lacks the usage. Box copies of such a resource are dropped
+// by D3D10/11 and invalid on D3D12.
+[[nodiscard]] inline bool IsDepthStencilResource(reshade::api::device* device, reshade::api::resource resource, const reshade::api::resource_desc& tracked_desc) {
+  const auto native_usage = device->get_resource_desc(resource).usage;
+  return renodx::utils::bitwise::HasAnyFlag(tracked_desc.usage | native_usage, reshade::api::resource_usage::depth_stencil);
+}
+
 [[nodiscard]] inline AnalysisTarget ResolveAnalysisTarget(
     reshade::api::resource_view resource_view,
     reshade::api::device* device,
@@ -1347,8 +1355,7 @@ inline void EncodePreviewPixel(
   const auto texture_width = std::max<uint32_t>(target.resolved_resource_desc.texture.width >> first_level, 1u);
   const auto texture_height = std::max<uint32_t>(target.resolved_resource_desc.texture.height >> first_level, 1u);
   // D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource: only the whole subresource is read.
-  if (region.has_value()
-      && renodx::utils::bitwise::HasAnyFlag(target.resolved_resource_desc.usage, reshade::api::resource_usage::depth_stencil)) {
+  if (region.has_value() && IsDepthStencilResource(device, target.resolved_resource, target.resolved_resource_desc)) {
     return ToolResult{
         .text = "A depth-stencil resource is read whole: leave the region out.",
         .structured_content = json{{"error", "A depth-stencil resource is read whole: leave the region out."}},
@@ -2036,6 +2043,9 @@ inline void EncodePreviewPixel(
           {"resolvedResourceFormat", target.resolved_resource_desc.type == reshade::api::resource_type::buffer
                                          ? json(nullptr)
                                          : json(FormatFormat(context, target.resolved_resource_desc.texture.format))},
+          {"resolvedResourceUsage", std::format("0x{:X}", static_cast<std::uint32_t>(target.resolved_resource_desc.usage))},
+          {"nativeResourceUsage", std::format("0x{:X}", static_cast<std::uint32_t>(device->get_resource_desc(target.resolved_resource).usage))},
+          {"depthStencil", IsDepthStencilResource(device, target.resolved_resource, target.resolved_resource_desc)},
       };
       json result = {
           {"deviceIndex", device_index},

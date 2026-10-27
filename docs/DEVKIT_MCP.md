@@ -556,7 +556,10 @@ R32 float, R8G8, R16G16 UNORM/float and R32G32 float (for example a 1x1 auto-exp
 values land in `channels.r` (and `channels.g`) with B = 0, so the luminance fields mean nothing there and a `signal`
 is refused (with `frames`, `rMean` and `gMean` carry them per frame). Depth views (D16/D24/D32) are not read; a
 depth buffer seen through its R32_FLOAT or R16_UNORM shader view decodes as one channel, read whole (a region is refused:
-D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource); `devkit_watch_region` refuses depth-stencil resources. R9G9B9E5 is refused on OpenGL
+D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource); `devkit_watch_region` refuses depth-stencil resources.
+Both ask the device for the resource's usage as well as the tracked description; `analysisTarget` reports
+`resolvedResourceUsage`, `nativeResourceUsage` and `depthStencil`. A typeless texture the game copies its depth into is not
+a depth-stencil resource and is read like any other. R9G9B9E5 is refused on OpenGL
 (ReShade's GL readback of it is not valid). `devkit_watch_region` reads the one- and two-channel formats and R9G9B9E5
 too, but not on D3D9 (nor R9G9B9E5 on OpenGL), and BGRX8/BGR10A2 only on D3D9 (see its limits below).
 
