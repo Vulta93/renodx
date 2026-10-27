@@ -232,12 +232,13 @@ inline void to_json(json& j, const RatioStats& value) {
   };
 }
 
-// The tracked description is the one the game created the resource with; the device's own is asked as well, so a
-// depth-stencil resource is recognized even if a tracked record lacks the usage. Box copies of such a resource are dropped
-// by D3D10/11 and invalid on D3D12.
+// Box copies and resolves of a depth-stencil resource are dropped by D3D10/11 and invalid on D3D12. The tracked description
+// matches the device's own for resources created while the Devkit runs (ReShade converts both the same way); the device is
+// asked as well for a record filled some other way, such as a resource that existed before the Devkit loaded.
 [[nodiscard]] inline bool IsDepthStencilResource(reshade::api::device* device, reshade::api::resource resource, const reshade::api::resource_desc& tracked_desc) {
-  const auto native_usage = device->get_resource_desc(resource).usage;
-  return renodx::utils::bitwise::HasAnyFlag(tracked_desc.usage | native_usage, reshade::api::resource_usage::depth_stencil);
+  return renodx::utils::bitwise::HasAnyFlag(
+      tracked_desc.usage | device->get_resource_desc(resource).usage,
+      reshade::api::resource_usage::depth_stencil);
 }
 
 [[nodiscard]] inline AnalysisTarget ResolveAnalysisTarget(
@@ -957,7 +958,7 @@ inline void EncodePreviewPixel(
         multisample_error = "Multisampled resources can only be analyzed on D3D9, D3D10/11 and OpenGL.";
         break;
       default:
-        if (renodx::utils::bitwise::HasAnyFlag(target.resolved_resource_desc.usage, reshade::api::resource_usage::depth_stencil)) {
+        if (IsDepthStencilResource(device, target.resolved_resource, target.resolved_resource_desc)) {
           multisample_error = "Multisampled depth-stencil resources cannot be resolved for analysis.";
         } else if (device->get_api() == reshade::api::device_api::opengl
                    && static_cast<uint32_t>(target.resolved_resource.handle >> 40u) == 0x8218u /* GL_FRAMEBUFFER_DEFAULT */) {
