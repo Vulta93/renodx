@@ -1527,6 +1527,7 @@ inline void EncodePreviewPixel(
     uint64_t pixels_any_above_one = 0u;
     uint64_t pixels_any_above_two = 0u;
     uint64_t pixels_any_above_four = 0u;
+    uint64_t pixels_any_exactly_one = 0u;
     bool supported_format = true;
     // One- and two-channel formats decode into R (and G) with B = 0, so display light, colour and the tone curve's
     // luminance make no sense there.
@@ -1759,6 +1760,7 @@ inline void EncodePreviewPixel(
         pixels_any_above_one += any_above_one ? 1u : 0u;
         pixels_any_above_two += any_above_two ? 1u : 0u;
         pixels_any_above_four += any_above_four ? 1u : 0u;
+        pixels_any_exactly_one += (rgba[0] == 1.f || rgba[1] == 1.f || rgba[2] == 1.f) ? 1u : 0u;
         pixels_all_rgb_zero += all_rgb_zero ? 1u : 0u;
 
         for (uint32_t channel = 0; channel < 4u; ++channel) {
@@ -2060,6 +2062,7 @@ inline void EncodePreviewPixel(
                   {"pixelsAnyChannelAbove1", RatioStats(pixels_any_above_one, pixel_count)},
                   {"pixelsAnyChannelAbove2", RatioStats(pixels_any_above_two, pixel_count)},
                   {"pixelsAnyChannelAbove4", RatioStats(pixels_any_above_four, pixel_count)},
+                  {"pixelsAnyChannelExactly1", RatioStats(pixels_any_exactly_one, pixel_count)},
                   {
                       "channels",
                       {
@@ -2083,6 +2086,51 @@ inline void EncodePreviewPixel(
             {"textureHeight", texture_height},
             {"note", "Statistics, preview, dump and resourceIdentity describe this region only."},
         };
+      }
+      // Rule-labelled facts about the signal, each with the rule that produced it. They are candidates for the
+      // classification the skills require proving (snapshot, shader, watch); no guess of linear against gamma encoding is
+      // made, because the values alone cannot tell them apart.
+      {
+        // At least this share of pixels with a channel exactly at 1.0 counts as a clamp.
+        constexpr double CLIP_SHARE = 0.01;
+        const auto share_of = [&](uint64_t count) {
+          return (pixel_count == 0u ? 0.0 : static_cast<double>(count) / static_cast<double>(pixel_count));
+        };
+        json signal_hints = json::array();
+        if (unorm_max_code > 0.0) {
+          signal_hints.push_back(json{
+              {"type", "unormStorage"},
+              {"rule", "A UNORM format stores 0 to 1: anything brighter was clipped when this texture was written."},
+          });
+        } else if (pixels_any_above_one != 0u) {
+          signal_hints.push_back(json{
+              {"type", "aboveOne"},
+              {"rule", "A float format with values above 1.0: not clamped here (an untonemapped scene, scRGB, or a mod's upgrade)."},
+              {"share", share_of(pixels_any_above_one)},
+          });
+        }
+        if (share_of(pixels_any_exactly_one) >= CLIP_SHARE) {
+          signal_hints.push_back(json{
+              {"type", "atOne"},
+              {"rule", "At least 1% of pixels have a channel exactly at 1.0: a saturate or clamp at or before this write (in UNORM, the top code)."},
+              {"share", share_of(pixels_any_exactly_one)},
+          });
+        }
+        if (pixels_any_negative != 0u) {
+          signal_hints.push_back(json{
+              {"type", "negative"},
+              {"rule", "Negative values: wide gamut encoded in BT.709 primaries (scRGB), or a math error."},
+              {"share", share_of(pixels_any_negative)},
+          });
+        }
+        if (nan_pixel_count + inf_pixel_count != 0u) {
+          signal_hints.push_back(json{
+              {"type", "nonFinite"},
+              {"rule", "NaN or infinite values: usually a division or log of zero or a negative, often after a resource upgrade."},
+              {"share", share_of(nan_pixel_count + inf_pixel_count)},
+          });
+        }
+        result["analysis"]["signalHints"] = std::move(signal_hints);
       }
       if (measure_banding) {
         // Nearest bin holding the middle step of a histogram; nullopt when it is empty.

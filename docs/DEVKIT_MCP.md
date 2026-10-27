@@ -560,6 +560,15 @@ D3D10/11 drop and D3D12 rejects a box copy of a depth-stencil resource); `devkit
 (ReShade's GL readback of it is not valid). `devkit_watch_region` reads the same formats except on D3D9 (see its limits
 below).
 
+### Signal hints
+
+Every `devkit_analyze_resource` result has `analysis.pixelsAnyChannelExactly1` and `analysis.signalHints`, a list of
+facts each labelled with the rule that produced it: `unormStorage` (a UNORM format: anything brighter than 1 was clipped
+when the texture was written), `aboveOne` (a float format holding values above 1), `atOne` (at least 1% of pixels have
+a channel exactly at 1.0: a saturate or clamp at or before this write), `negative` and `nonFinite`. They are candidates
+for classifying a signal as untonemapped, neutral SDR or graded SDR, which still has to be proven with the snapshot, the
+shader and `devkit_watch_region`; the values alone cannot tell linear from gamma-encoded data, so no such guess is made.
+
 ### Banding (`banding: true`)
 
 `devkit_analyze_resource` with `banding: true` (one frame, no A/B) adds `analysis.banding`: per channel, the steps
