@@ -191,6 +191,10 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                                        const renodx::utils::mcp::json& arguments) {
     return resource_analysis::HandleDumpResourceWithHashTool(arguments, build_analyze_resource_tool_context());
   });
+  register_tool("devkit_analyze_lut", [build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
+                                          const renodx::utils::mcp::json& arguments) {
+    return resource_analysis::HandleAnalyzeLutTool(arguments, build_analyze_resource_tool_context());
+  });
   register_tool("devkit_set_resource_clone", [build_resource_clone_tool_context = context.build_resource_clone_tool_context](
                                                  const renodx::utils::mcp::json& arguments) {
     return resource_clone::HandleSetResourceCloneTool(arguments, build_resource_clone_tool_context());

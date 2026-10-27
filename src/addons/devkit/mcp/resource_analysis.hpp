@@ -64,6 +64,14 @@ enum class Signal : std::uint8_t {
   SCRGB = 2,
 };
 
+struct LutOptions {
+  // "auto", "3d" (an N x N x N volume), "strip_x" (N*N x N: N slices side by side) or "strip_y" (N x N*N, stacked).
+  std::string layout = "auto";
+  // Green increases from the bottom row up instead of from the top.
+  bool flip_y = false;
+  std::optional<std::filesystem::path> csv_path = std::nullopt;
+};
+
 struct PendingRequest {
   reshade::api::resource_view resource_view = {0u};
   std::optional<std::filesystem::path> output_path = std::nullopt;
@@ -103,6 +111,8 @@ struct PendingRequest {
   std::vector<float> curve_input_luminance;
   std::vector<float> curve_output_luminance;
   json curve_input_result;
+  // devkit_analyze_lut: read the texture as a colour lookup table instead of an image.
+  std::optional<LutOptions> lut = std::nullopt;
   std::mutex mutex;
   std::condition_variable cv;
   bool started = false;
@@ -859,7 +869,9 @@ inline void EncodePreviewPixel(
     reshade::api::resource frame_end_copy,
     // When set, receives one luminance per pixel in row order (nits with a signal, else BT.709 luminance of the decoded
     // values; NaN for a non-finite pixel), for the tone curve's input/output pairs.
-    std::vector<float>* pixel_luminance = nullptr) {
+    std::vector<float>* pixel_luminance = nullptr,
+    // When set, the texture is read as a colour lookup table (devkit_analyze_lut) and LUT statistics are returned.
+    const LutOptions* lut = nullptr) {
   AnalysisTarget target = {};
   try {
     target = ResolveAnalysisTarget(resource_view, device, prefer_clone);
@@ -885,7 +897,8 @@ inline void EncodePreviewPixel(
         .is_error = true,
     };
   }
-  if (target.resolved_resource_desc.type != reshade::api::resource_type::texture_2d
+  if (lut == nullptr
+      && target.resolved_resource_desc.type != reshade::api::resource_type::texture_2d
       && target.resolved_resource_desc.type != reshade::api::resource_type::surface) {
     return ToolResult{
         .text = "Only 2D texture resource views are currently supported.",
@@ -953,6 +966,310 @@ inline void EncodePreviewPixel(
           .is_error = true,
       };
     }
+  }
+
+  if (lut != nullptr) {
+    const auto make_error = [](const std::string& error) {
+      return ToolResult{
+          .text = error,
+          .structured_content = json{{"error", error}},
+          .is_error = true,
+      };
+    };
+    const auto& lut_desc = target.resolved_resource_desc;
+    const bool is_volume = (lut_desc.type == reshade::api::resource_type::texture_3d);
+    if (lut_desc.texture.samples != 1u) return make_error("A multisampled texture is not a LUT.");
+    if (!is_volume && lut_desc.type != reshade::api::resource_type::texture_2d) {
+      return make_error("A LUT is a 3D texture or a 2D strip.");
+    }
+    if (is_volume && device->get_api() == reshade::api::device_api::d3d9) {
+      return make_error("3D LUTs are not read on D3D9 (its volume readback path is untested); 2D strip LUTs are.");
+    }
+    const auto lut_width = lut_desc.texture.width;
+    const auto lut_height = lut_desc.texture.height;
+    const auto lut_depth = static_cast<uint32_t>(lut_desc.texture.depth_or_layers);
+    auto layout = lut->layout;
+    if (layout == "auto") {
+      if (is_volume) {
+        layout = "3d";
+      } else if (lut_width == lut_height * lut_height) {
+        layout = "strip_x";
+      } else if (lut_height == lut_width * lut_width) {
+        layout = "strip_y";
+      } else {
+        return make_error(std::format(
+            "A {}x{} 2D texture is neither N*N x N nor N x N*N; pass layout if it is a LUT anyway.",
+            lut_width,
+            lut_height));
+      }
+    }
+    uint32_t lut_size = 0u;
+    if (layout == "3d" && is_volume && lut_width == lut_height && lut_height == lut_depth) {
+      lut_size = lut_width;
+    } else if (layout == "strip_x" && !is_volume && lut_width == lut_height * lut_height) {
+      lut_size = lut_height;
+    } else if (layout == "strip_y" && !is_volume && lut_height == lut_width * lut_width) {
+      lut_size = lut_width;
+    }
+    if (lut_size < 2u || lut_size > 256u) {
+      return make_error(std::format(
+          "Layout '{}' does not fit this {} texture of {}x{}x{}.",
+          layout,
+          (is_volume ? "3D" : "2D"),
+          lut_width,
+          lut_height,
+          lut_depth));
+    }
+
+    // Read back the whole top level as for an image; the view's format decides how texels decode (sRGB or not).
+    const auto readback_format = reshade::api::format_to_default_typed(lut_desc.texture.format, 0);
+    const auto decode_format = (target.resolved_view_desc.format != reshade::api::format::unknown
+                                    ? target.resolved_view_desc.format
+                                    : readback_format);
+    reshade::api::resource readback = {0u};
+    if (!device->create_resource(
+            reshade::api::resource_desc(
+                lut_desc.type,
+                lut_width,
+                lut_height,
+                static_cast<uint16_t>(is_volume ? lut_depth : 1u),
+                1,
+                readback_format,
+                1,
+                reshade::api::memory_heap::gpu_to_cpu,
+                reshade::api::resource_usage::copy_dest),
+            nullptr,
+            reshade::api::resource_usage::copy_dest,
+            &readback)) {
+      return make_error("Failed to create a GPU-to-CPU readback texture for the LUT.");
+    }
+    auto* lut_cmd_list = queue->get_immediate_command_list();
+    lut_cmd_list->copy_texture_region(target.resolved_resource, 0, nullptr, readback, 0, nullptr);
+    queue->flush_immediate_command_list();
+    queue->wait_idle();
+
+    reshade::api::subresource_data mapped = {};
+    if (!device->map_texture_region(readback, 0, nullptr, reshade::api::map_access::read_only, &mapped)) {
+      device->destroy_resource(readback);
+      return make_error("Failed to map the LUT readback texture.");
+    }
+    // lattice[(b * N + g) * N + r] = the RGB the shader reads for input (r, g, b) / (N - 1).
+    const auto lattice_index = [lut_size](uint32_t r, uint32_t g, uint32_t b) {
+      return ((static_cast<std::size_t>(b) * lut_size) + g) * lut_size + r;
+    };
+    std::vector<std::array<float, 3>> lattice(static_cast<std::size_t>(lut_size) * lut_size * lut_size);
+    const auto texel_stride = static_cast<std::size_t>(reshade::api::format_row_pitch(readback_format, 1));
+    uint32_t channel_count = 4u;
+    bool decoded = true;
+    for (uint32_t b = 0u; b < lut_size && decoded; ++b) {
+      for (uint32_t g = 0u; g < lut_size && decoded; ++g) {
+        const auto row = (lut->flip_y ? lut_size - 1u - g : g);
+        for (uint32_t r = 0u; r < lut_size; ++r) {
+          uint32_t x = r;
+          uint32_t y = row;
+          uint32_t z = 0u;
+          if (layout == "3d") {
+            z = b;
+          } else if (layout == "strip_x") {
+            x = (b * lut_size) + r;
+          } else {
+            y = (b * lut_size) + row;
+          }
+          const auto* texel = static_cast<const uint8_t*>(mapped.data)
+                              + (static_cast<std::size_t>(z) * mapped.slice_pitch)
+                              + (static_cast<std::size_t>(y) * mapped.row_pitch)
+                              + (static_cast<std::size_t>(x) * texel_stride);
+          float rgba[4] = {0.f, 0.f, 0.f, 1.f};
+          if (!DecodePixelToLinear(decode_format, texel, rgba, channel_count)) {
+            decoded = false;
+            break;
+          }
+          lattice[lattice_index(r, g, b)] = {rgba[0], rgba[1], rgba[2]};
+        }
+      }
+    }
+    device->unmap_texture_region(readback, 0);
+    device->destroy_resource(readback);
+    if (!decoded) {
+      return make_error(std::format("Readback is not implemented for format {}.", FormatFormat(context, decode_format)));
+    }
+    if (channel_count < 3u) {
+      return make_error(std::format("Format {} has fewer than three channels, so it is not a colour LUT.", FormatFormat(context, decode_format)));
+    }
+
+    // An sRGB view decodes texels to linear; the identity of such a LUT holds in the stored (encoded) values.
+    const bool srgb_format = (decode_format == reshade::api::format_to_default_typed(decode_format, 1)
+                              && decode_format != reshade::api::format_to_default_typed(decode_format, 0));
+    const auto lattice_step = static_cast<float>(lut_size - 1u);
+    std::array<double, 3> deviation_sum = {};
+    std::array<double, 3> deviation_max = {};
+    std::array<float, 3> output_min = {
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
+    };
+    std::array<float, 3> output_max = {
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+    };
+    std::vector<float> point_deviation;
+    point_deviation.reserve(lattice.size());
+    std::size_t worst_index = 0u;
+    float worst_deviation = -1.f;
+    std::size_t values_above_one = 0u;
+    std::size_t non_finite_values = 0u;
+    bool all_zero = true;
+    for (uint32_t b = 0u; b < lut_size; ++b) {
+      for (uint32_t g = 0u; g < lut_size; ++g) {
+        for (uint32_t r = 0u; r < lut_size; ++r) {
+          const auto index = lattice_index(r, g, b);
+          const auto& output = lattice[index];
+          const std::array<float, 3> input = {r / lattice_step, g / lattice_step, b / lattice_step};
+          float point_max = 0.f;
+          for (std::size_t channel = 0u; channel < 3u; ++channel) {
+            const auto value = output[channel];
+            if (!std::isfinite(value)) {
+              ++non_finite_values;
+              continue;
+            }
+            all_zero &= (value == 0.f);
+            if (value > 1.f) ++values_above_one;
+            output_min[channel] = std::min(output_min[channel], value);
+            output_max[channel] = std::max(output_max[channel], value);
+            const auto stored = (srgb_format ? LinearToSrgb(value) : value);
+            const auto deviation = std::abs(stored - input[channel]);
+            deviation_sum[channel] += deviation;
+            deviation_max[channel] = std::max<double>(deviation_max[channel], deviation);
+            point_max = std::max(point_max, deviation);
+          }
+          point_deviation.push_back(point_max);
+          if (point_max > worst_deviation) {
+            worst_deviation = point_max;
+            worst_index = index;
+          }
+        }
+      }
+    }
+    std::ranges::sort(point_deviation);
+    const auto deviation_p99 = point_deviation[std::min(point_deviation.size() - 1u, (point_deviation.size() * 99u) / 100u)];
+    const auto lattice_point_json = [&](uint32_t r, uint32_t g, uint32_t b) {
+      const auto& output = lattice[lattice_index(r, g, b)];
+      return json{
+          {"index", {r, g, b}},
+          {"input", {r / lattice_step, g / lattice_step, b / lattice_step}},
+          {"output", {output[0], output[1], output[2]}},
+      };
+    };
+    const auto last = lut_size - 1u;
+    // The eight cube corners show at a glance whether the axis mapping is right: a swapped axis or a flipped green moves
+    // a primary to another corner.
+    const json corners = {
+        {"black", lattice_point_json(0u, 0u, 0u)},
+        {"red", lattice_point_json(last, 0u, 0u)},
+        {"green", lattice_point_json(0u, last, 0u)},
+        {"blue", lattice_point_json(0u, 0u, last)},
+        {"yellow", lattice_point_json(last, last, 0u)},
+        {"magenta", lattice_point_json(last, 0u, last)},
+        {"cyan", lattice_point_json(0u, last, last)},
+        {"white", lattice_point_json(last, last, last)},
+    };
+    json neutral_axis = json::array();
+    std::array<bool, 3> neutral_monotonic = {true, true, true};
+    for (uint32_t i = 0u; i < lut_size; ++i) {
+      const auto& output = lattice[lattice_index(i, i, i)];
+      neutral_axis.push_back(json{{"input", i / lattice_step}, {"output", {output[0], output[1], output[2]}}});
+      if (i == 0u) continue;
+      const auto& previous = lattice[lattice_index(i - 1u, i - 1u, i - 1u)];
+      for (std::size_t channel = 0u; channel < 3u; ++channel) {
+        neutral_monotonic[channel] = neutral_monotonic[channel] && (output[channel] >= previous[channel] - 1e-4f);
+      }
+    }
+    const auto point_count = static_cast<double>(lattice.size());
+    const auto worst_b = static_cast<uint32_t>(worst_index / (static_cast<std::size_t>(lut_size) * lut_size));
+    const auto worst_g = static_cast<uint32_t>((worst_index / lut_size) % lut_size);
+    const auto worst_r = static_cast<uint32_t>(worst_index % lut_size);
+    // Within about 1.5 steps of an 8-bit value: an identity LUT stored in 8 bits.
+    constexpr double IDENTITY_TOLERANCE = 1.5 / 255.0;
+    const bool is_identity = (std::ranges::max(deviation_max) <= IDENTITY_TOLERANCE);
+
+    json csv_json = nullptr;
+    if (lut->csv_path.has_value()) {
+      std::ofstream csv_file(lut->csv_path.value(), std::ios::trunc);
+      csv_file << "r_index,g_index,b_index,in_r,in_g,in_b,out_r,out_g,out_b\n";
+      for (uint32_t b = 0u; b < lut_size; ++b) {
+        for (uint32_t g = 0u; g < lut_size; ++g) {
+          for (uint32_t r = 0u; r < lut_size; ++r) {
+            const auto& output = lattice[lattice_index(r, g, b)];
+            csv_file << std::format(
+                "{},{},{},{:.6g},{:.6g},{:.6g},{:.9g},{:.9g},{:.9g}\n",
+                r,
+                g,
+                b,
+                r / lattice_step,
+                g / lattice_step,
+                b / lattice_step,
+                output[0],
+                output[1],
+                output[2]);
+          }
+        }
+      }
+      csv_file.close();
+      if (!csv_file) {
+        return make_error(std::format("Failed to write '{}'.", lut->csv_path->string()));
+      }
+      csv_json = lut->csv_path->string();
+    }
+
+    json result = {
+        {"deviceIndex", device_index},
+        {"resourceViewHandle", FormatHandle(context, resource_view.handle)},
+        {"usedClone", target.used_clone},
+        {"layout", layout},
+        {"size", lut_size},
+        {"flipY", lut->flip_y},
+        {"format", FormatFormat(context, decode_format)},
+        {"srgbFormat", srgb_format},
+        {"identityDomain", (srgb_format ? "stored (sRGB-encoded) values" : "values as read")},
+        {"isIdentity", is_identity},
+        {"identityDeviation",
+         {
+             {"mean", {deviation_sum[0] / point_count, deviation_sum[1] / point_count, deviation_sum[2] / point_count}},
+             {"max", {deviation_max[0], deviation_max[1], deviation_max[2]}},
+             {"p99", deviation_p99},
+             {"worst", lattice_point_json(worst_r, worst_g, worst_b)},
+         }},
+        {"corners", corners},
+        {"neutralAxis", neutral_axis},
+        {"neutralAxisMonotonic", {neutral_monotonic[0], neutral_monotonic[1], neutral_monotonic[2]}},
+        {"outputRange", {{"min", {output_min[0], output_min[1], output_min[2]}}, {"max", {output_max[0], output_max[1], output_max[2]}}}},
+        {"valuesAboveOne", values_above_one},
+        {"nonFiniteValues", non_finite_values},
+        {"allZero", all_zero},
+        {"csvPath", csv_json},
+    };
+    auto text = std::format(
+        "{} LUT, N = {}, {}: {}. Identity deviation max (r, g, b) = ({:.4f}, {:.4f}, {:.4f}), p99 {:.4f}. Output range "
+        "[{:.4g}, {:.4g}]; neutral axis {}.",
+        layout,
+        lut_size,
+        FormatFormat(context, decode_format),
+        (is_identity ? "identity" : "not identity"),
+        deviation_max[0],
+        deviation_max[1],
+        deviation_max[2],
+        deviation_p99,
+        std::ranges::min(output_min),
+        std::ranges::max(output_max),
+        ((neutral_monotonic[0] && neutral_monotonic[1] && neutral_monotonic[2]) ? "monotonic" : "NOT monotonic"));
+    if (all_zero) {
+      text += " Every value is zero: the LUT may be built later in the frame, or the texture reused after the LUT pass.";
+    }
+    return ToolResult{
+        .text = std::move(text),
+        .structured_content = std::move(result),
+    };
   }
 
   const auto summary_view = target.used_clone ? target.resolved_view : resource_view;
@@ -2281,6 +2598,73 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   return request->result.value();
 }
 
+[[nodiscard]] inline ToolResult HandleAnalyzeLutTool(const json& arguments, const ToolContext& context) {
+  if (!context.resolve_device_index || !context.enqueue_request) {
+    throw std::runtime_error("AnalyzeResourceToolContext is not initialized.");
+  }
+
+  const auto resource_view_handle = resource_handle::GetRequired(arguments, "resourceViewHandle");
+  const auto device_index = context.resolve_device_index(arguments);
+  auto lut_options = LutOptions{
+      .layout = mcp_arguments::GetOptional<std::string>(arguments, "layout").value_or("auto"),
+      .flip_y = mcp_arguments::GetOptional<bool>(arguments, "flipY").value_or(false),
+  };
+  if (lut_options.layout != "auto" && lut_options.layout != "3d" && lut_options.layout != "strip_x" && lut_options.layout != "strip_y") {
+    throw std::runtime_error("layout must be 'auto', '3d', 'strip_x' or 'strip_y'.");
+  }
+  if (const auto output_path = mcp_arguments::GetOptional<std::string>(arguments, "outputPath"); output_path.has_value()) {
+    const auto csv_path = std::filesystem::path(output_path.value());
+    if (!csv_path.is_absolute() || csv_path.extension() != ".csv") {
+      throw std::runtime_error("outputPath must be an absolute path ending in .csv.");
+    }
+    lut_options.csv_path = csv_path.lexically_normal();
+  }
+
+  auto request = std::make_shared<PendingRequest>();
+  request->resource_view = reshade::api::resource_view{resource_view_handle};
+  request->prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
+  request->lut = std::move(lut_options);
+
+  if (!context.enqueue_request(device_index, request)) {
+    const auto error = std::format("Failed to queue the LUT analysis request for device #{}.", device_index);
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  }
+
+  {
+    std::unique_lock request_lock(request->mutex);
+    if (!request->cv.wait_for(request_lock, std::chrono::seconds(15), [&request] { return request->completed || request->started; })) {
+      request->canceled = true;
+      request_lock.unlock();
+      if (context.cancel_request) {
+        context.cancel_request(device_index, request);
+      }
+      return ToolResult{
+          .text = "Timed out waiting for the next present to process the LUT analysis request.",
+          .structured_content = json{{"error", "Timed out waiting for the next present to process the LUT analysis request."}},
+          .is_error = true,
+      };
+    }
+
+    if (!request->completed) {
+      request->cv.wait(request_lock, [&request] { return request->completed; });
+    }
+  }
+
+  if (!request->result.has_value()) {
+    return ToolResult{
+        .text = "The LUT analysis request completed without a result.",
+        .structured_content = json{{"error", "The LUT analysis request completed without a result."}},
+        .is_error = true,
+    };
+  }
+
+  return request->result.value();
+}
+
 // Returns the multi-frame requests that still need frames; the caller queues them again for the next present.
 [[nodiscard]] inline std::deque<std::shared_ptr<PendingRequest>> ProcessPendingRequests(
     const std::deque<std::shared_ptr<PendingRequest>>& requests,
@@ -2414,11 +2798,12 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
           request->region,
           request->signal,
           request->frame_end_copy,
-          (request->curve_input_view.has_value() ? &request->curve_output_luminance : nullptr));
+          (request->curve_input_view.has_value() ? &request->curve_output_luminance : nullptr),
+          (request->lut.has_value() ? &request->lut.value() : nullptr));
     } catch (const std::exception& exception) {
       result = make_error(exception.what());
     }
-    if (!result.is_error && result.structured_content.is_object()) {
+    if (!result.is_error && result.structured_content.is_object() && !request->lut.has_value()) {
       result.structured_content["measurePoint"] = (request->at_frame_end ? "frame_end" : "present");
     }
 

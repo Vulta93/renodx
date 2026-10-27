@@ -392,6 +392,24 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_analyze_lut",
+        {
+            .title = "Analyze LUT",
+            .description = "Read a texture as a colour lookup table, at the Devkit's next present, and summarize it without dumping images. Layouts: '3d' (an N x N x N 3D texture; red along x, green along y, blue across slices), 'strip_x' (a 2D N*N x N strip, N slices side by side, blue selects the slice: Unreal 256x16, Unity 1024x32) and 'strip_y' (N x N*N, slices stacked); 'auto' (default) picks one from the shape (devkit_frame_overview lists LUT-shaped textures). flipY when green increases from the bottom row up. Input point (r, g, b) / (N - 1) is in the LUT's own coordinates, whatever encoding the game uses (often log, PQ or gamma), so the numbers describe the LUT, not display light. Returns size, format, srgbFormat; corners (black, red, green, blue, yellow, magenta, cyan, white: a primary at the wrong corner means the layout or flipY is wrong); neutralAxis (output along (i, i, i)) and whether each channel is monotonic there; identityDeviation (|output - input| per channel, mean and max, p99 of the per-point maximum, and the worst point; for sRGB formats measured on the stored, encoded values) and isIdentity (max within 1.5/255); outputRange, valuesAboveOne, nonFiniteValues and allZero (all zero usually means the LUT is built later in the frame or its texture is reused after the LUT pass: read it from a pass that samples it, or with another snapshot). outputPath (absolute .csv) writes every lattice point (indices, input, output as read). preferClone reads a mod's active clone. 3D LUTs on D3D10/11/12, Vulkan and OpenGL; strips on every API.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"resourceViewHandle", MakeFlexibleHandleProperty()},
+                    {"layout", {.types = {"string"}, .enum_values = {"auto", "3d", "strip_x", "strip_y"}}},
+                    {"flipY", {.types = {"boolean"}}},
+                    {"outputPath", {.types = {"string"}}},
+                    {"preferClone", {.types = {"boolean"}}},
+                },
+                .required = {"resourceViewHandle"},
+            },
+        },
+    },
+    {
         "devkit_set_resource_clone",
         {
             .title = "Set Resource Clone",
