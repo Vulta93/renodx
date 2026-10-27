@@ -8,12 +8,15 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <limits>
 #include <optional>
 #include <ranges>
 #include <shared_mutex>
 #include <sstream>
 #include <type_traits>
 #include <utility>
+
+#include <windows.h>
 
 #include <include/reshade.hpp>
 
@@ -892,6 +895,30 @@ inline bool IsFullSubresourceUpdate(
          && static_cast<uint32_t>(box->back - box->front) == depth;
 }
 
+// Upload pointers come with a pitch but no byte count, and some games (Gujian 3) pass a
+// slice pitch larger than their buffer (D3D11 ignores SysMemSlicePitch for 2D textures).
+// Hash an upload only when every byte of the pitch-derived size is committed and readable.
+// This prevents the crash only: when the memory past such a buffer is readable, the hash
+// still covers those extra bytes and can differ between runs.
+inline bool IsReadableMemory(const void* data, size_t size) {
+  if (data == nullptr || size == 0u) return false;
+  const auto start = reinterpret_cast<uintptr_t>(data);
+  if (size > std::numeric_limits<uintptr_t>::max() - start) return false;
+  const uintptr_t end = start + size;
+  uintptr_t cursor = start;
+  while (cursor < end) {
+    MEMORY_BASIC_INFORMATION info = {};
+    if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0u) return false;
+    if (info.State != MEM_COMMIT) return false;
+    if ((info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) return false;
+    constexpr DWORD READABLE_PROTECTION = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+                                          | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((info.Protect & READABLE_PROTECTION) == 0u) return false;
+    cursor = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+  }
+  return true;
+}
+
 inline std::optional<ResourceUploadSignature> BuildUploadSignature(
     const reshade::api::resource_desc& desc,
     const reshade::api::subresource_data& data,
@@ -917,6 +944,7 @@ inline std::optional<ResourceUploadSignature> BuildUploadSignature(
                                ? data.slice_pitch
                                : reshade::api::format_slice_pitch(desc.texture.format, row_pitch, height);
   if (slice_pitch == 0u) return std::nullopt;
+  if (!IsReadableMemory(data.data, slice_pitch)) return std::nullopt;
 
   return ResourceUploadSignature{
       .source = source,

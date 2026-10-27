@@ -428,6 +428,7 @@ inline std::uint64_t RecordObservation(
 
   const auto source_size = static_cast<std::uint64_t>(slice_pitch);
   const auto* bytes = static_cast<const std::uint8_t*>(source_data.data);
+  if (!renodx::utils::resource::IsReadableMemory(bytes, static_cast<std::size_t>(source_size))) return 0u;
   const auto crc32 = renodx::utils::hash::ComputeCRC32(bytes, static_cast<std::size_t>(source_size));
 
   std::unique_lock lock(device_data->mutex);
