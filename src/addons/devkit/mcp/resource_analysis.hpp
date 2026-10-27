@@ -875,6 +875,16 @@ inline void EncodePreviewPixel(
     };
   }
 
+  // ReShade reads R9G9B9E5 back on OpenGL as GL_RGBA with GL_UNSIGNED_INT_5_9_9_9_REV, a pairing the GL spec only
+  // allows with GL_RGB, so the readback would hold whatever memory the failed glGetTexImage left behind.
+  if (device->get_api() == reshade::api::device_api::opengl
+      && reshade::api::format_to_default_typed(target.resolved_resource_desc.texture.format) == reshade::api::format::r9g9b9e5) {
+    return ToolResult{
+        .text = "R9G9B9E5 textures cannot be read back on OpenGL.",
+        .structured_content = json{{"error", "R9G9B9E5 textures cannot be read back on OpenGL."}},
+        .is_error = true,
+    };
+  }
   if (target.resolved_resource_desc.type != reshade::api::resource_type::texture_2d
       && target.resolved_resource_desc.type != reshade::api::resource_type::surface) {
     return ToolResult{
@@ -1137,7 +1147,8 @@ inline void EncodePreviewPixel(
     uint64_t pixels_any_above_two = 0u;
     uint64_t pixels_any_above_four = 0u;
     bool supported_format = true;
-    // One- and two-channel formats decode into R (and G) with B = 0, so display light and colour make no sense there.
+    // One- and two-channel formats decode into R (and G) with B = 0, so display light, colour and the tone curve's
+    // luminance make no sense there.
     bool signal_without_rgb = false;
     std::vector<std::uint8_t> preview_pixels;
     std::vector<std::uint8_t> raw_png_pixels;
@@ -1191,7 +1202,7 @@ inline void EncodePreviewPixel(
           supported_format = false;
           break;
         }
-        if (signal != Signal::RAW && decoded_channel_count < 3u) {
+        if ((signal != Signal::RAW || pixel_luminance != nullptr) && decoded_channel_count < 3u) {
           signal_without_rgb = true;
           break;
         }
@@ -1317,10 +1328,10 @@ inline void EncodePreviewPixel(
       device->unmap_texture_region(intermediate, 0);
       const auto error = (supported_format
                               ? std::format(
-                                    "Format {} has fewer than three channels, so signal '{}' (nits and colour) does not apply; "
-                                    "analyze it without a signal and read channels.r (and channels.g).",
-                                    FormatFormat(context, analysis_format),
-                                    GetSignalName(signal))
+                                    "Format {} has fewer than three channels, so luminance-based results (signal nits and colour, the "
+                                    "tone curve) do not apply; analyze it with signal 'raw' and read channels.r (and channels.g), or "
+                                    "give the tone curve another inputSlot.",
+                                    FormatFormat(context, analysis_format))
                               : std::format("Readback is not implemented for format {}.", FormatFormat(context, analysis_format)));
       tool_result = ToolResult{
           .text = error,
@@ -1712,11 +1723,14 @@ inline constexpr std::uint32_t MAX_MULTI_FRAME_WAIT_SECONDS = 180u;
 
 // Headline numbers kept per frame of a multi-frame analysis, by JSON pointer into that frame's analysis. Missing or null
 // ones are left out (nits and colour need a signal).
-inline constexpr std::array<std::pair<std::string_view, std::string_view>, 15> FRAME_METRICS = {{
+inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> FRAME_METRICS = {{
     {"luminanceMean", "/luminance/mean"},
     {"luminanceMax", "/luminance/max"},
     {"nanRatio", "/nanPixels/ratio"},
     {"negativeRatio", "/pixelsAnyNegative/ratio"},
+    // One- and two-channel formats (an exposure value, for example) are read from channels r and g.
+    {"rMean", "/channels/r/mean"},
+    {"gMean", "/channels/g/mean"},
     {"nitsMean", "/nits/luminance/mean"},
     {"nitsMax", "/nits/luminance/max"},
     {"nitsP50", "/nits/luminancePercentiles/p50"},

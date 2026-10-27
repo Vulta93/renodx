@@ -553,7 +553,9 @@ The PNG is for quick visual inspection, not for HDR truth.
 R11G11B10 float, R9G9B9E5, RGBA16 UNORM and float, RGBA32 float, and the one- and two-channel R8, R16 UNORM, R16 float,
 R32 float, R8G8, R16G16 UNORM/float and R32G32 float (for example a 1x1 auto-exposure texture). One- and two-channel
 values land in `channels.r` (and `channels.g`) with B = 0, so the luminance fields mean nothing there and a `signal`
-is refused. Depth formats are not read. `devkit_watch_region` reads fewer formats (see its limits below).
+is refused (with `frames`, `rMean` and `gMean` carry them per frame). Depth views (D16/D24/D32) are not read; a
+depth buffer seen through its R32_FLOAT or R16_UNORM shader view decodes as one channel. R9G9B9E5 is refused on OpenGL
+(ReShade's GL readback of it is not valid). `devkit_watch_region` reads fewer formats (see its limits below).
 
 ### Regions and nits
 
