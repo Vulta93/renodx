@@ -15,6 +15,7 @@
 #include <exception>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -2444,6 +2445,9 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   const auto resource_view_handle = resource_handle::GetRequired(arguments, "resourceViewHandle");
   const auto device_index = context.resolve_device_index(arguments);
   const auto output_path_value = mcp_arguments::GetOptional<std::string>(arguments, "outputPath").value_or("");
+  // A .json outputPath writes the finished result (frames and A/B summaries included) instead of an image, so two runs can
+  // be compared outside the game; it is the one output allowed with frames and abShaderHash.
+  const bool json_output = (std::filesystem::path(output_path_value).extension() == L".json");
   const auto preview_mode_value = mcp_arguments::GetOptional<std::string>(arguments, "previewMode").value_or("clamped");
   const auto preview_mode = internal::ParsePreviewMode(preview_mode_value);
   const auto prefer_clone = mcp_arguments::GetOptional<bool>(arguments, "preferClone").value_or(false);
@@ -2461,8 +2465,8 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   if (frames > 1u && measure_point != "present") {
     throw std::runtime_error("frames above 1 needs measurePoint 'present'.");
   }
-  if (frames > 1u && !output_path_value.empty()) {
-    throw std::runtime_error("frames above 1 cannot write outputPath.");
+  if (frames > 1u && !output_path_value.empty() && !json_output) {
+    throw std::runtime_error("frames above 1 can only write a .json outputPath.");
   }
   std::optional<std::uint32_t> ab_shader_hash = std::nullopt;
   if (arguments.contains("abShaderHash") && !arguments["abShaderHash"].is_null()) {
@@ -2476,12 +2480,19 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
   if (!ab_shader_hash.has_value() && (arguments.contains("abSourceA") || arguments.contains("abSourceB"))) {
     throw std::runtime_error("abSourceA and abSourceB need abShaderHash.");
   }
-  if (ab_shader_hash.has_value() && (measure_point != "present" || !output_path_value.empty())) {
-    throw std::runtime_error("abShaderHash needs measurePoint 'present' and no outputPath.");
+  if (ab_shader_hash.has_value() && (measure_point != "present" || (!output_path_value.empty() && !json_output))) {
+    throw std::runtime_error("abShaderHash needs measurePoint 'present' and no image outputPath (a .json one is allowed).");
   }
 
+  std::optional<std::filesystem::path> json_output_path;
   std::optional<std::filesystem::path> output_path = std::nullopt;
-  if (!output_path_value.empty()) {
+  if (json_output) {
+    const auto requested_path = std::filesystem::path(output_path_value);
+    if (!requested_path.is_absolute()) {
+      throw std::runtime_error("outputPath must be an absolute path.");
+    }
+    json_output_path = requested_path.lexically_normal();
+  } else if (!output_path_value.empty()) {
     auto requested_path = std::filesystem::path(output_path_value);
     if (!requested_path.is_absolute()) {
       throw std::runtime_error("outputPath must be an absolute path.");
@@ -2564,8 +2575,23 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
     };
   }
 
+  const auto finish = [&json_output_path](ToolResult finished) {
+    if (!json_output_path.has_value() || finished.is_error) return finished;
+    std::ofstream json_file(json_output_path.value(), std::ios::trunc);
+    json_file << finished.structured_content.dump(2);
+    json_file.close();
+    if (json_file) {
+      finished.structured_content["jsonPath"] = json_output_path->string();
+      finished.text += std::format(" Wrote the result to '{}'.", json_output_path->string());
+    } else {
+      finished.structured_content["jsonError"] = std::format("Failed to write '{}'.", json_output_path->string());
+      finished.text += std::format(" Failed to write '{}'.", json_output_path->string());
+    }
+    return finished;
+  };
+
   auto result = std::move(request->result.value());
-  if (request->frames == 1u || result.is_error) return result;
+  if (request->frames == 1u || result.is_error) return finish(std::move(result));
 
   std::vector<json> frame_samples;
   std::array<std::vector<json>, 2> side_samples;
@@ -2594,7 +2620,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
     result.structured_content["frames"]["summary"] = SummarizeFrameSamples(frame_samples);
     result.structured_content["frames"]["samples"] = std::move(frame_samples);
     result.text += std::format(" Measured {} frames, one per present; per-frame headline numbers and their summary are in frames.", frames);
-    return result;
+    return finish(std::move(result));
   }
   result.structured_content["frames"]["samples"] = std::move(frame_samples);
 
@@ -2631,7 +2657,7 @@ inline constexpr std::array<std::pair<std::string_view, std::string_view>, 17> F
       ab_sources[1],
       request->ab_restored_source,
       (request->ab_restore_note.empty() ? "" : std::format(" {}", request->ab_restore_note)));
-  return result;
+  return finish(std::move(result));
 }
 
 // The effective transfer of one pass: its input and output read at the same present, paired pixel by pixel, binned by
