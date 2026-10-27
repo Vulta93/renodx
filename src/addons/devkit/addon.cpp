@@ -3685,13 +3685,7 @@ void CancelPendingLiveShaderRequest(
           .text = std::get<std::string>(decompilation),
       };
     }
-    if (std::holds_alternative<std::exception>(decompilation)) {
-      return devkit_shader_inspection::TextSection{
-          .available = false,
-          .error = std::get<std::exception>(decompilation).what(),
-      };
-    }
-
+    // A cached failure is tried again: its cause (no tools path set, a missing decompiler DLL) may be fixed by now.
     shader_data = iterator->second.shader_data;
   }
 
@@ -3722,10 +3716,10 @@ void CancelPendingLiveShaderRequest(
   if (shader_details->shader_data.empty() && !shader_data.empty()) {
     shader_details->shader_data = shader_data;
   }
-  if (std::holds_alternative<std::nullopt_t>(shader_details->disassembly)) {
+  if (!std::holds_alternative<std::string>(shader_details->disassembly)) {
     shader_details->disassembly = computed_sections.disassembly;
   }
-  if (std::holds_alternative<std::nullopt_t>(shader_details->decompilation)) {
+  if (!std::holds_alternative<std::string>(shader_details->decompilation)) {
     shader_details->decompilation = computed_sections.decompilation;
   }
   if (std::holds_alternative<std::string>(shader_details->decompilation)) {
@@ -4007,30 +4001,49 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
 
   std::optional<renodx::utils::shader::compiler::directx::DxilProgramVersion> program_version;
   {
+    // The list lock keeps device_data->device valid through the bytecode load below.
     std::shared_lock list_lock(device_data_list_mutex);
     if (device_index >= device_data_list.size()) {
       return make_error(std::format("Device #{} is not available.", device_index));
     }
     auto* device_data = device_data_list[device_index];
-    std::shared_lock device_lock(device_data->mutex);
-    const auto iterator = device_data->shader_details.find(shader_hash);
-    if (iterator == device_data->shader_details.end()) {
-      return make_error(std::format("Shader {} is not tracked on device #{}.", FormatShaderHash(shader_hash), device_index));
+    std::vector<uint8_t> shader_data;
+    {
+      std::shared_lock device_lock(device_data->mutex);
+      const auto iterator = device_data->shader_details.find(shader_hash);
+      if (iterator == device_data->shader_details.end()) {
+        return make_error(std::format("Shader {} is not tracked on device #{}.", FormatShaderHash(shader_hash), device_index));
+      }
+      program_version = iterator->second.program_version;
+      shader_data = iterator->second.shader_data;
     }
-    program_version = iterator->second.program_version;
+    // OnBindPipeline decodes the shader model only while a snapshot is captured; read it from the bytecode otherwise.
+    if (!program_version.has_value() && renodx::utils::device::IsDirectX(device_data->device)) {
+      try {
+        if (shader_data.empty()) {
+          shader_data = LoadShaderDataForShaderHash(device_data->device, shader_hash);
+        }
+        program_version = renodx::utils::shader::compiler::directx::DecodeShaderVersion(shader_data);
+      } catch (const std::exception& exception) {
+        return make_error(std::format(
+            "The shader model of {} could not be read from its bytecode: {}",
+            FormatShaderHash(shader_hash),
+            exception.what()));
+      }
+    }
   }
   // The live-shader loader compiles <hash>.<stage>_<major>_<minor>.hlsl with fxc, which takes shader model 4 and 5;
   // DXIL (SM6) decompilations and SPIR-V/GLSL sources are not built to compile back.
   if (!program_version.has_value()) {
     return make_error(std::format(
-        "The shader model of {} is not known yet (it is decoded when a DirectX pipeline with it is bound; OpenGL and "
-        "Vulkan shaders have none). Let the game draw with it, then try again.",
+        "Shader {} is not a DirectX shader (OpenGL and Vulkan shaders have no shader model); stubs are written for "
+        "DXBC shader model 4 and 5 only.",
         FormatShaderHash(shader_hash)));
   }
   if (program_version->GetMajor() < 4 || program_version->GetMajor() > 5) {
     return make_error(std::format(
         "Shader {} is shader model {}.{}; stubs are written for DXBC shader model 4 and 5 (D3D10/11, D3D12 SM5) only. "
-        "devkit_get_shader still shows its decompilation.",
+        "devkit_get_shader still shows its disassembly.",
         FormatShaderHash(shader_hash),
         program_version->GetMajor(),
         program_version->GetMinor()));

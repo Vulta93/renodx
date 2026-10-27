@@ -135,14 +135,14 @@ still appears as a writer, with no change to the region.
 `devkit_write_shader_stub {shaderHash, outputDirectory?}` writes a shader's decompilation (the text `devkit_get_shader`
 shows) to `0x<HASH>.<stage>_<major>_<minor>.hlsl`, the name the live-shader loader parses, so a replacement starts from
 the shader's own signature and constant buffer layout instead of a hand-written one. It covers DXBC shader model 4 and 5
-(D3D10/11, D3D12 SM5; SM 5.1 stubs are untested and may lose register spaces) once the shader has been bound, and refuses
-when the folder already holds a file for that hash. The default folder is the dump folder, outside the default live
-folder (refused if the live path was set to a folder containing it). The edit loop: write the stub, check it against the
-original (copy it into the live folder, `devkit_load_live_shaders`, then `devkit_analyze_resource` on a small region of
-the target the shader writes, with `abShaderHash`, `abSourceA: original`, `abSourceB: file`, after an A-against-A run
-for the noise floor: overlapping ranges mean no measurable difference in the region's statistics, not a pixel-exact
-match), then replace a constant such as `cb0[3].x` with a number, reload and compare again. That answers "what does this
-constant do" without a constant override tool.
+(D3D10/11, D3D12 SM5; SM 5.1 stubs are untested and may lose register spaces), reading the shader model from the
+bytecode, and refuses when the folder already holds a file for that hash. The default folder is the dump folder, outside
+the default live folder (refused if the live path was set to a folder containing it). The edit loop: write the stub,
+check it against the original (copy it into the live folder, `devkit_load_live_shaders`, then `devkit_analyze_resource`
+on a small region of the target the shader writes, with `abShaderHash`, `abSourceA: original`, `abSourceB: file`, after
+an A-against-A run for the noise floor: overlapping ranges mean no measurable difference in the region's statistics, not
+a pixel-exact match), then replace a constant such as `cb0[3].x` with a number, reload and compare again. That answers
+"what does this constant do" without a constant override tool.
 
 Default devkit folder layout under the ReShade base path:
 
@@ -464,7 +464,12 @@ If it is missing, bootstrap the repo tools from the repo root before using the d
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-dev-env.ps1 -Install
 ```
 
-That installs `cmd_Decompiler.exe` into `.\bin`. For the full tool bootstrap and the remaining optional reverse-engineering binaries, see `docs/CONTRIBUTING.md`.
+That installs `cmd_Decompiler.exe` and the `d3dcompiler_46.dll` it imports into `.\bin` (Windows does not ship that
+DLL version; without it the decompiler exits with `0xC0000135`, "DLL not found", and every DXBC decompilation fails).
+A `bin` set up before the script copied the DLL holds only the `.exe`, and the script cannot read that `.exe`'s version
+to repair it: delete `bin\cmd_Decompiler.exe`, then run the script with `-Install`. Point `devkit_set_tools_path` at
+`bin` once per game; a decompilation that failed before is tried again on the next `devkit_get_shader` or
+`devkit_write_shader_stub` call. For the full tool bootstrap and the remaining optional reverse-engineering binaries, see `docs/CONTRIBUTING.md`.
 
 Devkit MCP can already disassemble tracked DirectX shaders. Decompilation is best-effort: DXBC SM4/5 shaders use `cmd_Decompiler.exe` from the configured tools path, while DXIL SM6 shaders use the internal DXC decompiler path. The external tools in `.\bin` are still useful when you want standalone files on disk or alternate reverse-engineering workflows.
 
