@@ -156,6 +156,9 @@ std::atomic_bool shaders_pane_show_compute_shaders = true;
 // docs/DEVKIT_MCP.md): adds copy-source usage to the game's Vulkan images at creation, so devkit_watch_region can copy
 // them.
 std::atomic_bool watch_region_copy_source_usage = true;
+// On by default (Gaetano, 2026-10-28; GPU cost not measured yet): adds copy-source usage to the game's Vulkan uniform
+// buffers at creation, so snapshots can copy their values for devkit_get_draw.
+std::atomic_bool constant_buffer_copy_source_usage = true;
 
 // MCP waitForKey: the virtual key the one waiting tool call waits for (0 when none), and the presses OnReShadePresent saw
 // for it.
@@ -10784,6 +10787,8 @@ struct SettingsDeviceOption {
     DrawSettingDecimalTextbox("FPS Limit", "FPSLimit", &renodx::utils::swapchain::fps_limit);
     DrawSettingBoolCheckbox("Watch Region: Copyable Vulkan Images (restart)", "WatchRegionCopySourceUsage", &watch_region_copy_source_usage);
     ImGui::SetItemTooltip("Adds copy-source usage to the game's Vulkan images so devkit_watch_region can measure them. Only images created after it is enabled: restart the game.");
+    DrawSettingBoolCheckbox("Snapshot: Copyable Vulkan Uniform Buffers (restart)", "ConstantBufferCopySourceUsage", &constant_buffer_copy_source_usage);
+    ImGui::SetItemTooltip("Adds copy-source usage to the game's Vulkan uniform buffers so snapshots can copy their values for devkit_get_draw. Only buffers created after it is enabled: restart the game.");
 
     EndSettingsSection();
   }
@@ -11751,6 +11756,7 @@ void InitializeUserSettings() {
            {"TraceConstantBuffers", &renodx::utils::constants::capture_constant_buffers},
            {"SnapshotTraceWithSnapshot", &snapshot_trace_with_snapshot},
            {"WatchRegionCopySourceUsage", &watch_region_copy_source_usage},
+           {"ConstantBufferCopySourceUsage", &constant_buffer_copy_source_usage},
            {"SnapshotPaneShowVertexShaders", &snapshot_pane_show_vertex_shaders},
            {"SnapshotPaneShowPixelShaders", &snapshot_pane_show_pixel_shaders},
            {"SnapshotPaneShowComputeShaders", &snapshot_pane_show_compute_shaders},
@@ -12260,25 +12266,33 @@ void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
   devkit_watch_region::OnEffectRuntimeDestroyed(&device_data->watch_region_watcher, runtime);
 }
 
-// Vulkan images can only be copied with VK_IMAGE_USAGE_TRANSFER_SRC_BIT, and devkit_watch_region measures by copying.
-// With the setting (on by default) the flag is added to every image the game creates from then on. Same rules as the Vulkan
-// clone targets in utils/resource_upgrade.hpp OnCreateResource: shared and sparse images, and formats without copy
-// support, are left alone. ReShade hands the same desc to every add-on's handler and RenoDX resource upgrades only add
-// usage bits, so the flag survives whatever the handler order.
+// Vulkan images and buffers can only be copied with the TRANSFER_SRC usage bit. devkit_watch_region measures images by
+// copying them, and snapshots copy uniform buffers for devkit_get_draw's constant values. With each setting (both on by
+// default) the flag is added to every image, or every buffer with uniform usage, the game creates from then on. Same rules
+// as the Vulkan clone targets in utils/resource_upgrade.hpp OnCreateResource: shared and sparse resources, and image
+// formats without copy support, are left alone. ReShade hands the same desc to every add-on's handler and RenoDX resource
+// upgrades only add usage bits, so the flag survives whatever the handler order.
 bool OnCreateResource(
     reshade::api::device* device,
     reshade::api::resource_desc& desc,
     reshade::api::subresource_data* /*initial_data*/,
     reshade::api::resource_usage /*initial_state*/) {
-  if (!watch_region_copy_source_usage.load(std::memory_order_relaxed)) return false;
   if (device->get_api() != reshade::api::device_api::vulkan) return false;
-  if (desc.type == reshade::api::resource_type::buffer || desc.type == reshade::api::resource_type::unknown) return false;
+  if (desc.type == reshade::api::resource_type::unknown) return false;
   constexpr auto special_flags = reshade::api::resource_flags::shared
                                  | reshade::api::resource_flags::shared_nt_handle
                                  | reshade::api::resource_flags::sparse_binding;
   if (renodx::utils::bitwise::HasAnyFlag(desc.flags, special_flags)
-      || renodx::utils::bitwise::HasAnyFlag(desc.usage, reshade::api::resource_usage::copy_source)
-      || !device->check_format_support(desc.texture.format, reshade::api::resource_usage::copy_source)) {
+      || renodx::utils::bitwise::HasAnyFlag(desc.usage, reshade::api::resource_usage::copy_source)) {
+    return false;
+  }
+  if (desc.type == reshade::api::resource_type::buffer) {
+    if (!constant_buffer_copy_source_usage.load(std::memory_order_relaxed)
+        || !renodx::utils::bitwise::HasAnyFlag(desc.usage, reshade::api::resource_usage::constant_buffer)) {
+      return false;
+    }
+  } else if (!watch_region_copy_source_usage.load(std::memory_order_relaxed)
+             || !device->check_format_support(desc.texture.format, reshade::api::resource_usage::copy_source)) {
     return false;
   }
   desc.usage = renodx::utils::bitwise::SetFlag(desc.usage, reshade::api::resource_usage::copy_source);
