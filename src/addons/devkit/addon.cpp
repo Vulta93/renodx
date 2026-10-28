@@ -2965,6 +2965,7 @@ std::vector<DeviceData*> device_data_list;
       .device_handle = FormatPointer(device),
       .api = StreamToString(device->get_api()),
       .is_d3d9_ex = device_data->is_d3d9_ex,
+      .is_d3d9_pure_device = device_data->is_d3d9_pure_device,
       .is_display_proxy = device_data->is_display_proxy,
       .tracked_shaders = device_data->shader_details.size(),
       .captured_draws = device_data->draw_details_list.size(),
@@ -5960,6 +5961,11 @@ void OnInitDevice(reshade::api::device* device) {
     if (SUCCEEDED(reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(device->get_native()))
                       ->GetCreationParameters(&creation_parameters))) {
       device_data->is_d3d9_pure_device = (creation_parameters.BehaviorFlags & D3DCREATE_PUREDEVICE) != 0u;
+    }
+    if (device_data->is_d3d9_pure_device) {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "devkit: D3D9 device created with D3DCREATE_PUREDEVICE: snapshots read no fixed-function stages, d3d9State or device constants.");
     }
   }
   device_data->watch_region_watcher.begin_linked_snapshot = [device_data]() -> std::optional<uint64_t> {

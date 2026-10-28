@@ -347,7 +347,8 @@ stages clamp at white (1.0) before blending, and `add_signed`/`subtract` clamp a
 reproduces the stages in float has to clamp the same way where the game relies on it, or decide on purpose not to.
 
 The stages are read only on draws without a game pixel shader, only while a snapshot records, and not on a pure device
-(created with `D3DCREATE_PUREDEVICE`), whose `Get*` state calls are not reliable.
+(created with `D3DCREATE_PUREDEVICE`), whose `Get*` state calls are not reliable. `devkit_status` reports such a device
+with `isD3D9PureDevice: true`, and `ReShade.log` has a warning from the Devkit when it is created.
 
 ### D3D9 porting state (`d3d9State` in `devkit_get_draw`)
 

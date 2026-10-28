@@ -88,6 +88,7 @@ struct DeviceSummary {
   std::string device_handle;
   std::string api;
   bool is_d3d9_ex = false;
+  bool is_d3d9_pure_device = false;
   bool is_display_proxy = false;
   std::size_t tracked_shaders = 0u;
   std::size_t captured_draws = 0u;
@@ -121,6 +122,9 @@ inline void to_json(json& j, const DeviceSummary& value) {
       {"snapshotQueued", value.snapshot_queued},
       {"snapshotActive", value.snapshot_active},
   };
+  if (value.is_d3d9_pure_device) {
+    j["isD3D9PureDevice"] = true;
+  }
   if (value.primary_swapchain.has_value()) {
     j["primarySwapchain"] = value.primary_swapchain.value();
   }
