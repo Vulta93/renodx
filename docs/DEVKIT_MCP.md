@@ -349,16 +349,21 @@ reproduces the stages in float has to clamp the same way where the game relies o
 The stages are read only on draws without a game pixel shader and only while a snapshot records. Every read checks its
 result: when one fails, `fixedFunction` is left out rather than filled with zeros.
 
-Pure devices (created with `D3DCREATE_PUREDEVICE`): Direct3D documents no `Get*` state calls for them, but the current
-D3D9 runtime answers them, so the Devkit reads them like any other device; a read the runtime refuses leaves its field out.
-Verified in Prince of Persia: The Sands of Time (GOG, whose wrapper creates a pure device): the blend state read per draw
-matched the frame (opaque scene, unblended glow downsample, ONE + ONE glow add). `devkit_status` reports such a device
-with `isD3D9PureDevice: true`, and `ReShade.log` has a warning from the Devkit when it is created.
+Pure devices (created with `D3DCREATE_PUREDEVICE`): Direct3D documents no `Get*` state calls for them, so a runtime may
+refuse them, or answer with values it does not track, which no result check can detect. In Prince of Persia: The Sands of
+Time (GOG, whose wrapper creates a pure device; Windows 11, 2026-10-28) every read answered correctly: blend state per
+draw matched the frame (opaque scene, unblended glow downsample, ONE + ONE glow add), the device-read c0 of the glow add
+equalled the value the game pushed in the same frame (0.50196), the texture stages varied per draw (`modulate2x` scene,
+`modulate` of replicated alphas for a multiplicative shadow, alpha-blended HUD) and every filtered sampler had a texture
+bound. So the Devkit reads pure devices like any other; a read the runtime refuses leaves its field (or entry) out. On
+another runtime or wrapper, cross-check one value against a pushed one before relying on it. `devkit_status` reports such
+a device with `isD3D9PureDevice: true`, and `ReShade.log` has a warning from the Devkit when it is created.
 
 ### D3D9 porting state (`d3d9State` in `devkit_get_draw`)
 
 What a port of a D3D9 draw has to reproduce beyond its shaders, read from the device at every recorded D3D9 draw. Default
-values, and values whose read failed, are left out, so most draws carry only a few fields:
+values are left out, and so is an entry (a transform, a bump matrix, a sampler) when one of its reads fails, so most draws
+carry only a few fields:
 
 - `fvfHex` (the FVF code, when not 0) and `vertexElements` (the vertex declaration: `stream`, `offset`, `type` as the
   D3DDECLTYPE name such as `float3` or `d3dcolor`, `usage` as the D3DDECLUSAGE name such as `position`, `texcoord`,

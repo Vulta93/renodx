@@ -646,8 +646,8 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   HWND primary_swapchain_hwnd = nullptr;
   bool primary_swapchain_is_flip = false;
   bool is_d3d9_ex = false;
-  // D3DCREATE_PUREDEVICE, reported by devkit_status: Direct3D documents no Get* state calls for it, but the current runtime
-  // answers them (verified in Prince of Persia: The Sands of Time), so the snapshot reads its state like any other's.
+  // D3DCREATE_PUREDEVICE, reported by devkit_status: Direct3D documents no Get* state calls for it, but in Prince of
+  // Persia: The Sands of Time (GOG, Windows 11) the runtime answered them correctly, so the snapshot reads its state too.
   bool is_d3d9_pure_device = false;
   // The D3D11 device a RenoDX Display Proxy presents the game's frames on. It is listed only for the measuring tools
   // (devkit_analyze_resource, devkit_watch_region): no snapshots, shader tracking, live shaders or clones.
@@ -7218,7 +7218,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         // D3D9 has at most eight texture blending stages.
         for (DWORD stage = 0u; stage < 8u && fixed_function_known; ++stage) {
           const DWORD color_op = read_stage_state(stage, D3DTSS_COLOROP);
-          if (color_op == D3DTOP_DISABLE) break;
+          if (!fixed_function_known || color_op == D3DTOP_DISABLE) break;
           fixed_function.stages.push_back(D3D9TextureStage{
               .stage = stage,
               .color_op = color_op,
@@ -7244,6 +7244,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         Microsoft::WRL::ComPtr<IDirect3DPixelShader9> device_pixel_shader;
         if (SUCCEEDED(native_device->GetPixelShader(&device_pixel_shader))) {
           fixed_function.device_pixel_shader_bound = (device_pixel_shader != nullptr);
+        } else {
+          fixed_function_known = false;
         }
         if (fixed_function_known) {
           draw_details.d3d9_fixed_function = std::move(fixed_function);
@@ -7279,11 +7281,16 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         constexpr std::array<D3DTEXTURESTAGESTATETYPE, 4> BUMP_MATRIX_STATES = {
             D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11};
         // A vertex shader ignores D3DTSS_TEXCOORDINDEX and the texture matrices; D3DTTFF_PROJECTED still applies to ps_1_x.
-        // The device's binding decides, since any vertex shader (an add-on's, or one the snapshot did not identify) does.
+        // The device's binding decides, since any vertex shader (an add-on's, or one the snapshot did not identify) does;
+        // when that read fails, the vertex shader the snapshot recorded for the draw.
         Microsoft::WRL::ComPtr<IDirect3DVertexShader9> device_vertex_shader;
         bool vertex_shader_bound = false;
         if (SUCCEEDED(native_device->GetVertexShader(&device_vertex_shader))) {
           vertex_shader_bound = (device_vertex_shader != nullptr);
+        } else {
+          vertex_shader_bound = std::ranges::any_of(get_bound_shaders().shaders, [](const auto& bound) {
+            return bound.stage == reshade::api::pipeline_stage::vertex_shader;
+          });
         }
         for (DWORD stage = 0u; stage < 8u; ++stage) {
           if (!vertex_shader_bound) {
@@ -7298,11 +7305,12 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
               && transform_flags != D3DTTFF_DISABLE) {
             D3D9DrawState::TextureTransform transform = {.stage = stage, .flags = transform_flags};
             D3DMATRIX matrix = {};
-            if (!vertex_shader_bound
-                && SUCCEEDED(native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &matrix))) {
+            if (vertex_shader_bound) {
+              state.texture_transforms.push_back(transform);
+            } else if (SUCCEEDED(native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &matrix))) {
               transform.matrix = matrix;
+              state.texture_transforms.push_back(transform);
             }
-            state.texture_transforms.push_back(transform);
           }
           std::array<DWORD, BUMP_MATRIX_STATES.size()> bump_matrix = {};
           bool bump_matrix_known = true;
