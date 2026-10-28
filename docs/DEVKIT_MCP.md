@@ -408,6 +408,22 @@ It answers "is my shader live and drawing here?" without reading `ReShade.log`. 
 of replacements (418 in Gears of War: E-Day). `drawnOnly: true` keeps only the hashes the snapshot drew; `totalRegistered`,
 `totalDrawn` and `totalFiltered` give the counts before paging.
 
+### Auto Dump (`devkit_auto_dump`)
+
+For long playtests: with Auto Dump on (`action: enable`, or the overlay's Shaders > Auto Dump), every shader the game
+creates is dumped to the Devkit's dump folder (`renodx-dev\dump` next to the game) at the first frame after it appears,
+on every API (D3D9 to D3D12 bytecode, Vulkan SPIR-V, OpenGL source). Shaders already in the folder when the game starts
+are not dumped again. The setting is saved in `ReShade.ini` (`[renodx-dev] AutoDump`), so it stays on across launches.
+A frame on which the game created no new shader costs one counter read.
+
+Each dump writes a line to `ReShade.log`: `devkit: new shader 0x... dumped as <file>`, as a warning ending in
+`(unported)` when nothing replaced the shader: no game mod replacement (compile-time or runtime) and no live file the
+Devkit compiled. After a playthrough the warnings are the shaders the mod does not cover yet. `action: status` reports
+the same for this session: `dumpedCount`, `unportedCount`, `pendingCount` (seen but not yet dumped, while Auto Dump is
+off), and the `unported` and `dumped` lists (`shaderHash`, `file`, `replaced`), newest first, at most 64 each.
+Replacement is judged when the shader is dumped, so a live file added later does not change an earlier entry. Unlike
+`devkit_shader_coverage`, which counts the draws of replaced shaders, this lists shaders by creation, drawn or not.
+
 ### Shader coverage (`devkit_shader_coverage`)
 
 A snapshot shows one frame; coverage answers "which of my replacements did this play session never exercise?".

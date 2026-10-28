@@ -152,6 +152,10 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                               const renodx::utils::mcp::json& arguments) {
     return live_shaders::HandleSetDrawBypassTool(arguments, build_live_shaders_tool_context());
   });
+  register_tool("devkit_auto_dump", [build_live_shaders_tool_context = context.build_live_shaders_tool_context](
+                                        const renodx::utils::mcp::json& arguments) {
+    return live_shaders::HandleAutoDumpTool(arguments, build_live_shaders_tool_context());
+  });
   register_tool("devkit_shader_coverage", [build_live_shaders_tool_context = context.build_live_shaders_tool_context](
                                               const renodx::utils::mcp::json& arguments) {
     return live_shaders::HandleShaderCoverageTool(arguments, build_live_shaders_tool_context());

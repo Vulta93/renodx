@@ -1564,6 +1564,15 @@ const std::vector<std::pair<const char*, const char*>> SETTING_NAV_TITLES = {
 };
 
 bool setting_auto_dump = false;
+// Shaders dumped as the game first created them (Auto Dump or Dump Shaders), oldest first, for devkit_auto_dump.
+struct DumpedShaderRecord {
+  uint32_t shader_hash = 0u;
+  std::string file_name;
+  // A game mod's replacement or a live file existed for the hash when it was dumped.
+  bool replaced = false;
+};
+std::mutex dumped_shader_records_mutex;
+std::vector<DumpedShaderRecord> dumped_shader_records;
 bool setting_live_reload = false;
 uint32_t setting_nav_item = 0;
 uint32_t setting_device_proxy_output_mode = 2;
@@ -4317,6 +4326,98 @@ std::vector<LoadedDiskShaderResult> LoadDiskShaders(reshade::api::device* device
   return RunLiveShaderRequestForMcp(device_index, request, "draw bypass");
 }
 
+// Dumps the shaders waiting to be dumped, then logs each one, warning for those nothing replaces (unported), so a long
+// playtest leaves a list in ReShade.log. Callers hold no device lock.
+void DumpPendingShaders() {
+  const auto dumped = renodx::utils::shader::dump::DumpAllPending();
+  if (dumped.empty()) return;
+  std::set<uint32_t> replaced_hashes;
+  {
+    std::shared_lock list_lock(device_data_list_mutex);
+    for (auto* device_data : device_data_list) {
+      if (device_data->is_display_proxy) continue;
+      renodx::utils::shader::ForEachCompileTimeReplacement(device_data->device, [&](uint32_t shader_hash, std::span<const uint8_t> /*bytecode*/) {
+        replaced_hashes.insert(shader_hash);
+      });
+      renodx::utils::shader::ForEachRuntimeReplacement(device_data->device, [&](uint32_t shader_hash, std::span<const uint8_t> /*bytecode*/) {
+        replaced_hashes.insert(shader_hash);
+      });
+      std::shared_lock device_lock(device_data->mutex);
+      for (const auto& [shader_hash, details] : device_data->shader_details) {
+        if (details.HasCompiledDiskShader()) {
+          replaced_hashes.insert(shader_hash);
+        }
+      }
+    }
+  }
+  std::unique_lock records_lock(dumped_shader_records_mutex);
+  for (const auto& [shader_hash, path] : dumped) {
+    const bool replaced = replaced_hashes.contains(shader_hash);
+    auto file_name = renodx::utils::path::ToUtf8(path.filename());
+    reshade::log::message(
+        (replaced ? reshade::log::level::info : reshade::log::level::warning),
+        std::format("devkit: new shader {} dumped as {}{}", FormatShaderHash(shader_hash), file_name, (replaced ? "" : " (unported)")).c_str());
+    dumped_shader_records.push_back({.shader_hash = shader_hash, .file_name = std::move(file_name), .replaced = replaced});
+  }
+}
+
+[[nodiscard]] ToolResult AutoDumpForMcp(std::string_view action) {
+  if (action != "status" && action != "enable" && action != "disable") {
+    return ToolResult{
+        .text = "action must be 'status', 'enable' or 'disable'.",
+        .structured_content = json{{"error", "action must be 'status', 'enable' or 'disable'."}},
+        .is_error = true,
+    };
+  }
+  if (action != "status") {
+    // Plain bool like the overlay's other toggles; present reads it at the next frame.
+    setting_auto_dump = (action == "enable");
+    reshade::set_config_value(nullptr, "renodx-dev", "AutoDump", setting_auto_dump);
+  }
+  // At most this many shaders are listed per group, newest first; the counts are complete.
+  constexpr std::size_t MAX_LISTED = 64u;
+  json unported = json::array();
+  json dumped = json::array();
+  std::size_t unported_count = 0u;
+  std::unique_lock records_lock(dumped_shader_records_mutex);
+  for (const auto& record : std::views::reverse(dumped_shader_records)) {
+    const json entry = {
+        {"shaderHash", FormatShaderHash(record.shader_hash)},
+        {"file", record.file_name},
+        {"replaced", record.replaced},
+    };
+    if (!record.replaced) {
+      ++unported_count;
+      if (unported.size() < MAX_LISTED) {
+        unported.push_back(entry);
+      }
+    }
+    if (dumped.size() < MAX_LISTED) {
+      dumped.push_back(entry);
+    }
+  }
+  const auto pending_count = renodx::utils::shader::dump::GetPendingDumpCount();
+  return ToolResult{
+      .text = std::format(
+          "Auto Dump {}. {} shaders dumped this session, {} of them unported (no game mod replacement and no live file); {} "
+          "waiting to be dumped. Folder: '{}'.",
+          (setting_auto_dump ? "on" : "off"),
+          dumped_shader_records.size(),
+          unported_count,
+          pending_count,
+          renodx::utils::path::ToUtf8(renodx::utils::path::GetDumpOutputPath())),
+      .structured_content = json{
+          {"enabled", setting_auto_dump},
+          {"dumpDirectory", renodx::utils::path::ToUtf8(renodx::utils::path::GetDumpOutputPath())},
+          {"pendingCount", pending_count},
+          {"dumpedCount", dumped_shader_records.size()},
+          {"unportedCount", unported_count},
+          {"unported", std::move(unported)},
+          {"dumped", std::move(dumped)},
+      },
+  };
+}
+
 [[nodiscard]] ToolResult ShaderCoverageForMcp(uint32_t device_index, std::string_view action) {
   const auto make_error = [](const std::string& error) {
     return ToolResult{
@@ -5836,6 +5937,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .set_draw_bypass = SetDrawBypassForMcp,
                                                     .write_shader_stub = WriteShaderStubForMcp,
                                                     .shader_coverage = ShaderCoverageForMcp,
+                                                    .auto_dump = AutoDumpForMcp,
                                                 }; },
       .build_analyze_resource_tool_context = []() { return devkit_resource_analysis::ToolContext{
                                                         .resolve_device_index = BuildResolveDeviceIndexCallback(true),
@@ -8183,12 +8285,14 @@ void RenderMenuBar(reshade::api::device* device, DeviceData* data) {
     ImGui::PopID();
 
     ImGui::PushID("##menu_shaders_auto_dump");
-    ImGui::MenuItem("Auto Dump", "", &setting_auto_dump);
+    if (ImGui::MenuItem("Auto Dump", "", &setting_auto_dump)) {
+      reshade::set_config_value(nullptr, "renodx-dev", "AutoDump", setting_auto_dump);
+    }
     ImGui::PopID();
 
     ImGui::PushID("##menu_shaders_dump");
     if (ImGui::MenuItem(std::format("Dump Shaders ({})", renodx::utils::shader::dump::GetPendingDumpCount()).c_str(), "", false, !setting_auto_dump)) {
-      renodx::utils::shader::dump::DumpAllPending();
+      DumpPendingShaders();
     }
     ImGui::PopID();
 
@@ -11551,6 +11655,7 @@ void InitializeUserSettings() {
       renodx::utils::shader::compiler::vulkan::SetToolsPath(tools_path);
     }
   }
+  reshade::get_config_value(nullptr, "renodx-dev", "AutoDump", setting_auto_dump);
   {
     char temp[256] = "";
     size_t size = 256;
@@ -12211,8 +12316,9 @@ void OnPresent(
     }
   }
 
-  if (setting_auto_dump) {
-    renodx::utils::shader::dump::DumpAllPending();
+  // Nothing to walk on the frames where the game created no new shader.
+  if (setting_auto_dump && renodx::utils::shader::dump::GetPendingDumpCount() != 0u) {
+    DumpPendingShaders();
   }
 
   reshade::api::device* active_snapshot_device = snapshot_device;

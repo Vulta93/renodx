@@ -32,6 +32,7 @@ struct ToolContext {
   std::function<ToolResult(std::uint32_t device_index, std::uint32_t shader_hash, bool bypass_draw)> set_draw_bypass;
   std::function<ToolResult(std::uint32_t device_index, std::uint32_t shader_hash, const std::optional<std::string>& output_directory)> write_shader_stub;
   std::function<ToolResult(std::uint32_t device_index, std::string_view action)> shader_coverage;
+  std::function<ToolResult(std::string_view action)> auto_dump;
 };
 
 inline ToolResult HandleDumpShaderTool(const json& arguments, const ToolContext& context) {
@@ -88,6 +89,14 @@ inline ToolResult HandleSetDrawBypassTool(const json& arguments, const ToolConte
   const auto shader_hash = shader_hash::GetRequired(arguments, "shaderHash");
   const auto bypass_draw = mcp_arguments::GetRequired<bool>(arguments, "bypass");
   return context.set_draw_bypass(context.resolve_device_index(arguments), shader_hash, bypass_draw);
+}
+
+inline ToolResult HandleAutoDumpTool(const json& arguments, const ToolContext& context) {
+  if (!context.auto_dump) {
+    throw std::runtime_error("The live shader tool context is not configured.");
+  }
+
+  return context.auto_dump(mcp_arguments::GetOptional<std::string>(arguments, "action").value_or("status"));
 }
 
 inline ToolResult HandleShaderCoverageTool(const json& arguments, const ToolContext& context) {

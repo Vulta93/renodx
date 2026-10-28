@@ -217,6 +217,18 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_auto_dump",
+        {
+            .title = "Auto Dump",
+            .description = "Dump every shader the game creates to the Devkit's dump folder as it first appears, for long playtests (any API). action 'enable' or 'disable' switches the overlay's Shaders > Auto Dump setting, saved in ReShade.ini as [renodx-dev] AutoDump so it stays on across launches; 'status' (default) only reports. Shaders already in the dump folder at startup are not dumped again. Each dump writes a ReShade.log line, a warning marked '(unported)' when nothing replaced the shader (no game mod replacement and no live file the Devkit compiled), so the log lists what a playthrough found still unported. The report gives enabled, dumpDirectory, pendingCount (seen, not yet dumped), dumpedCount and unportedCount for this session, then unported and dumped (shaderHash, file, replaced), newest first, at most 64 each. Replacement is judged when the shader is dumped. A frame where the game created no new shader costs one counter read.",
+            .input_schema = {
+                .properties = {
+                    {"action", {.types = {"string"}, .enum_values = {"status", "enable", "disable"}}},
+                },
+            },
+        },
+    },
+    {
         "devkit_shader_coverage",
         {
             .title = "Shader Coverage",
