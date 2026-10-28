@@ -422,10 +422,16 @@ struct DrawDetails {
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> uav_binds;
   std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> constants;
-  // Copied while the draw is recorded, since games rewrite the same constant buffer between draws. A buffer the
-  // constants tracker does not know (Trace Constant Buffers off at startup) maps to std::nullopt.
+  enum class ConstantBufferValuesSource : std::uint8_t {
+    UNSUPPORTED_API,
+    CPU_CACHE,
+    CPU_MAPPED,
+  };
+  ConstantBufferValuesSource constant_buffer_values_source = ConstantBufferValuesSource::UNSUPPORTED_API;
+  // Copied while the draw is recorded, since games rewrite the same constant buffer between draws. std::nullopt is a
+  // buffer the constants tracker does not know (CPU_CACHE: Trace Constant Buffers off at startup) or one that was not
+  // read (CPU_MAPPED: untracked or released, not CPU-visible, or Map failed).
   std::map<std::pair<uint32_t, uint32_t>, std::optional<std::vector<uint8_t>>> constant_buffer_bytes;
-  bool constant_buffer_values_supported = false;
   std::map<PushConstantKey, PushConstantValues> push_constants;
   std::map<uint32_t, ResourceViewDetails> render_targets;
   std::vector<PipelineBindDetails> pipeline_binds;
@@ -3294,17 +3300,19 @@ std::vector<DeviceData*> device_data_list;
     });
     if (!include_constant_values) continue;
     const auto captured_bytes = draw_details.constant_buffer_bytes.find(slot_space);
-    if (!draw_details.constant_buffer_values_supported) {
+    const bool values_mapped =
+        draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::CPU_MAPPED;
+    if (draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::UNSUPPORTED_API) {
       constant_buffer.values_source = "unsupported_api";
     } else if (captured_bytes == draw_details.constant_buffer_bytes.end()) {
       constant_buffer.values_source = "not_read_by_shader";
     } else if (!captured_bytes->second.has_value()) {
-      constant_buffer.values_source = "untracked";
+      constant_buffer.values_source = (values_mapped ? "not_cpu_readable" : "untracked");
     } else {
       const auto& bytes = captured_bytes->second.value();
       std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
       std::memcpy(words.data(), bytes.data(), words.size() * sizeof(uint32_t));
-      constant_buffer.values_source = "cpu_cache";
+      constant_buffer.values_source = (values_mapped ? "cpu_mapped" : "cpu_cache");
       constant_buffer.values_truncated = bytes.size() == MAX_CAPTURED_CONSTANT_BUFFER_BYTES
                                          && buffer_range.size > MAX_CAPTURED_CONSTANT_BUFFER_BYTES;
       constant_buffer.float_values = to_floats(words);
@@ -7934,21 +7942,68 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     // that a snapshot of thousands of draws stays small.
     const bool has_reflected_shader_binds = draw_details.resource_binds.has_value() && !draw_details.resource_binds->empty();
     // D3D12 and Vulkan games write constant buffers through persistent maps or copies, which the CPU-side cache never
-    // sees, so their buffer values are not reported; root and push constants are.
-    draw_details.constant_buffer_values_supported = (device_api != reshade::api::device_api::d3d12
-                                                     && device_api != reshade::api::device_api::vulkan);
+    // sees. D3D12 buffers are mapped and read while the draw is recorded (OnDraw runs at record time), when games
+    // usually have written its constants already; after execution a ring allocator may have reused them. Vulkan memory
+    // the game already mapped cannot be mapped again.
+    switch (device_api) {
+      case reshade::api::device_api::d3d12:
+        draw_details.constant_buffer_values_source = DrawDetails::ConstantBufferValuesSource::CPU_MAPPED;
+        break;
+      case reshade::api::device_api::vulkan:
+        draw_details.constant_buffer_values_source = DrawDetails::ConstantBufferValuesSource::UNSUPPORTED_API;
+        break;
+      default:
+        draw_details.constant_buffer_values_source = DrawDetails::ConstantBufferValuesSource::CPU_CACHE;
+        break;
+    }
     for (const auto& [slot_space, buffer_range] : draw_details.constants) {
-      if (!draw_details.constant_buffer_values_supported) break;
+      if (draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::UNSUPPORTED_API) break;
       if (buffer_range.buffer.handle == 0u) continue;
       const auto& [slot, space] = slot_space;
       if (has_reflected_shader_binds
           && !IsResourceBindUsedByShader(draw_details.resource_binds, ResourceBind::BindType::CBV, slot, space)) {
         continue;
       }
-      draw_details.constant_buffer_bytes[slot_space] = renodx::utils::constants::GetResourceCacheRange(
+      const auto captured_size = std::min(buffer_range.size, MAX_CAPTURED_CONSTANT_BUFFER_BYTES);
+      if (draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::CPU_CACHE) {
+        draw_details.constant_buffer_bytes[slot_space] = renodx::utils::constants::GetResourceCacheRange(
+            buffer_range.buffer,
+            buffer_range.offset,
+            captured_size);
+        continue;
+      }
+      // The entry starts as std::nullopt (not CPU readable) and gets bytes only after a successful read.
+      auto& captured_bytes = draw_details.constant_buffer_bytes[slot_space];
+      // Cached descriptor heaps can still hold views of released resources, so only a tracked, live buffer is touched.
+      // Map on a GPU-only heap or a reserved resource (heap unknown) fails and is a debug-layer error, so it is not tried.
+      std::optional<reshade::api::resource_desc> buffer_desc = std::nullopt;
+      renodx::utils::resource::GetResourceInfo(
           buffer_range.buffer,
-          buffer_range.offset,
-          std::min(buffer_range.size, MAX_CAPTURED_CONSTANT_BUFFER_BYTES));
+          [&buffer_desc](const renodx::utils::resource::ResourceInfo& resource_info) {
+            if (resource_info.destroyed) return;
+            buffer_desc = resource_info.desc;
+          });
+      if (!buffer_desc.has_value() || buffer_desc->type != reshade::api::resource_type::buffer) continue;
+      if (buffer_desc->heap == reshade::api::memory_heap::gpu_only
+          || buffer_desc->heap == reshade::api::memory_heap::unknown) {
+        continue;
+      }
+      const auto buffer_size = buffer_desc->buffer.size;
+      if (buffer_range.offset >= buffer_size) continue;
+      // Root constant buffer views arrive with size UINT64_MAX: the read stops at the end of the buffer.
+      const auto read_size = std::min(captured_size, buffer_size - buffer_range.offset);
+      // D3D12 Map is reference-counted, so mapping a buffer the game keeps mapped is legal. ReShade's own map call reaches
+      // the unhooked Map, so no map events fire.
+      void* mapped_data = nullptr;
+      if (!device->map_buffer_region(
+              buffer_range.buffer, buffer_range.offset, read_size, reshade::api::map_access::read_only, &mapped_data)) {
+        continue;
+      }
+      if (renodx::utils::resource::IsReadableMemory(mapped_data, static_cast<size_t>(read_size))) {
+        const auto* mapped_bytes = static_cast<const uint8_t*>(mapped_data);
+        captured_bytes = std::vector<uint8_t>(mapped_bytes, mapped_bytes + static_cast<size_t>(read_size));
+      }
+      device->unmap_buffer_region(buffer_range.buffer);
     }
 
     const auto active_stage = (draw_method == DrawDetails::DrawMethods::DISPATCH

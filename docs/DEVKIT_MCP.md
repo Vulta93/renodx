@@ -220,16 +220,26 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
   recorded the draw, because games rewrite the same buffer between draws. At most 4096 bytes from the bound offset
   (`valuesTruncated` when that cap was reached; a whole-buffer bind of exactly 4096 bytes also reports it). `valuesSource`:
   - `cpu_cache`: the bytes the CPU last wrote through map/unmap or `update_buffer_region` (`utils::constants`). This is the
-    D3D10/11 path, and OpenGL uniform buffers written the same way. D3D9 has no constant buffers (see the shader constants
-    below).
+    D3D10/11 path (D3D12 uses `cpu_mapped`), and OpenGL uniform buffers written the same way. D3D9 has no constant
+    buffers (see the shader constants below).
   - `untracked`: the Devkit setting **Trace Constant Buffers** (Settings > Trace, ReShade.ini `TraceConstantBuffers`) was
     off when the game started (it only registers its hooks at startup, so enable it and restart), or the buffer was not created
     as a constant buffer, or it was mapped at that moment.
+  - `cpu_mapped`: D3D12. The Devkit maps the buffer itself (D3D12 `Map` is reference-counted, so a buffer the game
+    keeps mapped can be mapped again) and copies it while the draw is recorded. Games usually write a draw's constants
+    before recording it (UE-style ring allocators included), so these are usually the bytes the GPU reads; an engine
+    that writes them later, before submitting, would show older values. A read after the frame ran could see a reused
+    ring slot. A root constant buffer view (`fullRange`) has no size: the read runs to the end of the buffer (capped at
+    4096 bytes, and then `valuesTruncated` is usually set), so words past the cbuffer's own size belong to whatever
+    follows it. A stale descriptor whose buffer was released and its address reused by another buffer reads that one.
+  - `not_cpu_readable`: a D3D12 buffer the Devkit did not or could not read: a GPU-only default heap (filled by GPU
+    copies), a reserved resource, a resource released since its descriptor was written (stale descriptor heap
+    entries), one the resource tracker never saw, or `Map` refused.
   - `not_read_by_shader`: the active shader's reflected bindings do not include this buffer. When the shader's bindings are
     not reflected, every bound buffer is captured.
-  - `unsupported_api`: D3D12 and Vulkan. Their games write constant buffers through persistent maps or GPU copies, which the
-    CPU-side cache never sees, so it would only report zeros. Use the root/push constants below, or read the buffer's
-    layout from the decompiled shader.
+  - `unsupported_api`: Vulkan. Its games write uniform buffers through their own persistent maps, which ReShade does not
+    report and which cannot be mapped a second time. Use the push constants below, or read the buffer's layout from the
+    decompiled shader.
 - `pushConstants` for the active stage (pixel for draws, compute for dispatches), at most 1024 words each (longer ranges
   are cut and flagged with `valuesTruncated`), `firstValue` being the word index of `floatValues[0]`. They do not need
   Trace Constant Buffers.
@@ -268,13 +278,13 @@ OpenGL, where uniforms belong to the whole linked program.
 for its own float constants), read from the reflection
 in its disassembly (on OpenGL, the linked program's active uniforms, all stages): each entry is `name`, `index` (into
 `floatValues`/`uintValues`) and `count` (words).
-- D3D10/11 constant buffers and D3D12 root constants (DXBC `//` or DXIL `;` disassembly): the "Buffer Definitions"
+- D3D10/11/12 constant buffers and D3D12 root constants (DXBC `//` or DXIL `;` disassembly): the "Buffer Definitions"
   block (cbuffer members and their byte offsets, struct members as `struct.member`) joined to the register and space
   through "Resource Bindings"; DXIL's wrapper struct named after the cbuffer adds no prefix (a DXBC struct member with
   the cbuffer's name keeps it). Offsets are relative to the bound offset. A D3D12 root constant parameter is
   matched through the root signature's register and space, and its word is the 32-bit value offset; D3D12 root and
-  table CBVs have no values, so no names. Members of nested structs (and every DXIL member) have no size in the
-  disassembly; their size is derived from the type (column_major packing unless the line says `row_major`; array
+  table CBVs are named like D3D11 cbuffers (untested in a game). Members of nested structs (and every DXIL member)
+  have no size in the disassembly; their size is derived from the type (column_major packing unless the line says `row_major`; array
   elements start on 16-byte boundaries; `double` and 64-bit integers take 8 bytes, 16-bit types are counted as
   4). Arrays of structs are labelled at element 0 only. `$Globals` is included; structured buffer layouts are not.
   Shipped D3D12 shaders often strip their reflection (`-Qstrip_reflect`), and then the list is empty.
