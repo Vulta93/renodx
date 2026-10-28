@@ -249,7 +249,9 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     snapshot. While the copies are pending, `devkit_watch_region withSnapshot` cannot start its snapshot.
   - `not_copied`: a Vulkan uniform buffer without `TRANSFER_SRC` usage (see the setting below: created before it was
     on, or a buffer the setting leaves alone), a buffer released before the frame ended, the 32 MB cap, a readback
-    that could not be mapped, or a newer snapshot started before the readback.
+    that could not be mapped, or a newer snapshot started before the readback. Until the readback lands (in
+    finish_present of the snapshot frame's present, or the next present on that queue if that present failed) every
+    Vulkan buffer reads `not_copied` and the device reports `snapshotActive: true` (`waitForCompletion` waits for it).
   - Vulkan DYNAMIC uniform buffers never reach the snapshot (ReShade passes them with count 0), so they are not listed.
 - `pushConstants` for the active stage (pixel for draws, compute for dispatches), at most 1024 words each (longer ranges
   are cut and flagged with `valuesTruncated`), `firstValue` being the word index of `floatValues[0]`. They do not need

@@ -53,8 +53,13 @@ struct SnapshotCompletion {
   // Tells a device from the one that takes its index after it is destroyed.
   std::uintptr_t device_handle = 0u;
   std::uint64_t completed_snapshot_id = 0u;
+  // The latest snapshot started on the device.
+  std::uint64_t snapshot_id = 0u;
   bool queued = false;
+  // Capturing its frame.
   bool active = false;
+  // Frame captured, Vulkan constant buffer readback still pending.
+  bool finishing = false;
 };
 
 struct ToolContext {
@@ -508,6 +513,7 @@ inline ToolResult HandleQueueSnapshotTool(const json& arguments, const ToolConte
   if (!completion_before.has_value()) {
     throw std::runtime_error(std::format("Device #{} is not available.", device_index));
   }
+  const bool joined_running_capture = queue_result.structured_content.value("active", false);
 
   const auto make_error = [](std::string error) {
     return ToolResult{
@@ -523,11 +529,23 @@ inline ToolResult HandleQueueSnapshotTool(const json& arguments, const ToolConte
     if (!completion.has_value() || completion->device_handle != completion_before->device_handle) {
       return make_error(std::format("Device #{} was destroyed or replaced while the snapshot was pending.", device_index));
     }
-    if (completion->completed_snapshot_id != completion_before->completed_snapshot_id) break;
+    // Done once the device's latest snapshot, started after the call (or the capture the call found running, which
+    // has not completed when it was read before), has completed. Ids rather than a changed completed id: an earlier
+    // Vulkan snapshot can complete after the call came, at the end of its constant buffer readback.
+    const bool started_since_call = (completion->snapshot_id > completion_before->snapshot_id
+                                     || (joined_running_capture
+                                         && completion->snapshot_id > completion_before->completed_snapshot_id));
+    if (started_since_call && completion->completed_snapshot_id >= completion->snapshot_id) break;
     if (std::chrono::steady_clock::now() >= deadline) {
       if (completion->queued) {
         return make_error(std::format(
             "The snapshot of device #{} did not start within {} s: the game presented no frame (paused in the background, minimized or loading?). The request stays queued.",
+            device_index,
+            tool_catalog::MAX_SNAPSHOT_COMPLETION_WAIT_SECONDS));
+      }
+      if (completion->finishing) {
+        return make_error(std::format(
+            "The snapshot of device #{} captured its frame but its Vulkan constant buffer readback was not collected within {} s (the queue that presented that frame has not presented again). Queue a new snapshot.",
             device_index,
             tool_catalog::MAX_SNAPSHOT_COMPLETION_WAIT_SECONDS));
       }

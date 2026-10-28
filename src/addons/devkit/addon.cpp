@@ -3018,7 +3018,8 @@ std::vector<DeviceData*> device_data_list;
       .snapshot_rows_valid = device_data->snapshot_rows_valid,
       .resource_usage_entries = device_data->resource_usage_by_handle.size(),
       .snapshot_queued = snapshot_queued_device == device,
-      .snapshot_active = snapshot_device == device,
+      // A snapshot is still being finished until it completes (a Vulkan one after its constant buffer readback).
+      .snapshot_active = (snapshot_device == device || device_data->completed_snapshot_id < device_data->snapshot_id),
   };
 
   if (device_data->primary_swapchain_desc.has_value()) {
@@ -5597,7 +5598,7 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
   std::shared_lock device_lock(device_data->mutex);
   devkit_frame_overview::Input input = {
       .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device
-                           || device_data->constant_buffer_readback.has_value()),
+                           || device_data->completed_snapshot_id < device_data->snapshot_id),
       .snapshot_id = device_data->snapshot_id,
   };
   if (device_data->primary_swapchain_desc.has_value()) {
@@ -5743,7 +5744,15 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
         device_data_index.store(device_index, std::memory_order_relaxed); },
       .get_pipe_name = []() { return NarrowAscii(devkit_mcp_session.server.GetPipeName()); },
       .is_connected = []() { return devkit_mcp_session.server.IsConnected(); },
-      .has_active_snapshot = []() { return snapshot_device != nullptr; },
+      .has_active_snapshot = []() {
+        if (snapshot_device != nullptr) return true;
+        // A snapshot that has not completed yet (a Vulkan one until its constant buffer readback) is still being
+        // finished, as each device reports.
+        std::shared_lock list_lock(device_data_list_mutex);
+        return std::ranges::any_of(device_data_list, [](DeviceData* device_data) {
+          std::shared_lock device_lock(device_data->mutex);
+          return device_data->completed_snapshot_id < device_data->snapshot_id;
+        }); },
       .has_queued_snapshot = []() { return snapshot_queued_device != nullptr; },
       .is_snapshot_active = [](uint32_t device_index) {
         std::shared_lock list_lock(device_data_list_mutex);
@@ -5761,8 +5770,10 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
         return devkit_snapshot_tools::SnapshotCompletion{
             .device_handle = reinterpret_cast<std::uintptr_t>(device_data->device),
             .completed_snapshot_id = device_data->completed_snapshot_id,
+            .snapshot_id = device_data->snapshot_id,
             .queued = snapshot_queued_device == device_data->device,
             .active = snapshot_device == device_data->device,
+            .finishing = (snapshot_device != device_data->device && device_data->completed_snapshot_id < device_data->snapshot_id),
         }; },
       .build_device_summary = [](uint32_t device_index, bool is_selected) {
         std::shared_lock list_lock(device_data_list_mutex);
@@ -5840,7 +5851,7 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
         return renodx::addons::devkit::mcp::snapshot_summary::SnapshotSummary{
             .device_index = device_index,
             .snapshot_queued = snapshot_queued_device == device,
-            .snapshot_active = snapshot_device == device,
+            .snapshot_active = (snapshot_device == device || device_data->completed_snapshot_id < device_data->snapshot_id),
             .captured_draws = device_data->draw_details_list.size(),
             .tracked_shaders = device_data->shader_details.size(),
             .resource_usage_entries = device_data->resource_usage_by_handle.size(),
@@ -5943,7 +5954,7 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
         devkit_shader_summary::ReplacementListSummary result = {
             .captured_draws = device_data->draw_details_list.size(),
             .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device
-                                 || device_data->constant_buffer_readback.has_value()),
+                                 || device_data->completed_snapshot_id < device_data->snapshot_id),
         };
         for (const auto& draw_details : device_data->draw_details_list) {
           for (const auto& pipeline_bind : draw_details.pipeline_binds) {
@@ -6199,9 +6210,13 @@ void OnDestroyDevice(reshade::api::device* device) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
   devkit_watch_region::Shutdown(&device_data->watch_region_watcher, device);
-  if (device_data->constant_buffer_readback.has_value()) {
-    device->destroy_resource(device_data->constant_buffer_readback->readback_buffer);
-    device_data->constant_buffer_readback.reset();
+  std::optional<DeviceData::ConstantBufferReadback> pending_readback = std::nullopt;
+  {
+    std::unique_lock lock(device_data->mutex);
+    pending_readback = std::exchange(device_data->constant_buffer_readback, std::nullopt);
+  }
+  if (pending_readback.has_value()) {
+    device->destroy_resource(pending_readback->readback_buffer);
   }
   if (!device_data->is_display_proxy && GetSelectedDeviceData() == device_data) {
     DestroyDeviceProxyOutputWindow();
@@ -12642,7 +12657,26 @@ void OnPresent(
         }
       }
     }
+    // A readback still pending from an earlier snapshot (its present queue never presented again) belongs to draws a
+    // later snapshot cleared: it is dropped, and its buffer released before this snapshot's copies are recorded (the
+    // wait flushes the immediate command list, which must not submit them without the present's semaphores).
+    auto dropped_readback = std::exchange(device_data->constant_buffer_readback, std::nullopt);
+    if (dropped_readback.has_value()) {
+      device_data->completed_snapshot_id = std::max(device_data->completed_snapshot_id, dropped_readback->snapshot_id);
+    }
     lock.unlock();
+    if (dropped_readback.has_value()) {
+      // Waiting is only safe on the queue this present records on (as FinishConstantBufferReadback does); on another
+      // one the GPU may still write the buffer, so it is left allocated instead.
+      if (dropped_readback->copy_queue == copy_queue) {
+        copy_queue->wait_idle();
+        device->destroy_resource(dropped_readback->readback_buffer);
+      } else {
+        reshade::log::message(
+            reshade::log::level::warning,
+            "devkit: a Vulkan constant buffer readback from another queue was never collected; its buffer is leaked.");
+      }
+    }
     const bool copies_recorded = readback_size != 0u
                                  && device->create_resource(
                                      reshade::api::resource_desc(
@@ -12678,18 +12712,11 @@ void OnPresent(
           readback.readback_buffer, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::cpu_access);
     }
     lock.lock();
-    // A readback still pending from an earlier snapshot (its present queue never presented again) belongs to draws a
-    // later snapshot cleared: it is dropped.
-    auto dropped_readback = std::exchange(device_data->constant_buffer_readback, std::nullopt);
     if (copies_recorded) {
       device_data->constant_buffer_readback = std::move(readback);
     } else {
-      device_data->completed_snapshot_id = device_data->snapshot_id;
-    }
-    lock.unlock();
-    if (dropped_readback.has_value()) {
-      dropped_readback->copy_queue->wait_idle();
-      device->destroy_resource(dropped_readback->readback_buffer);
+      // A snapshot another thread started while the lock was released is not this one.
+      device_data->completed_snapshot_id = std::max(device_data->completed_snapshot_id, readback.snapshot_id);
     }
   }
 }
