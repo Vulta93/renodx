@@ -237,9 +237,20 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     entries), one the resource tracker never saw, or `Map` refused.
   - `not_read_by_shader`: the active shader's reflected bindings do not include this buffer. When the shader's bindings are
     not reflected, every bound buffer is captured.
-  - `unsupported_api`: Vulkan. Its games write uniform buffers through their own persistent maps, which ReShade does not
-    report and which cannot be mapped a second time. Use the push constants below, or read the buffer's layout from the
-    decompiled shader.
+  - `gpu_copy`: Vulkan. Games write uniform buffers through their own persistent maps, which ReShade does not report
+    and which cannot be mapped a second time, and copies are not allowed inside the render passes draws are recorded in.
+    So the snapshot notes each bound range a draw reads and, at the snapshot frame's present, copies every distinct
+    range (buffer, offset, size) once on the effect runtime's queue's immediate command list, which ReShade submits
+    behind the game's frame; finish_present waits for that queue, reads the copies back and only then completes the
+    snapshot (`waitForCompletion` includes it). Ring allocators usually do not reuse a frame's ranges before that
+    frame's fence, so these are usually the bytes the draws read (the fence does not cover the later copy, so a game
+    that rewrites a range as soon as the fence signals could win that race); a range the game rewrote on the GPU later
+    in the same frame (`vkCmdUpdateBuffer`, a copy or a shader store) shows its last value. At most 32 MB of ranges per
+    snapshot. While the copies are pending, `devkit_watch_region withSnapshot` cannot start its snapshot.
+  - `not_copied`: a Vulkan uniform buffer without `TRANSFER_SRC` usage (see the setting below: created before it was
+    on, or a buffer the setting leaves alone), a buffer released before the frame ended, the 32 MB cap, a readback
+    that could not be mapped, or a newer snapshot started before the readback.
+  - Vulkan DYNAMIC uniform buffers never reach the snapshot (ReShade passes them with count 0), so they are not listed.
 - `pushConstants` for the active stage (pixel for draws, compute for dispatches), at most 1024 words each (longer ranges
   are cut and flagged with `valuesTruncated`), `firstValue` being the word index of `floatValues[0]`. They do not need
   Trace Constant Buffers.
@@ -1287,6 +1298,14 @@ Refused or limited cases on D3D12/Vulkan, all stated in the output:
   (mainly a concern on AMD; not measured). Measured: DOOM 2016, NVIDIA RTX 5070 Ti (driver 621.1), 3840x2160, one spot,
   GPU 3.5 ms average in the game's performance overlay (0.1 ms resolution) with the setting on and off (2026-10-22).
   If a Vulkan game crashes, fails to create images, or runs slower only with the Devkit, try the setting off first.
+- **Snapshot: Copyable Vulkan Uniform Buffers** (Settings > Other, ReShade.ini key `ConstantBufferCopySourceUsage` in
+  `[renodx-dev]`, on by default, restart after toggling) adds `copy_source` usage to every Vulkan buffer with uniform
+  usage the game creates, so snapshots can copy their values (`gpu_copy` above). ReShade rebuilds the buffer's usage
+  bits from the changed desc, which would add bits the game never asked for to buffers with storage, stream-output or
+  acceleration-structure usage, or a shader binding table (`SHADER_DEVICE_ADDRESS` among them, which needs memory
+  allocated for it), so those are left alone and report `not_copied`. Shared and sparse buffers are left alone too. A
+  buffer created with `VkBufferUsageFlags2CreateInfo` (maintenance5) keeps its own usage, which an add-on cannot see or
+  change, so its copy is invalid Vulkan (the validation layer reports it). GPU cost not measured yet.
 - The measurement copies and barriers cost GPU time and VRAM; use a region or `shaderHash` for long watches.
 
 Limits on every API: 2D, non-MSAA textures in RGBA 8-bit, 10-bit, R11G11B10, 16-bit or 32-bit float formats, and except on
