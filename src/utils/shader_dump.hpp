@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <include/reshade.hpp>
 
@@ -448,9 +449,11 @@ static std::filesystem::path GetShaderDumpPath(
   return GetShaderDumpPath(shader_hash, shader_data, shader_type, prefix, device_api);
 }
 
-static void DumpAllPending() {
+// Dumps every shader seen since the last call that is not on disk yet; returns each one's hash and file.
+static std::vector<std::pair<uint32_t, std::filesystem::path>> DumpAllPending() {
+  std::vector<std::pair<uint32_t, std::filesystem::path>> dumped;
   auto* data = internal::shared.data;
-  if (data == nullptr) return;
+  if (data == nullptr) return dumped;
 
   uint32_t dumped_count = 0u;
   data->shaders.for_each_m([&](std::pair<const uint32_t, internal::ShaderInfo>& pair) {
@@ -467,6 +470,9 @@ static void DumpAllPending() {
     if (!DumpShader(shader_hash, shader_info.data, shader_info.type, "", shader_info.device_api)) {
       return;
     }
+    dumped.emplace_back(
+        shader_hash,
+        GetShaderDumpPath(shader_hash, shader_info.data, shader_info.type, "", shader_info.device_api));
 
     shader_info.data.clear();
     shader_info.pending = false;
@@ -475,6 +481,7 @@ static void DumpAllPending() {
   });
 
   if (dumped_count != 0u) data->pending_dump_count.fetch_sub(dumped_count);
+  return dumped;
 }
 
 static void Use(DWORD fdw_reason) {
