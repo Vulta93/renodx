@@ -43,6 +43,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -406,6 +407,8 @@ struct D3D9DrawState {
 };
 
 constexpr uint64_t MAX_CAPTURED_CONSTANT_BUFFER_BYTES = 4096u;
+// The readback buffer for one snapshot's Vulkan uniform buffer copies; ranges past it are not copied.
+constexpr uint64_t MAX_CONSTANT_BUFFER_COPY_BYTES = 32u * 1024u * 1024u;
 constexpr size_t MAX_CAPTURED_PUSH_CONSTANT_VALUES = 1024u;
 
 struct DrawDetails {
@@ -429,11 +432,13 @@ struct DrawDetails {
     UNSUPPORTED_API,
     CPU_CACHE,
     CPU_MAPPED,
+    GPU_COPY,
   };
   ConstantBufferValuesSource constant_buffer_values_source = ConstantBufferValuesSource::UNSUPPORTED_API;
   // Copied while the draw is recorded, since games rewrite the same constant buffer between draws. std::nullopt is a
   // buffer the constants tracker does not know (CPU_CACHE: Trace Constant Buffers off at startup) or one that was not
-  // read (CPU_MAPPED: untracked or released, not a buffer, GPU-only or reserved, empty, or Map failed).
+  // read (CPU_MAPPED: untracked or released, not a buffer, GPU-only or reserved, empty, or Map failed). GPU_COPY
+  // (Vulkan) entries start as std::nullopt and get their bytes from the copy read back after the snapshot frame.
   std::map<std::pair<uint32_t, uint32_t>, std::optional<std::vector<uint8_t>>> constant_buffer_bytes;
   std::map<PushConstantKey, PushConstantValues> push_constants;
   std::map<uint32_t, ResourceViewDetails> render_targets;
@@ -688,6 +693,20 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   // Read on every draw; the recording itself is guarded by shader_coverage.mutex. watched only changes while this is false.
   std::atomic_bool shader_coverage_active = false;
   ShaderCoverage shader_coverage;
+
+  // Vulkan snapshot constant values: the uniform buffer ranges copied at the snapshot frame's present, read back in
+  // finish_present (FinishConstantBufferReadback). Keyed by the bound range (buffer, offset, size as bound): the offset
+  // in readback_buffer and the bytes copied.
+  struct ConstantBufferReadback {
+    uint64_t snapshot_id = 0u;
+    reshade::api::resource readback_buffer = {0u};
+    // The effect runtime's queue the copies were recorded on, and the queue that presented the snapshot frame, whose
+    // finish_present reads them back.
+    reshade::api::command_queue* copy_queue = nullptr;
+    reshade::api::command_queue* present_queue = nullptr;
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>> copied_ranges;
+  };
+  std::optional<ConstantBufferReadback> constant_buffer_readback = std::nullopt;
 };
 
 [[nodiscard]] std::vector<uint8_t> LoadShaderDataForShaderHash(reshade::api::device* device, uint32_t shader_hash) {
@@ -3303,19 +3322,38 @@ std::vector<DeviceData*> device_data_list;
     });
     if (!include_constant_values) continue;
     const auto captured_bytes = draw_details.constant_buffer_bytes.find(slot_space);
-    const bool values_mapped =
-        draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::CPU_MAPPED;
-    if (draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::UNSUPPORTED_API) {
+    const auto values_source = draw_details.constant_buffer_values_source;
+    if (values_source == DrawDetails::ConstantBufferValuesSource::UNSUPPORTED_API) {
       constant_buffer.values_source = "unsupported_api";
     } else if (captured_bytes == draw_details.constant_buffer_bytes.end()) {
       constant_buffer.values_source = "not_read_by_shader";
     } else if (!captured_bytes->second.has_value()) {
-      constant_buffer.values_source = (values_mapped ? "not_cpu_readable" : "untracked");
+      switch (values_source) {
+        case DrawDetails::ConstantBufferValuesSource::CPU_MAPPED:
+          constant_buffer.values_source = "not_cpu_readable";
+          break;
+        case DrawDetails::ConstantBufferValuesSource::GPU_COPY:
+          constant_buffer.values_source = "not_copied";
+          break;
+        default:
+          constant_buffer.values_source = "untracked";
+          break;
+      }
     } else {
       const auto& bytes = captured_bytes->second.value();
       std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
       std::memcpy(words.data(), bytes.data(), words.size() * sizeof(uint32_t));
-      constant_buffer.values_source = (values_mapped ? "cpu_mapped" : "cpu_cache");
+      switch (values_source) {
+        case DrawDetails::ConstantBufferValuesSource::CPU_MAPPED:
+          constant_buffer.values_source = "cpu_mapped";
+          break;
+        case DrawDetails::ConstantBufferValuesSource::GPU_COPY:
+          constant_buffer.values_source = "gpu_copy";
+          break;
+        default:
+          constant_buffer.values_source = "cpu_cache";
+          break;
+      }
       constant_buffer.values_truncated = bytes.size() == MAX_CAPTURED_CONSTANT_BUFFER_BYTES
                                          && buffer_range.size > MAX_CAPTURED_CONSTANT_BUFFER_BYTES;
       constant_buffer.float_values = to_floats(words);
@@ -5558,7 +5596,8 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
 
   std::shared_lock device_lock(device_data->mutex);
   devkit_frame_overview::Input input = {
-      .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device),
+      .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device
+                           || device_data->constant_buffer_readback.has_value()),
       .snapshot_id = device_data->snapshot_id,
   };
   if (device_data->primary_swapchain_desc.has_value()) {
@@ -5903,7 +5942,8 @@ devkit_frame_overview::Input CollectFrameOverview(uint32_t device_index) {
         std::shared_lock device_lock(device_data->mutex);
         devkit_shader_summary::ReplacementListSummary result = {
             .captured_draws = device_data->draw_details_list.size(),
-            .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device),
+            .snapshot_pending = (snapshot_device == device_data->device || snapshot_queued_device == device_data->device
+                                 || device_data->constant_buffer_readback.has_value()),
         };
         for (const auto& draw_details : device_data->draw_details_list) {
           for (const auto& pipeline_bind : draw_details.pipeline_binds) {
@@ -6089,6 +6129,12 @@ void OnInitDevice(reshade::api::device* device) {
   }
   device_data->watch_region_watcher.begin_linked_snapshot = [device_data]() -> std::optional<uint64_t> {
     if (snapshot_queued_device != nullptr) return std::nullopt;
+    // The previous snapshot's Vulkan constant copies are read back in finish_present, after this call: starting now
+    // would clear the draws they belong to.
+    {
+      std::shared_lock lock(device_data->mutex);
+      if (device_data->constant_buffer_readback.has_value()) return std::nullopt;
+    }
     // Claimed first, so a snapshot started meanwhile from the overlay or MCP cannot interleave with this one.
     reshade::api::device* no_snapshot = nullptr;
     if (!snapshot_device.compare_exchange_strong(no_snapshot, device_data->device)) return std::nullopt;
@@ -6153,6 +6199,10 @@ void OnDestroyDevice(reshade::api::device* device) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
   devkit_watch_region::Shutdown(&device_data->watch_region_watcher, device);
+  if (device_data->constant_buffer_readback.has_value()) {
+    device->destroy_resource(device_data->constant_buffer_readback->readback_buffer);
+    device_data->constant_buffer_readback.reset();
+  }
   if (!device_data->is_display_proxy && GetSelectedDeviceData() == device_data) {
     DestroyDeviceProxyOutputWindow();
   }
@@ -7947,20 +7997,20 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     // D3D12 and Vulkan games write constant buffers through persistent maps or copies, which the CPU-side cache never
     // sees, so D3D12 buffers are mapped and read by the Devkit while the draw is recorded (OnDraw runs at record time), when games
     // usually have written its constants already; after execution a ring allocator may have reused them. Vulkan memory
-    // the game already mapped cannot be mapped again.
+    // the game already mapped cannot be mapped again, and copies are not allowed inside the render passes draws are
+    // recorded in, so Vulkan ranges are only noted here and copied once the snapshot frame ends (OnPresent).
     switch (device_api) {
       case reshade::api::device_api::d3d12:
         draw_details.constant_buffer_values_source = DrawDetails::ConstantBufferValuesSource::CPU_MAPPED;
         break;
       case reshade::api::device_api::vulkan:
-        draw_details.constant_buffer_values_source = DrawDetails::ConstantBufferValuesSource::UNSUPPORTED_API;
+        draw_details.constant_buffer_values_source = DrawDetails::ConstantBufferValuesSource::GPU_COPY;
         break;
       default:
         draw_details.constant_buffer_values_source = DrawDetails::ConstantBufferValuesSource::CPU_CACHE;
         break;
     }
     for (const auto& [slot_space, buffer_range] : draw_details.constants) {
-      if (draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::UNSUPPORTED_API) break;
       if (buffer_range.buffer.handle == 0u) continue;
       const auto& [slot, space] = slot_space;
       if (has_reflected_shader_binds
@@ -7973,6 +8023,10 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
             buffer_range.buffer,
             buffer_range.offset,
             captured_size);
+        continue;
+      }
+      if (draw_details.constant_buffer_values_source == DrawDetails::ConstantBufferValuesSource::GPU_COPY) {
+        draw_details.constant_buffer_bytes.emplace(slot_space, std::nullopt);
         continue;
       }
       // The entry starts as std::nullopt (not CPU readable) and gets bytes only after a successful read.
@@ -12215,10 +12269,61 @@ void OnReShadePresent(reshade::api::effect_runtime* runtime) {
   devkit_watch_region::ProcessAtFrameEnd(&device_data->watch_region_watcher, device_index, runtime, reduce_shader, __watch_region_quad_dx9);
 }
 
+// Reads back the Vulkan uniform buffer copies OnPresent recorded at the end of a snapshot frame (ReShade submitted them
+// with the immediate command list at that present), fills in the draws' constant values and completes the snapshot.
+// It runs inside the present call of the queue that presented the snapshot frame, like the frame_end analyses that wait
+// on the effect runtime's queue there. The wait and the driver calls run without the device lock, which the game's
+// render threads take on every pipeline bind. Draws are only filled while the readback's snapshot is still the current
+// one (a new snapshot clears them).
+void FinishConstantBufferReadback(DeviceData* device_data, reshade::api::command_queue* present_queue) {
+  // Called on every present: the shared lock keeps the common case from blocking the game's pipeline binds.
+  {
+    std::shared_lock shared_lock(device_data->mutex);
+    if (!device_data->constant_buffer_readback.has_value()) return;
+  }
+  std::unique_lock lock(device_data->mutex);
+  if (!device_data->constant_buffer_readback.has_value()
+      || device_data->constant_buffer_readback->present_queue != present_queue) {
+    return;
+  }
+  auto readback = std::move(device_data->constant_buffer_readback.value());
+  device_data->constant_buffer_readback.reset();
+  lock.unlock();
+  auto* device = device_data->device;
+  readback.copy_queue->wait_idle();
+  void* mapped_data = nullptr;
+  const bool mapped = device->map_buffer_region(
+      readback.readback_buffer, 0u, UINT64_MAX, reshade::api::map_access::read_only, &mapped_data);
+  lock.lock();
+  if (mapped && device_data->snapshot_id == readback.snapshot_id) {
+    const auto* readback_bytes = static_cast<const uint8_t*>(mapped_data);
+    for (auto& draw_details : device_data->draw_details_list) {
+      if (draw_details.constant_buffer_values_source != DrawDetails::ConstantBufferValuesSource::GPU_COPY) continue;
+      for (auto& [slot_space, captured_bytes] : draw_details.constant_buffer_bytes) {
+        const auto bound_range = draw_details.constants.find(slot_space);
+        if (bound_range == draw_details.constants.end()) continue;
+        const auto& buffer_range = bound_range->second;
+        const auto copied_range = readback.copied_ranges.find({buffer_range.buffer.handle, buffer_range.offset, buffer_range.size});
+        if (copied_range == readback.copied_ranges.end()) continue;
+        const auto& [readback_offset, byte_count] = copied_range->second;
+        const auto* first_byte = readback_bytes + readback_offset;
+        captured_bytes = std::vector<uint8_t>(first_byte, first_byte + byte_count);
+      }
+    }
+  }
+  device_data->completed_snapshot_id = std::max(device_data->completed_snapshot_id, readback.snapshot_id);
+  lock.unlock();
+  if (mapped) {
+    device->unmap_buffer_region(readback.readback_buffer);
+  }
+  device->destroy_resource(readback.readback_buffer);
+}
+
 void OnFinishPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(swapchain->get_device());
   if (device_data == nullptr) return;
   devkit_watch_region::OnFinishPresent(&device_data->watch_region_watcher, queue);
+  FinishConstantBufferReadback(device_data, queue);
 
   // Vulkan measurePoint 'frame_end': ReShade submitted the immediate command lists with the back-buffer copies at
   // present, so the analysis can flush and wait now. Each request is analyzed on the effect runtime's queue its copy
@@ -12258,6 +12363,17 @@ void OnDestroyCommandQueue(reshade::api::command_queue* queue) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(queue->get_device());
   if (device_data == nullptr) return;
   devkit_watch_region::OnCommandQueueDestroyed(&device_data->watch_region_watcher, queue);
+  // The constant buffer copies were never read back: the snapshot completes without their values.
+  std::unique_lock lock(device_data->mutex);
+  if (!device_data->constant_buffer_readback.has_value()
+      || (device_data->constant_buffer_readback->copy_queue != queue
+          && device_data->constant_buffer_readback->present_queue != queue)) {
+    return;
+  }
+  const auto readback = std::exchange(device_data->constant_buffer_readback, std::nullopt).value();
+  device_data->completed_snapshot_id = std::max(device_data->completed_snapshot_id, readback.snapshot_id);
+  lock.unlock();
+  device_data->device->destroy_resource(readback.readback_buffer);
 }
 
 void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
@@ -12287,8 +12403,17 @@ bool OnCreateResource(
     return false;
   }
   if (desc.type == reshade::api::resource_type::buffer) {
+    // ReShade rebuilds the VkBufferCreateInfo usage from the changed desc: storage, stream-output and acceleration
+    // structure usage would come back with bits the game never asked for (SHADER_DEVICE_ADDRESS needs memory allocated
+    // for it), so only buffers whose usage survives that round trip unchanged get the flag.
+    // A shader binding table arrives as shader_resource_non_pixel alone and comes back the same way.
+    constexpr auto inexact_round_trip_usage = reshade::api::resource_usage::unordered_access
+                                              | reshade::api::resource_usage::stream_output
+                                              | reshade::api::resource_usage::acceleration_structure;
     if (!constant_buffer_copy_source_usage.load(std::memory_order_relaxed)
-        || !renodx::utils::bitwise::HasAnyFlag(desc.usage, reshade::api::resource_usage::constant_buffer)) {
+        || !renodx::utils::bitwise::HasAnyFlag(desc.usage, reshade::api::resource_usage::constant_buffer)
+        || renodx::utils::bitwise::HasAnyFlag(desc.usage, inexact_round_trip_usage)
+        || (desc.usage & reshade::api::resource_usage::shader_resource) == reshade::api::resource_usage::shader_resource_non_pixel) {
       return false;
     }
   } else if (!watch_region_copy_source_usage.load(std::memory_order_relaxed)
@@ -12408,6 +12533,9 @@ void OnPresent(
     DumpPendingShaders();
   }
 
+  // A constant buffer readback finish_present did not collect (the present failed) is collected on the next present
+  // from the same queue; its copies were already submitted with the failed present.
+  FinishConstantBufferReadback(get_data(), queue);
   reshade::api::device* active_snapshot_device = snapshot_device;
   if (active_snapshot_device == nullptr) {
     if (snapshot_queued_device == device) {
@@ -12461,7 +12589,108 @@ void OnPresent(
     device_data->snapshot_rows.clear();
     device_data->snapshot_row_layout_key = 0u;
     device_data->snapshot_rows_valid = false;
-    device_data->completed_snapshot_id = device_data->snapshot_id;
+
+    // Vulkan constant values (DrawDetails::ConstantBufferValuesSource::GPU_COPY): each bound range a snapshot draw reads
+    // is copied once, after the frame, on the effect runtime's queue's immediate command list (a game can present from
+    // another queue; ReShade has no immediate list on a queue without graphics), which ReShade submits at this present
+    // behind the game's work, waiting on the present's semaphores; the barriers order the copies after every earlier
+    // command on that queue. Ring allocators usually do not reuse a frame's ranges before that frame's fence, so the
+    // copies hold what the draws read; a range the game rewrote on the GPU later in the frame holds its last value. Only
+    // uniform buffers created with copy-source usage (constant_buffer_copy_source_usage) can be copied. The driver calls
+    // run without the device lock; FinishConstantBufferReadback reads the copies back in finish_present and then
+    // completes the snapshot.
+    auto* copy_queue = (device_data->runtime != nullptr ? device_data->runtime->get_command_queue() : queue);
+    auto* copy_list = (device->get_api() == reshade::api::device_api::vulkan ? copy_queue->get_immediate_command_list()
+                                                                             : nullptr);
+    DeviceData::ConstantBufferReadback readback = {
+        .snapshot_id = device_data->snapshot_id,
+        .copy_queue = copy_queue,
+        .present_queue = queue,
+    };
+    uint64_t readback_size = 0u;
+    if (copy_list != nullptr) {
+      std::unordered_map<uint64_t, std::optional<uint64_t>> copyable_buffer_sizes;
+      for (const auto& draw_details : device_data->draw_details_list) {
+        if (draw_details.constant_buffer_values_source != DrawDetails::ConstantBufferValuesSource::GPU_COPY) continue;
+        for (const auto& [slot_space, captured_bytes] : draw_details.constant_buffer_bytes) {
+          const auto bound_range = draw_details.constants.find(slot_space);
+          if (bound_range == draw_details.constants.end()) continue;
+          const auto& buffer_range = bound_range->second;
+          const auto range_key = std::make_tuple(buffer_range.buffer.handle, buffer_range.offset, buffer_range.size);
+          if (readback.copied_ranges.contains(range_key)) continue;
+          auto [buffer_size, buffer_seen_first] = copyable_buffer_sizes.try_emplace(buffer_range.buffer.handle, std::nullopt);
+          if (buffer_seen_first) {
+            renodx::utils::resource::GetResourceInfo(
+                buffer_range.buffer,
+                [&](const renodx::utils::resource::ResourceInfo& resource_info) {
+                  if (resource_info.destroyed || resource_info.desc.type != reshade::api::resource_type::buffer
+                      || !renodx::utils::bitwise::HasAnyFlag(resource_info.desc.usage, reshade::api::resource_usage::copy_source)) {
+                    return;
+                  }
+                  buffer_size->second = resource_info.desc.buffer.size;
+                });
+          }
+          if (!buffer_size->second.has_value() || buffer_range.offset >= buffer_size->second.value()) continue;
+          const auto byte_count = std::min({
+              buffer_range.size,
+              MAX_CAPTURED_CONSTANT_BUFFER_BYTES,
+              buffer_size->second.value() - buffer_range.offset,
+          });
+          if (readback_size + byte_count > MAX_CONSTANT_BUFFER_COPY_BYTES) continue;
+          readback.copied_ranges.emplace(range_key, std::make_pair(readback_size, byte_count));
+          readback_size += byte_count;
+        }
+      }
+    }
+    lock.unlock();
+    const bool copies_recorded = readback_size != 0u
+                                 && device->create_resource(
+                                     reshade::api::resource_desc(
+                                         readback_size, reshade::api::memory_heap::gpu_to_cpu, reshade::api::resource_usage::copy_dest),
+                                     nullptr,
+                                     reshade::api::resource_usage::copy_dest,
+                                     &readback.readback_buffer);
+    if (copies_recorded) {
+      // copied_ranges is ordered by buffer handle first, so each source buffer's copies are consecutive.
+      uint64_t barrier_buffer_handle = 0u;
+      const auto restore_source_buffer = [&]() {
+        if (barrier_buffer_handle == 0u) return;
+        copy_list->barrier(
+            {barrier_buffer_handle}, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::general);
+      };
+      for (const auto& [range_key, copy] : readback.copied_ranges) {
+        const auto& [buffer_handle, buffer_offset, bound_size] = range_key;
+        const auto& [readback_offset, byte_count] = copy;
+        if (buffer_handle != barrier_buffer_handle) {
+          restore_source_buffer();
+          barrier_buffer_handle = buffer_handle;
+          // Makes the game's GPU writes (transfers, shader stores) visible to the copy; CPU writes are visible
+          // through the submission.
+          copy_list->barrier(
+              {buffer_handle},
+              reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::unordered_access,
+              reshade::api::resource_usage::copy_source);
+        }
+        copy_list->copy_buffer_region({buffer_handle}, buffer_offset, readback.readback_buffer, readback_offset, byte_count);
+      }
+      restore_source_buffer();
+      copy_list->barrier(
+          readback.readback_buffer, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::cpu_access);
+    }
+    lock.lock();
+    // A readback still pending from an earlier snapshot (its present queue never presented again) belongs to draws a
+    // later snapshot cleared: it is dropped.
+    auto dropped_readback = std::exchange(device_data->constant_buffer_readback, std::nullopt);
+    if (copies_recorded) {
+      device_data->constant_buffer_readback = std::move(readback);
+    } else {
+      device_data->completed_snapshot_id = device_data->snapshot_id;
+    }
+    lock.unlock();
+    if (dropped_readback.has_value()) {
+      dropped_readback->copy_queue->wait_idle();
+      device->destroy_resource(dropped_readback->readback_buffer);
+    }
   }
 }
 
