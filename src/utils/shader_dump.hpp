@@ -383,12 +383,9 @@ static std::filesystem::path GetShaderDumpPath(
 }
 
 static bool DumpShader(
-    uint32_t shader_hash,
+    const std::filesystem::path& dump_path,
     std::span<uint8_t> shader_data,
-    reshade::api::pipeline_subobject_type shader_type = reshade::api::pipeline_subobject_type::unknown,
-    const std::string& prefix = "",
     const reshade::api::device_api& device_api = reshade::api::device_api::d3d11) {
-  auto dump_path = GetShaderDumpPath(shader_hash, shader_data, shader_type, prefix, device_api);
   auto is_binary = device_api != reshade::api::device_api::opengl;
 
   if (is_binary) {
@@ -398,6 +395,15 @@ static bool DumpShader(
     renodx::utils::path::WriteBinaryFile(dump_path, shader_data.subspan(0, shader_data.size() - 1));
   }
   return true;
+}
+
+static bool DumpShader(
+    uint32_t shader_hash,
+    std::span<uint8_t> shader_data,
+    reshade::api::pipeline_subobject_type shader_type = reshade::api::pipeline_subobject_type::unknown,
+    const std::string& prefix = "",
+    const reshade::api::device_api& device_api = reshade::api::device_api::d3d11) {
+  return DumpShader(GetShaderDumpPath(shader_hash, shader_data, shader_type, prefix, device_api), shader_data, device_api);
 }
 
 static bool DumpShader(
@@ -467,12 +473,11 @@ static std::vector<std::pair<uint32_t, std::filesystem::path>> DumpAllPending() 
     s << ")";
     reshade::log::message(reshade::log::level::debug, s.str().c_str());
 
-    if (!DumpShader(shader_hash, shader_info.data, shader_info.type, "", shader_info.device_api)) {
+    auto dump_path = GetShaderDumpPath(shader_hash, shader_info.data, shader_info.type, "", shader_info.device_api);
+    if (!DumpShader(dump_path, shader_info.data, shader_info.device_api)) {
       return;
     }
-    dumped.emplace_back(
-        shader_hash,
-        GetShaderDumpPath(shader_hash, shader_info.data, shader_info.type, "", shader_info.device_api));
+    dumped.emplace_back(shader_hash, std::move(dump_path));
 
     shader_info.data.clear();
     shader_info.pending = false;
