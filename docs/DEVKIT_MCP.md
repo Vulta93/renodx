@@ -362,10 +362,12 @@ a pure device). Default values are left out, so most draws carry only a few fiel
 - `alphaTest`: `function` (`never`, `less`, `equal`, `less_equal`, `greater`, `not_equal`, `greater_equal`, `always`)
   and `reference` (0-255) while D3DRS_ALPHATESTENABLE is set. A port into a float target has to keep the discard.
 - `textureCoordinateIndexes`: stages whose D3DTSS_TEXCOORDINDEX is not their own stage number: `coordinateSet` and,
-  for generated coordinates (D3DTSS_TCI_CAMERASPACENORMAL and others), `generationHex`.
+  for generated coordinates (D3DTSS_TCI_CAMERASPACENORMAL and others), `generationHex`. Only for draws without a vertex
+  shader: a vertex shader ignores it.
 - `textureTransforms`: stages whose D3DTSS_TEXTURETRANSFORMFLAGS are not `D3DTTFF_DISABLE`, with `flagsHex`, `count`
-  (D3DTTFF_COUNT1..4), `projected` (D3DTTFF_PROJECTED) and `matrix` (D3DTS_TEXTUREn, row-major). ps_1_x and the
-  fixed-function stages honour `projected`; a ps_2_0+ port must reproduce it with `tex2Dproj`.
+  (D3DTTFF_COUNT1..4), `projected` (D3DTTFF_PROJECTED) and, for draws without a vertex shader (which ignores it),
+  `matrix` (D3DTS_TEXTUREn, row-major). ps_1_x and the fixed-function stages honour `projected`; a ps_2_0+ port must
+  reproduce it with `tex2Dproj`.
 - `bumpEnvironments`: stages with a non-zero bump-environment matrix (`matrix` = BUMPENVMAT00, 01, 10, 11), which `texbem`
   and the `bump_env_map` ops read, and that stage's `addressU` (`wrap`, `mirror`, `clamp`, `border`, `mirror_once`). A
   port passes the matrix as a constant.

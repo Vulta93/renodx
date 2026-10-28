@@ -379,12 +379,13 @@ struct D3D9DrawState {
     uint32_t stage = 0u;
     DWORD value = 0u;
   };
-  // Stages whose D3DTSS_TEXCOORDINDEX is not their own stage number (the default).
+  // Stages whose D3DTSS_TEXCOORDINDEX is not their own stage number (the default); fixed-function vertex processing only.
   std::vector<TextureCoordinateIndex> texture_coordinate_indexes;
   struct TextureTransform {
     uint32_t stage = 0u;
     DWORD flags = 0u;
-    D3DMATRIX matrix = {};
+    // D3DTS_TEXTUREn, which only fixed-function vertex processing applies (no vertex shader bound).
+    std::optional<D3DMATRIX> matrix = std::nullopt;
   };
   std::vector<TextureTransform> texture_transforms;
   struct BumpEnvironment {
@@ -3539,10 +3540,9 @@ std::vector<DeviceData*> device_data_list;
           .alpha_arg2 = argument(stage.alpha_arg2),
           .result_arg = (stage.result_arg == D3DTA_CURRENT ? std::nullopt : std::optional(argument(stage.result_arg))),
       });
-      const auto reads_constant = [](DWORD arg) { return (arg & D3DTA_SELECTMASK) == D3DTA_CONSTANT; };
       if (std::ranges::any_of(
               std::array{stage.color_arg0, stage.color_arg1, stage.color_arg2, stage.alpha_arg0, stage.alpha_arg1, stage.alpha_arg2},
-              reads_constant)) {
+              [](DWORD arg) { return (arg & D3DTA_SELECTMASK) == D3DTA_CONSTANT; })) {
         stages.back().constant_hex = std::format("0x{:08X}", static_cast<uint32_t>(stage.constant));
       }
       if (stage.color_op == D3DTOP_BUMPENVMAPLUMINANCE || stage.alpha_op == D3DTOP_BUMPENVMAPLUMINANCE) {
@@ -3662,7 +3662,9 @@ std::vector<DeviceData*> device_data_list;
           .count = static_cast<uint32_t>(transform.flags & 0xFFu),
           .projected = (transform.flags & D3DTTFF_PROJECTED) != 0u,
       };
-      std::ranges::copy(std::span(&transform.matrix.m[0][0], 16u), transform_summary.matrix.begin());
+      if (transform.matrix.has_value()) {
+        transform_summary.matrix = std::bit_cast<std::array<float, 16>>(transform.matrix.value());
+      }
       state_summary.texture_transforms.push_back(std::move(transform_summary));
     }
     for (const auto& bump_environment : state.bump_environments) {
@@ -7258,17 +7260,27 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         }
         constexpr std::array<D3DTEXTURESTAGESTATETYPE, 4> BUMP_MATRIX_STATES = {
             D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11};
+        // A vertex shader ignores D3DTSS_TEXCOORDINDEX and the texture matrices; D3DTTFF_PROJECTED still applies to ps_1_x.
+        const bool game_vertex_shader_bound = std::ranges::any_of(get_bound_shaders().shaders, [](const auto& bound) {
+          return bound.stage == reshade::api::pipeline_stage::vertex_shader;
+        });
         for (DWORD stage = 0u; stage < 8u; ++stage) {
-          DWORD texture_coordinate_index = stage;
-          native_device->GetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, &texture_coordinate_index);
-          if (texture_coordinate_index != stage) {
-            state.texture_coordinate_indexes.push_back({.stage = stage, .value = texture_coordinate_index});
+          if (!game_vertex_shader_bound) {
+            DWORD texture_coordinate_index = stage;
+            native_device->GetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, &texture_coordinate_index);
+            if (texture_coordinate_index != stage) {
+              state.texture_coordinate_indexes.push_back({.stage = stage, .value = texture_coordinate_index});
+            }
           }
           DWORD transform_flags = D3DTTFF_DISABLE;
           native_device->GetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, &transform_flags);
           if (transform_flags != D3DTTFF_DISABLE) {
             D3D9DrawState::TextureTransform transform = {.stage = stage, .flags = transform_flags};
-            native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &transform.matrix);
+            if (!game_vertex_shader_bound) {
+              D3DMATRIX matrix = {};
+              native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &matrix);
+              transform.matrix = matrix;
+            }
             state.texture_transforms.push_back(transform);
           }
           std::array<DWORD, BUMP_MATRIX_STATES.size()> bump_matrix = {};
@@ -7474,14 +7486,12 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         // A shader bound before the snapshot frame never went through the snapshot's bind path, which decodes the
         // version that the constant table parse and the register range need.
         if (!shader_details->program_version.has_value()) {
-          EnsureShaderDataForShaderDetails(device, shader_details);
-          if (!shader_details->shader_data.empty()) {
-            try {
-              shader_details->program_version =
-                  renodx::utils::shader::compiler::directx::DecodeShaderVersion(shader_details->shader_data);
-            } catch (const std::exception&) {
-              // Left unknown: the largest register range applies.
-            }
+          try {
+            EnsureShaderDataForShaderDetails(device, shader_details);
+            shader_details->program_version =
+                renodx::utils::shader::compiler::directx::DecodeShaderVersion(shader_details->shader_data);
+          } catch (const std::exception&) {
+            // Bytecode not loadable or not decodable: left unknown, the largest register range applies.
           }
         }
         if (!shader_details->resource_binds.has_value()) {

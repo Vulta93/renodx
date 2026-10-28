@@ -400,8 +400,8 @@ struct D3D9TextureTransformSummary {
   std::string flags_hex;
   std::uint32_t count = 0u;
   bool projected = false;
-  // D3DTS_TEXTUREn, row-major (_11 _12 _13 _14 _21 ...).
-  std::array<float, 16> matrix = {};
+  // D3DTS_TEXTUREn, row-major (_11 _12 _13 _14 _21 ...); fixed-function vertex processing only.
+  std::optional<std::array<float, 16>> matrix = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -411,8 +411,10 @@ inline void to_json(json& j, const D3D9TextureTransformSummary& value) {
       {"flagsHex", value.flags_hex},
       {"count", value.count},
       {"projected", value.projected},
-      {"matrix", value.matrix},
   };
+  if (value.matrix.has_value()) {
+    j["matrix"] = value.matrix.value();
+  }
 }
 
 struct D3D9BumpEnvironmentSummary {
