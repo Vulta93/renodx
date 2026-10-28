@@ -418,7 +418,10 @@ A frame on which the game created no new shader costs one counter read.
 
 Each dump writes a line to `ReShade.log`: `devkit: new shader 0x... dumped as <file>`, as a warning ending in
 `(unported)` when nothing replaced the shader: no game mod replacement (compile-time or runtime) and no live file the
-Devkit compiled. After a playthrough the warnings are the shaders the mod does not cover yet. `action: status` reports
+Devkit has loaded (a file sitting in the live folder while Live Shaders is off counts as nothing). After a playthrough the
+warnings are the shaders the mod does not cover yet. A mod shader handled only in a draw callback (skipped or given
+injected state, with no replacement code) also shows as unported, and without a mod loaded every shader does; on engines
+that create tens of thousands of shaders that is a long log, written on the present thread as shaders appear. `action: status` reports
 the same for this session: `dumpedCount`, `unportedCount`, `pendingCount` (seen but not yet dumped, while Auto Dump is
 off), and the `unported` and `dumped` lists (`shaderHash`, `file`, `replaced`), newest first, at most 64 each.
 Replacement is judged when the shader is dumped, so a live file added later does not change an earlier entry. Unlike
