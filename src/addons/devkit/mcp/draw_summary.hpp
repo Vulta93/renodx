@@ -284,6 +284,11 @@ struct TextureStageSummary {
   TextureStageArgumentSummary alpha_arg1;
   TextureStageArgumentSummary alpha_arg2;
   std::optional<TextureStageArgumentSummary> result_arg = std::nullopt;
+  // D3DTSS_CONSTANT (ARGB), when an argument reads it.
+  std::optional<std::string> constant_hex = std::nullopt;
+  // D3DTSS_BUMPENVLSCALE / BUMPENVLOFFSET, for bump_env_map_luminance.
+  std::optional<float> bump_luminance_scale = std::nullopt;
+  std::optional<float> bump_luminance_offset = std::nullopt;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -305,6 +310,15 @@ inline void to_json(json& j, const TextureStageSummary& value) {
   }
   if (value.result_arg.has_value()) {
     j["resultArg"] = value.result_arg.value();
+  }
+  if (value.constant_hex.has_value()) {
+    j["constantHex"] = value.constant_hex.value();
+  }
+  if (value.bump_luminance_scale.has_value()) {
+    j["bumpLuminanceScale"] = value.bump_luminance_scale.value();
+  }
+  if (value.bump_luminance_offset.has_value()) {
+    j["bumpLuminanceOffset"] = value.bump_luminance_offset.value();
   }
 }
 
@@ -351,11 +365,43 @@ inline void to_json(json& j, const D3D9VertexElementSummary& value) {
   }
 }
 
+struct D3D9AlphaTestSummary {
+  std::string function;
+  std::uint32_t reference = 0u;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const D3D9AlphaTestSummary& value) {
+  j = {
+      {"function", value.function},
+      {"reference", value.reference},
+  };
+}
+
+struct D3D9TextureCoordinateIndexSummary {
+  std::uint32_t stage = 0u;
+  std::uint32_t coordinate_set = 0u;
+  std::optional<std::string> generation_hex = std::nullopt;
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+inline void to_json(json& j, const D3D9TextureCoordinateIndexSummary& value) {
+  j = {
+      {"stage", value.stage},
+      {"coordinateSet", value.coordinate_set},
+  };
+  if (value.generation_hex.has_value()) {
+    j["generationHex"] = value.generation_hex.value();
+  }
+}
+
 struct D3D9TextureTransformSummary {
   std::uint32_t stage = 0u;
   std::string flags_hex;
   std::uint32_t count = 0u;
   bool projected = false;
+  // D3DTS_TEXTUREn, row-major (_11 _12 _13 _14 _21 ...).
+  std::array<float, 16> matrix = {};
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -365,6 +411,7 @@ inline void to_json(json& j, const D3D9TextureTransformSummary& value) {
       {"flagsHex", value.flags_hex},
       {"count", value.count},
       {"projected", value.projected},
+      {"matrix", value.matrix},
   };
 }
 
@@ -402,6 +449,8 @@ inline void to_json(json& j, const D3D9SamplerFilterSummary& value) {
 struct D3D9StateSummary {
   std::optional<std::string> fvf_hex = std::nullopt;
   std::vector<D3D9VertexElementSummary> vertex_elements;
+  std::optional<D3D9AlphaTestSummary> alpha_test = std::nullopt;
+  std::vector<D3D9TextureCoordinateIndexSummary> texture_coordinate_indexes;
   std::vector<D3D9TextureTransformSummary> texture_transforms;
   std::vector<D3D9BumpEnvironmentSummary> bump_environments;
   std::vector<D3D9SamplerFilterSummary> sampler_filters;
@@ -415,6 +464,12 @@ inline void to_json(json& j, const D3D9StateSummary& value) {
   }
   if (!value.vertex_elements.empty()) {
     j["vertexElements"] = value.vertex_elements;
+  }
+  if (value.alpha_test.has_value()) {
+    j["alphaTest"] = value.alpha_test.value();
+  }
+  if (!value.texture_coordinate_indexes.empty()) {
+    j["textureCoordinateIndexes"] = value.texture_coordinate_indexes;
   }
   if (!value.texture_transforms.empty()) {
     j["textureTransforms"] = value.texture_transforms;

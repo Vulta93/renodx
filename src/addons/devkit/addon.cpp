@@ -352,6 +352,11 @@ struct D3D9TextureStage {
   DWORD alpha_arg1 = 0u;
   DWORD alpha_arg2 = 0u;
   DWORD result_arg = 0u;
+  // D3DTSS_CONSTANT, the value a D3DTA_CONSTANT argument reads (D3DCOLOR).
+  DWORD constant = 0u;
+  // D3DTSS_BUMPENVLSCALE and D3DTSS_BUMPENVLOFFSET, which D3DTOP_BUMPENVMAPLUMINANCE applies.
+  float bump_luminance_scale = 0.f;
+  float bump_luminance_offset = 0.f;
 };
 
 struct D3D9FixedFunction {
@@ -368,9 +373,18 @@ struct D3D9DrawState {
   DWORD fvf = 0u;
   // The vertex declaration's elements, without the D3DDECL_END terminator.
   std::vector<D3DVERTEXELEMENT9> vertex_elements;
+  // D3DRS_ALPHAFUNC and D3DRS_ALPHAREF while D3DRS_ALPHATESTENABLE is set.
+  std::optional<std::pair<DWORD, DWORD>> alpha_test = std::nullopt;
+  struct TextureCoordinateIndex {
+    uint32_t stage = 0u;
+    DWORD value = 0u;
+  };
+  // Stages whose D3DTSS_TEXCOORDINDEX is not their own stage number (the default).
+  std::vector<TextureCoordinateIndex> texture_coordinate_indexes;
   struct TextureTransform {
     uint32_t stage = 0u;
     DWORD flags = 0u;
+    D3DMATRIX matrix = {};
   };
   std::vector<TextureTransform> texture_transforms;
   struct BumpEnvironment {
@@ -418,6 +432,7 @@ struct DrawDetails {
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
   // D3D9 draws the game issued without a pixel shader.
   std::optional<D3D9FixedFunction> d3d9_fixed_function = std::nullopt;
+  // Every D3D9 draw (not on a pure device).
   std::optional<D3D9DrawState> d3d9_state = std::nullopt;
   std::optional<std::vector<ResourceBind>> resource_binds = std::nullopt;
   std::shared_ptr<const std::vector<ConstantVariable>> constant_variables;
@@ -3524,6 +3539,16 @@ std::vector<DeviceData*> device_data_list;
           .alpha_arg2 = argument(stage.alpha_arg2),
           .result_arg = (stage.result_arg == D3DTA_CURRENT ? std::nullopt : std::optional(argument(stage.result_arg))),
       });
+      const auto reads_constant = [](DWORD arg) { return (arg & D3DTA_SELECTMASK) == D3DTA_CONSTANT; };
+      if (std::ranges::any_of(
+              std::array{stage.color_arg0, stage.color_arg1, stage.color_arg2, stage.alpha_arg0, stage.alpha_arg1, stage.alpha_arg2},
+              reads_constant)) {
+        stages.back().constant_hex = std::format("0x{:08X}", static_cast<uint32_t>(stage.constant));
+      }
+      if (stage.color_op == D3DTOP_BUMPENVMAPLUMINANCE || stage.alpha_op == D3DTOP_BUMPENVMAPLUMINANCE) {
+        stages.back().bump_luminance_scale = stage.bump_luminance_scale;
+        stages.back().bump_luminance_offset = stage.bump_luminance_offset;
+      }
     }
     // D3DRS_TEXTUREFACTOR is a D3DCOLOR (ARGB, 8 bits per channel).
     draw_summary.fixed_function = devkit_draw_summary::FixedFunctionSummary{
@@ -3554,85 +3579,106 @@ std::vector<DeviceData*> device_data_list;
         default:                      return std::format("unknown_{}", filter);
       }
     };
-    const auto address_name = [](DWORD address) -> std::string {
-      switch (address) {
-        case D3DTADDRESS_WRAP:       return "wrap";
-        case D3DTADDRESS_MIRROR:     return "mirror";
-        case D3DTADDRESS_CLAMP:      return "clamp";
-        case D3DTADDRESS_BORDER:     return "border";
-        case D3DTADDRESS_MIRRORONCE: return "mirror_once";
-        default:                     return std::format("unknown_{}", address);
-      }
-    };
-    const auto type_name = [](BYTE type) -> std::string {
-      switch (type) {
-        case D3DDECLTYPE_FLOAT1:    return "float1";
-        case D3DDECLTYPE_FLOAT2:    return "float2";
-        case D3DDECLTYPE_FLOAT3:    return "float3";
-        case D3DDECLTYPE_FLOAT4:    return "float4";
-        case D3DDECLTYPE_D3DCOLOR:  return "d3dcolor";
-        case D3DDECLTYPE_UBYTE4:    return "ubyte4";
-        case D3DDECLTYPE_SHORT2:    return "short2";
-        case D3DDECLTYPE_SHORT4:    return "short4";
-        case D3DDECLTYPE_UBYTE4N:   return "ubyte4n";
-        case D3DDECLTYPE_SHORT2N:   return "short2n";
-        case D3DDECLTYPE_SHORT4N:   return "short4n";
-        case D3DDECLTYPE_USHORT2N:  return "ushort2n";
-        case D3DDECLTYPE_USHORT4N:  return "ushort4n";
-        case D3DDECLTYPE_UDEC3:     return "udec3";
-        case D3DDECLTYPE_DEC3N:     return "dec3n";
-        case D3DDECLTYPE_FLOAT16_2: return "float16_2";
-        case D3DDECLTYPE_FLOAT16_4: return "float16_4";
-        case D3DDECLTYPE_UNUSED:    return "unused";
-        default:                    return std::format("unknown_{}", type);
-      }
-    };
-    const auto usage_name = [](BYTE usage) -> std::string {
-      switch (usage) {
-        case D3DDECLUSAGE_POSITION:     return "position";
-        case D3DDECLUSAGE_BLENDWEIGHT:  return "blend_weight";
-        case D3DDECLUSAGE_BLENDINDICES: return "blend_indices";
-        case D3DDECLUSAGE_NORMAL:       return "normal";
-        case D3DDECLUSAGE_PSIZE:        return "psize";
-        case D3DDECLUSAGE_TEXCOORD:     return "texcoord";
-        case D3DDECLUSAGE_TANGENT:      return "tangent";
-        case D3DDECLUSAGE_BINORMAL:     return "binormal";
-        case D3DDECLUSAGE_TESSFACTOR:   return "tess_factor";
-        case D3DDECLUSAGE_POSITIONT:    return "positiont";
-        case D3DDECLUSAGE_COLOR:        return "color";
-        case D3DDECLUSAGE_FOG:          return "fog";
-        case D3DDECLUSAGE_DEPTH:        return "depth";
-        case D3DDECLUSAGE_SAMPLE:       return "sample";
-        default:                        return std::format("unknown_{}", usage);
-      }
-    };
     devkit_draw_summary::D3D9StateSummary state_summary = {
         .fvf_hex = (state.fvf == 0u ? std::nullopt : std::optional(std::format("0x{:X}", static_cast<uint32_t>(state.fvf)))),
     };
     for (const auto& element : state.vertex_elements) {
+      std::string type;
+      switch (element.Type) {
+        case D3DDECLTYPE_FLOAT1:    type = "float1"; break;
+        case D3DDECLTYPE_FLOAT2:    type = "float2"; break;
+        case D3DDECLTYPE_FLOAT3:    type = "float3"; break;
+        case D3DDECLTYPE_FLOAT4:    type = "float4"; break;
+        case D3DDECLTYPE_D3DCOLOR:  type = "d3dcolor"; break;
+        case D3DDECLTYPE_UBYTE4:    type = "ubyte4"; break;
+        case D3DDECLTYPE_SHORT2:    type = "short2"; break;
+        case D3DDECLTYPE_SHORT4:    type = "short4"; break;
+        case D3DDECLTYPE_UBYTE4N:   type = "ubyte4n"; break;
+        case D3DDECLTYPE_SHORT2N:   type = "short2n"; break;
+        case D3DDECLTYPE_SHORT4N:   type = "short4n"; break;
+        case D3DDECLTYPE_USHORT2N:  type = "ushort2n"; break;
+        case D3DDECLTYPE_USHORT4N:  type = "ushort4n"; break;
+        case D3DDECLTYPE_UDEC3:     type = "udec3"; break;
+        case D3DDECLTYPE_DEC3N:     type = "dec3n"; break;
+        case D3DDECLTYPE_FLOAT16_2: type = "float16_2"; break;
+        case D3DDECLTYPE_FLOAT16_4: type = "float16_4"; break;
+        case D3DDECLTYPE_UNUSED:    type = "unused"; break;
+        default:                    type = std::format("unknown_{}", element.Type); break;
+      }
+      std::string usage;
+      switch (element.Usage) {
+        case D3DDECLUSAGE_POSITION:     usage = "position"; break;
+        case D3DDECLUSAGE_BLENDWEIGHT:  usage = "blend_weight"; break;
+        case D3DDECLUSAGE_BLENDINDICES: usage = "blend_indices"; break;
+        case D3DDECLUSAGE_NORMAL:       usage = "normal"; break;
+        case D3DDECLUSAGE_PSIZE:        usage = "psize"; break;
+        case D3DDECLUSAGE_TEXCOORD:     usage = "texcoord"; break;
+        case D3DDECLUSAGE_TANGENT:      usage = "tangent"; break;
+        case D3DDECLUSAGE_BINORMAL:     usage = "binormal"; break;
+        case D3DDECLUSAGE_TESSFACTOR:   usage = "tess_factor"; break;
+        case D3DDECLUSAGE_POSITIONT:    usage = "positiont"; break;
+        case D3DDECLUSAGE_COLOR:        usage = "color"; break;
+        case D3DDECLUSAGE_FOG:          usage = "fog"; break;
+        case D3DDECLUSAGE_DEPTH:        usage = "depth"; break;
+        case D3DDECLUSAGE_SAMPLE:       usage = "sample"; break;
+        default:                        usage = std::format("unknown_{}", element.Usage); break;
+      }
       state_summary.vertex_elements.push_back(devkit_draw_summary::D3D9VertexElementSummary{
           .stream = element.Stream,
           .offset = element.Offset,
-          .type = type_name(element.Type),
+          .type = std::move(type),
           .method = element.Method,
-          .usage = usage_name(element.Usage),
+          .usage = std::move(usage),
           .usage_index = element.UsageIndex,
+      });
+    }
+    if (state.alpha_test.has_value()) {
+      const auto [alpha_function, alpha_reference] = state.alpha_test.value();
+      // D3DCMPFUNC 1-8: never, less, equal, less_equal, greater, not_equal, greater_equal, always.
+      constexpr std::array<const char*, 8> COMPARISON_NAMES = {
+          "never", "less", "equal", "less_equal", "greater", "not_equal", "greater_equal", "always"};
+      state_summary.alpha_test = devkit_draw_summary::D3D9AlphaTestSummary{
+          .function = (alpha_function >= D3DCMP_NEVER && alpha_function <= D3DCMP_ALWAYS
+                           ? std::string(COMPARISON_NAMES[alpha_function - D3DCMP_NEVER])
+                           : std::format("unknown_{}", alpha_function)),
+          .reference = static_cast<uint32_t>(alpha_reference),
+      };
+    }
+    for (const auto& index : state.texture_coordinate_indexes) {
+      // The low word is the texture coordinate set; the high word a D3DTSS_TCI_* generation mode.
+      state_summary.texture_coordinate_indexes.push_back(devkit_draw_summary::D3D9TextureCoordinateIndexSummary{
+          .stage = index.stage,
+          .coordinate_set = static_cast<uint32_t>(index.value & 0xFFFFu),
+          .generation_hex = ((index.value & 0xFFFF0000u) == 0u
+                                 ? std::nullopt
+                                 : std::optional(std::format("0x{:X}", static_cast<uint32_t>(index.value & 0xFFFF0000u)))),
       });
     }
     for (const auto& transform : state.texture_transforms) {
       // D3DTTFF_COUNT1..4 in the low byte; D3DTTFF_PROJECTED divides by the last coordinate.
-      state_summary.texture_transforms.push_back(devkit_draw_summary::D3D9TextureTransformSummary{
+      devkit_draw_summary::D3D9TextureTransformSummary transform_summary = {
           .stage = transform.stage,
           .flags_hex = std::format("0x{:X}", static_cast<uint32_t>(transform.flags)),
           .count = static_cast<uint32_t>(transform.flags & 0xFFu),
           .projected = (transform.flags & D3DTTFF_PROJECTED) != 0u,
-      });
+      };
+      std::ranges::copy(std::span(&transform.matrix.m[0][0], 16u), transform_summary.matrix.begin());
+      state_summary.texture_transforms.push_back(std::move(transform_summary));
     }
     for (const auto& bump_environment : state.bump_environments) {
+      std::string address_u;
+      switch (bump_environment.address_u) {
+        case D3DTADDRESS_WRAP:       address_u = "wrap"; break;
+        case D3DTADDRESS_MIRROR:     address_u = "mirror"; break;
+        case D3DTADDRESS_CLAMP:      address_u = "clamp"; break;
+        case D3DTADDRESS_BORDER:     address_u = "border"; break;
+        case D3DTADDRESS_MIRRORONCE: address_u = "mirror_once"; break;
+        default:                     address_u = std::format("unknown_{}", bump_environment.address_u); break;
+      }
       state_summary.bump_environments.push_back(devkit_draw_summary::D3D9BumpEnvironmentSummary{
           .stage = bump_environment.stage,
           .matrix = bump_environment.matrix,
-          .address_u = address_name(bump_environment.address_u),
+          .address_u = std::move(address_u),
       });
     }
     for (const auto& filter : state.sampler_filters) {
@@ -3642,7 +3688,12 @@ std::vector<DeviceData*> device_data_list;
           .min_filter = filter_name(filter.min_filter),
       });
     }
-    draw_summary.d3d9_state = std::move(state_summary);
+    // Left out when every value is the default.
+    if (state_summary.fvf_hex.has_value() || !state_summary.vertex_elements.empty() || state_summary.alpha_test.has_value()
+        || !state_summary.texture_coordinate_indexes.empty() || !state_summary.texture_transforms.empty()
+        || !state_summary.bump_environments.empty() || !state_summary.sampler_filters.empty()) {
+      draw_summary.d3d9_state = std::move(state_summary);
+    }
   }
 
   return draw_summary;
@@ -5904,9 +5955,10 @@ void OnInitDevice(reshade::api::device* device) {
   device_data->is_d3d9_ex = renodx::utils::device::IsD3D9ExDevice(device);
   if (device_api == reshade::api::device_api::d3d9) {
     D3DDEVICE_CREATION_PARAMETERS creation_parameters = {};
-    auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(device->get_native()));
-    device_data->is_d3d9_pure_device = SUCCEEDED(native_device->GetCreationParameters(&creation_parameters))
-                                       && (creation_parameters.BehaviorFlags & D3DCREATE_PUREDEVICE) != 0u;
+    if (SUCCEEDED(reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(device->get_native()))
+                      ->GetCreationParameters(&creation_parameters))) {
+      device_data->is_d3d9_pure_device = (creation_parameters.BehaviorFlags & D3DCREATE_PUREDEVICE) != 0u;
+    }
   }
   device_data->watch_region_watcher.begin_linked_snapshot = [device_data]() -> std::optional<uint64_t> {
     if (snapshot_queued_device != nullptr) return std::nullopt;
@@ -7164,6 +7216,9 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
               .alpha_arg1 = read_stage_state(stage, D3DTSS_ALPHAARG1),
               .alpha_arg2 = read_stage_state(stage, D3DTSS_ALPHAARG2),
               .result_arg = read_stage_state(stage, D3DTSS_RESULTARG),
+              .constant = read_stage_state(stage, D3DTSS_CONSTANT),
+              .bump_luminance_scale = std::bit_cast<float>(read_stage_state(stage, D3DTSS_BUMPENVLSCALE)),
+              .bump_luminance_offset = std::bit_cast<float>(read_stage_state(stage, D3DTSS_BUMPENVLOFFSET)),
           });
         }
         native_device->GetRenderState(D3DRS_TEXTUREFACTOR, &fixed_function.texture_factor);
@@ -7171,8 +7226,9 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         native_device->GetRenderState(D3DRS_SPECULARENABLE, &specular_enable);
         fixed_function.specular_enable = specular_enable != FALSE;
         Microsoft::WRL::ComPtr<IDirect3DPixelShader9> device_pixel_shader;
-        fixed_function.device_pixel_shader_bound =
-            SUCCEEDED(native_device->GetPixelShader(&device_pixel_shader)) && device_pixel_shader != nullptr;
+        if (SUCCEEDED(native_device->GetPixelShader(&device_pixel_shader))) {
+          fixed_function.device_pixel_shader_bound = (device_pixel_shader != nullptr);
+        }
         draw_details.d3d9_fixed_function = std::move(fixed_function);
       }
 
@@ -7191,13 +7247,29 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
             }
           }
         }
+        DWORD alpha_test_enable = FALSE;
+        native_device->GetRenderState(D3DRS_ALPHATESTENABLE, &alpha_test_enable);
+        if (alpha_test_enable != FALSE) {
+          DWORD alpha_function = D3DCMP_ALWAYS;
+          DWORD alpha_reference = 0u;
+          native_device->GetRenderState(D3DRS_ALPHAFUNC, &alpha_function);
+          native_device->GetRenderState(D3DRS_ALPHAREF, &alpha_reference);
+          state.alpha_test = std::pair(alpha_function, alpha_reference);
+        }
         constexpr std::array<D3DTEXTURESTAGESTATETYPE, 4> BUMP_MATRIX_STATES = {
             D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11};
         for (DWORD stage = 0u; stage < 8u; ++stage) {
+          DWORD texture_coordinate_index = stage;
+          native_device->GetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, &texture_coordinate_index);
+          if (texture_coordinate_index != stage) {
+            state.texture_coordinate_indexes.push_back({.stage = stage, .value = texture_coordinate_index});
+          }
           DWORD transform_flags = D3DTTFF_DISABLE;
           native_device->GetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, &transform_flags);
           if (transform_flags != D3DTTFF_DISABLE) {
-            state.texture_transforms.push_back({.stage = stage, .flags = transform_flags});
+            D3D9DrawState::TextureTransform transform = {.stage = stage, .flags = transform_flags};
+            native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &transform.matrix);
+            state.texture_transforms.push_back(transform);
           }
           std::array<DWORD, BUMP_MATRIX_STATES.size()> bump_matrix = {};
           for (std::size_t index = 0u; index < BUMP_MATRIX_STATES.size(); ++index) {
@@ -7399,11 +7471,27 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         if (shader_details == nullptr) {
           shader_details = device_data->GetShaderDetails(shader_hash);
         }
+        // A shader bound before the snapshot frame never went through the snapshot's bind path, which decodes the
+        // version that the constant table parse and the register range need.
+        if (!shader_details->program_version.has_value()) {
+          EnsureShaderDataForShaderDetails(device, shader_details);
+          if (!shader_details->shader_data.empty()) {
+            try {
+              shader_details->program_version =
+                  renodx::utils::shader::compiler::directx::DecodeShaderVersion(shader_details->shader_data);
+            } catch (const std::exception&) {
+              // Left unknown: the largest register range applies.
+            }
+          }
+        }
         if (!shader_details->resource_binds.has_value()) {
           GetResourceBindsForShaderDetails(device, device_data, shader_details);
         }
         const bool is_pixel_shader = (stage == reshade::api::pipeline_stage::pixel_shader);
-        if (!is_pixel_shader) {
+        if (is_pixel_shader) {
+          draw_details.resource_binds = shader_details->resource_binds;
+          draw_details.constant_variables = shader_details->constant_variables;
+        } else {
           draw_details.vertex_constant_variables = shader_details->constant_variables;
         }
         // ReShade's D3D9 layout pushes vertex shader float/int/bool registers at parameters 2/3/4, pixel at 5/6/7.
@@ -7418,16 +7506,23 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
             register_count = std::max<uint64_t>(register_count, (static_cast<uint64_t>(variable.first_word) + variable.word_count + 3u) / 4u);
           }
         }
-        if (!has_constant_table && shader_details->program_version.has_value()) {
-          // Float registers per shader model: ps_1_x 8, ps_2_x 32, ps_3_0 224; vs_1_1 96, vs_2_x and vs_3_0 256.
+        // Float registers per shader model: ps_1_x 8, ps_2_x 32, ps_3_0 224; vs_1_1 96, vs_2_x and vs_3_0 256. An
+        // unknown version takes the largest.
+        uint64_t model_register_count = (is_pixel_shader ? 224u : 256u);
+        if (shader_details->program_version.has_value()) {
           const auto major = shader_details->program_version->GetMajor();
           if (is_pixel_shader) {
-            register_count = (major <= 1u ? 8u : (major == 2u ? 32u : 224u));
+            model_register_count = (major <= 1u ? 8u : (major == 2u ? 32u : 224u));
           } else {
-            register_count = (major <= 1u ? 96u : 256u);
+            model_register_count = (major <= 1u ? 96u : 256u);
           }
         }
-        // Every D3D9 push goes to ReShade's one global layout, so any pushed key names it.
+        // A replacement (a game mod's or a live file) can read registers the original's table does not list, such as
+        // constants an add-on injects with its own Set*ShaderConstantF calls, which raise no push event.
+        if (!has_constant_table || !shader_details->addon_shader.empty() || shader_details->HasCompiledDiskShader()) {
+          register_count = std::max(register_count, model_register_count);
+        }
+        // Every D3D9 push goes to ReShade's one global layout, so any pushed key names it; 0 until the game pushes.
         uint64_t layout_handle = 0u;
         for (const auto& [push_constant_key, pushed] : command_list_data->push_constants) {
           const auto& [pushed_layout_handle, pushed_layout_param, pushed_stages, pushed_gl_program] = push_constant_key;
@@ -7442,13 +7537,16 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         if (register_count != 0u) {
           auto* native_device = reinterpret_cast<IDirect3DDevice9*>(static_cast<uintptr_t>(cmd_list->get_native()));
           std::vector<float> registers(register_count * 4u);
-          const HRESULT result = (is_pixel_shader
-                                      ? native_device->GetPixelShaderConstantF(0u, registers.data(), static_cast<UINT>(register_count))
-                                      : native_device->GetVertexShaderConstantF(0u, registers.data(), static_cast<UINT>(register_count)));
+          HRESULT result = E_FAIL;
+          if (is_pixel_shader) {
+            result = native_device->GetPixelShaderConstantF(0u, registers.data(), static_cast<UINT>(register_count));
+          } else {
+            result = native_device->GetVertexShaderConstantF(0u, registers.data(), static_cast<UINT>(register_count));
+          }
           if (SUCCEEDED(result)) {
             std::vector<uint32_t> values(registers.size());
             std::ranges::transform(registers, values.begin(), [](float value) { return std::bit_cast<uint32_t>(value); });
-            // Inserted first, so the pushed float registers of the same key below do not replace it.
+            // Inserted before the pushed values are copied, whose emplace then keeps it for the same key.
             draw_details.push_constants[{layout_handle, float_layout_param, shader_stage, 0u}] = PushConstantValues{
                 .first_written = 0u,
                 .values = std::move(values),
@@ -7837,6 +7935,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         default:
           break;
       }
+      // emplace: a D3D9 float entry read from the device for this key stays.
       draw_details.push_constants.emplace(
           push_constant_key,
           PushConstantValues{

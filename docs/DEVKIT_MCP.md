@@ -241,14 +241,17 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     float constants. Float and int register N start at word 4 * N; bool register N is word N. The float constants
     (`layoutParam` 5 and 2, `valuesSource: "device"`) are read from the device at the draw (`GetPixelShaderConstantF`,
     `GetVertexShaderConstantF`) rather than collected from pushes: from c0 up to the end of the shader's constant table,
-    or without one the shader model's float registers (ps_1_x 8, ps_2_x 32, ps_3_0 224, vs_1_1 96, vs_2_x/vs_3_0 256),
-    or further when the game pushed higher registers during the snapshot, at most 256 registers. Every word is then
-    known (no `unwrittenRanges`), whenever and by whom it was set: constants set in an earlier frame, by a state block,
-    or by an add-on that injects its own constants (RenoDX shader injection) all show. A ps_1_x shader clamps its
-    constants to [-1, 1] when it reads them; the device holds, and the Devkit reports, the unclamped values. The int and
-    bool registers (`layoutParam` 6/7) stay collected from pushes. On a pure device (`D3DCREATE_PUREDEVICE`), whose
-    `Get*` calls are not reliable, the float constants are collected from pushes too, pixel shader only. `layoutHandle` is
-    ReShade's one D3D9 layout, or 0 when the game pushed no constant during the snapshot.
+    or the shader model's float registers (ps_1_x 8, ps_2_x 32, ps_3_0 224, vs_1_1 96, vs_2_x/vs_3_0 256; the largest
+    when the version is unknown) when there is no table or the shader has a replacement (a game mod's or a live file,
+    which can read registers the original's table does not list), or further when the game pushed higher registers
+    during the snapshot, at most 256 registers. Every word in that range is the device's value (no `unwrittenRanges`),
+    whenever and by whom it was set: constants set in an earlier frame, by a state block, or by an add-on that injects
+    its own (RenoDX shader injection, often from c50, which raises no push event) all show. A register the shader
+    defines itself (`def`) shows the device's value, not the one the shader reads. A ps_1_x shader clamps its constants
+    to [-1, 1] when it reads them; the device holds, and the Devkit reports, the unclamped values. The int and bool
+    registers (`layoutParam` 6/7) stay collected from pushes. On a pure device (`D3DCREATE_PUREDEVICE`), whose `Get*`
+    calls are not reliable, the float constants are collected from pushes too, pixel shader only. `layoutHandle` is
+    ReShade's one D3D9 layout, or 0 until the game's first push of the snapshot (early draws of a snapshot can show 0).
   - OpenGL `glUniform*`: word 4 * location. Values are kept per program (the one current at each call) and per context,
     and a draw lists only its own program's (`glProgram`), since a location means something different in every program;
     a uniform set on another context of the share group is not seen. Arrays and matrices fill consecutive words from
@@ -261,7 +264,8 @@ is missing, or shows a value from an earlier snapshot on D3D9 (int and bool regi
 context, whose state is kept between frames. Vertex shader constants are not included, except the D3D9 float ones and on
 OpenGL, where uniforms belong to the whole linked program.
 
-`valueNames` labels the words with the active pixel (or compute) shader's own variable names, read from the reflection
+`valueNames` labels the words with the active pixel (or compute) shader's own variable names (the D3D9 vertex shader's
+for its own float constants), read from the reflection
 in its disassembly (on OpenGL, the linked program's active uniforms, all stages): each entry is `name`, `index` (into
 `floatValues`/`uintValues`) and `count` (words).
 - D3D10/11 constant buffers and D3D12 root constants (DXBC `//` or DXIL `;` disassembly): the "Buffer Definitions"
@@ -328,11 +332,15 @@ from the device at each such draw (`GetTextureStageState`, `GetRenderState`), th
   `colorArg1`/`colorArg2` and `alphaArg1`/`alphaArg2` as `{source, complement?, alphaReplicate?}` (source `diffuse`,
   `current`, `texture`, `texture_factor`, `specular`, `temp` or `constant`; `complement` is D3DTA_COMPLEMENT, 1 - x;
   `alphaReplicate` is D3DTA_ALPHAREPLICATE), `colorArg0`/`alphaArg0` only for `multiply_add` and `lerp`, which use three
-  operands, and `resultArg` only when the stage writes somewhere else than `current` (usually `temp`).
+  operands, `resultArg` only when the stage writes somewhere else than `current` (usually `temp`), `constantHex`
+  (D3DTSS_CONSTANT, ARGB) only when an argument reads `constant`, and `bumpLuminanceScale`/`bumpLuminanceOffset`
+  (D3DTSS_BUMPENVLSCALE/LOFFSET) only for `bump_env_map_luminance`.
 - `textureFactor` (D3DRS_TEXTUREFACTOR as RGBA 0-1) with `textureFactorHex` (the raw ARGB value), and `specularEnable`.
-- `devicePixelShaderBound`: the device had a pixel shader bound although the game bound none. An add-on drew the draw with
-  its own shader (a stand-in), which it binds without a ReShade event; the stages are still the game's, which is what the
-  stand-in has to reproduce.
+- `devicePixelShaderBound`: the device had a pixel shader bound although the snapshot recorded none for the draw. Usually
+  an add-on drew the draw with its own shader (a stand-in), which it binds without a ReShade event; the stages are still
+  the game's, which is what the stand-in has to reproduce. It is also set for a game pixel shader the Devkit could not
+  identify (no pipeline information, for example one created before the Devkit tracked pipelines); then the stages are
+  not what the draw used.
 
 Why it matters for HDR: the stages compute in the hardware's fixed-point range, so `modulate2x`, `modulate4x` and `add`
 stages clamp at white (1.0) before blending, and `add_signed`/`subtract` clamp at 0. A stand-in pixel shader that
@@ -351,15 +359,22 @@ a pure device). Default values are left out, so most draws carry only a few fiel
   `color` or `positiont`, `usageIndex`, and `method` when not default). A shader port must declare the same input. The
   runtime can report an FVF derived from a declaration and a declaration generated from an FVF, so both are listed as
   the device reports them.
+- `alphaTest`: `function` (`never`, `less`, `equal`, `less_equal`, `greater`, `not_equal`, `greater_equal`, `always`)
+  and `reference` (0-255) while D3DRS_ALPHATESTENABLE is set. A port into a float target has to keep the discard.
+- `textureCoordinateIndexes`: stages whose D3DTSS_TEXCOORDINDEX is not their own stage number: `coordinateSet` and,
+  for generated coordinates (D3DTSS_TCI_CAMERASPACENORMAL and others), `generationHex`.
 - `textureTransforms`: stages whose D3DTSS_TEXTURETRANSFORMFLAGS are not `D3DTTFF_DISABLE`, with `flagsHex`, `count`
-  (D3DTTFF_COUNT1..4) and `projected` (D3DTTFF_PROJECTED). ps_1_x and the fixed-function stages honour `projected`; a
-  ps_2_0+ port must reproduce it with `tex2Dproj`.
+  (D3DTTFF_COUNT1..4), `projected` (D3DTTFF_PROJECTED) and `matrix` (D3DTS_TEXTUREn, row-major). ps_1_x and the
+  fixed-function stages honour `projected`; a ps_2_0+ port must reproduce it with `tex2Dproj`.
 - `bumpEnvironments`: stages with a non-zero bump-environment matrix (`matrix` = BUMPENVMAT00, 01, 10, 11), which `texbem`
   and the `bump_env_map` ops read, and that stage's `addressU` (`wrap`, `mirror`, `clamp`, `border`, `mirror_once`). A
   port passes the matrix as a constant.
 - `samplerFilters`: samplers 0-15 with a texture bound whose filters are not both `point` (the default): `magFilter` and
   `minFilter` (`point`, `linear`, `anisotropic`, ...). A port that sets its own filters must restore the game's, or later
   draws inherit them.
+
+`d3d9State` is left out when every value is the default. Not covered: D3D9 lighting and material state, fog, the world,
+view and projection transforms, clip planes and the vertex shader samplers.
 
 ### Replacement status (`devkit_list_replacements`)
 
