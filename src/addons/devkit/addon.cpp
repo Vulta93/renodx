@@ -646,7 +646,8 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   HWND primary_swapchain_hwnd = nullptr;
   bool primary_swapchain_is_flip = false;
   bool is_d3d9_ex = false;
-  // D3DCREATE_PUREDEVICE: the device's Get* state calls are not reliable, so the snapshot reads no D3D9 state beyond blending.
+  // D3DCREATE_PUREDEVICE, reported by devkit_status: Direct3D documents no Get* state calls for it, but the current runtime
+  // answers them (verified in Prince of Persia: The Sands of Time), so the snapshot reads its state like any other's.
   bool is_d3d9_pure_device = false;
   // The D3D11 device a RenoDX Display Proxy presents the game's frames on. It is listed only for the measuring tools
   // (devkit_analyze_resource, devkit_watch_region): no snapshots, shader tracking, live shaders or clones.
@@ -5965,7 +5966,7 @@ void OnInitDevice(reshade::api::device* device) {
     if (device_data->is_d3d9_pure_device) {
       reshade::log::message(
           reshade::log::level::warning,
-          "devkit: D3D9 device created with D3DCREATE_PUREDEVICE: snapshots read no fixed-function stages, d3d9State or device constants.");
+          "devkit: D3D9 device created with D3DCREATE_PUREDEVICE: snapshots still read its state; a state read that fails leaves its field out.");
     }
   }
   device_data->watch_region_watcher.begin_linked_snapshot = [device_data]() -> std::optional<uint64_t> {
@@ -7202,15 +7203,20 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       const bool game_pixel_shader_bound = std::ranges::any_of(get_bound_shaders().shaders, [](const auto& bound) {
         return bound.stage == reshade::api::pipeline_stage::pixel_shader;
       });
-      if (!device_data->is_d3d9_pure_device && !game_pixel_shader_bound) {
+      // Every read below checks its result: a failed read leaves its field (or the whole fixedFunction) out instead of
+      // reporting the zero it left behind.
+      if (!game_pixel_shader_bound) {
+        bool fixed_function_known = true;
         const auto read_stage_state = [&](DWORD stage, D3DTEXTURESTAGESTATETYPE state) -> DWORD {
           DWORD value = 0u;
-          native_device->GetTextureStageState(stage, state, &value);
+          if (FAILED(native_device->GetTextureStageState(stage, state, &value))) {
+            fixed_function_known = false;
+          }
           return value;
         };
         D3D9FixedFunction fixed_function = {};
         // D3D9 has at most eight texture blending stages.
-        for (DWORD stage = 0u; stage < 8u; ++stage) {
+        for (DWORD stage = 0u; stage < 8u && fixed_function_known; ++stage) {
           const DWORD color_op = read_stage_state(stage, D3DTSS_COLOROP);
           if (color_op == D3DTOP_DISABLE) break;
           fixed_function.stages.push_back(D3D9TextureStage{
@@ -7229,22 +7235,28 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
               .bump_luminance_offset = std::bit_cast<float>(read_stage_state(stage, D3DTSS_BUMPENVLOFFSET)),
           });
         }
-        native_device->GetRenderState(D3DRS_TEXTUREFACTOR, &fixed_function.texture_factor);
         DWORD specular_enable = FALSE;
-        native_device->GetRenderState(D3DRS_SPECULARENABLE, &specular_enable);
+        if (FAILED(native_device->GetRenderState(D3DRS_TEXTUREFACTOR, &fixed_function.texture_factor))
+            || FAILED(native_device->GetRenderState(D3DRS_SPECULARENABLE, &specular_enable))) {
+          fixed_function_known = false;
+        }
         fixed_function.specular_enable = specular_enable != FALSE;
         Microsoft::WRL::ComPtr<IDirect3DPixelShader9> device_pixel_shader;
         if (SUCCEEDED(native_device->GetPixelShader(&device_pixel_shader))) {
           fixed_function.device_pixel_shader_bound = (device_pixel_shader != nullptr);
         }
-        draw_details.d3d9_fixed_function = std::move(fixed_function);
+        if (fixed_function_known) {
+          draw_details.d3d9_fixed_function = std::move(fixed_function);
+        }
       }
 
       // What a port of the draw has to reproduce beyond its shaders. The runtime can report an FVF derived from a
       // declaration and a declaration generated from an FVF, so both are kept as the device reports them.
-      if (!device_data->is_d3d9_pure_device) {
+      {
         D3D9DrawState state = {};
-        native_device->GetFVF(&state.fvf);
+        if (FAILED(native_device->GetFVF(&state.fvf))) {
+          state.fvf = 0u;
+        }
         Microsoft::WRL::ComPtr<IDirect3DVertexDeclaration9> vertex_declaration;
         if (SUCCEEDED(native_device->GetVertexDeclaration(&vertex_declaration)) && vertex_declaration != nullptr) {
           std::array<D3DVERTEXELEMENT9, MAXD3DDECLLENGTH + 1> elements = {};
@@ -7256,13 +7268,13 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           }
         }
         DWORD alpha_test_enable = FALSE;
-        native_device->GetRenderState(D3DRS_ALPHATESTENABLE, &alpha_test_enable);
-        if (alpha_test_enable != FALSE) {
+        if (SUCCEEDED(native_device->GetRenderState(D3DRS_ALPHATESTENABLE, &alpha_test_enable)) && alpha_test_enable != FALSE) {
           DWORD alpha_function = D3DCMP_ALWAYS;
           DWORD alpha_reference = 0u;
-          native_device->GetRenderState(D3DRS_ALPHAFUNC, &alpha_function);
-          native_device->GetRenderState(D3DRS_ALPHAREF, &alpha_reference);
-          state.alpha_test = std::pair(alpha_function, alpha_reference);
+          if (SUCCEEDED(native_device->GetRenderState(D3DRS_ALPHAFUNC, &alpha_function))
+              && SUCCEEDED(native_device->GetRenderState(D3DRS_ALPHAREF, &alpha_reference))) {
+            state.alpha_test = std::pair(alpha_function, alpha_reference);
+          }
         }
         constexpr std::array<D3DTEXTURESTAGESTATETYPE, 4> BUMP_MATRIX_STATES = {
             D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11};
@@ -7276,32 +7288,35 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         for (DWORD stage = 0u; stage < 8u; ++stage) {
           if (!vertex_shader_bound) {
             DWORD texture_coordinate_index = stage;
-            native_device->GetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, &texture_coordinate_index);
-            if (texture_coordinate_index != stage) {
+            if (SUCCEEDED(native_device->GetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, &texture_coordinate_index))
+                && texture_coordinate_index != stage) {
               state.texture_coordinate_indexes.push_back({.stage = stage, .value = texture_coordinate_index});
             }
           }
           DWORD transform_flags = D3DTTFF_DISABLE;
-          native_device->GetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, &transform_flags);
-          if (transform_flags != D3DTTFF_DISABLE) {
+          if (SUCCEEDED(native_device->GetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, &transform_flags))
+              && transform_flags != D3DTTFF_DISABLE) {
             D3D9DrawState::TextureTransform transform = {.stage = stage, .flags = transform_flags};
-            if (!vertex_shader_bound) {
-              D3DMATRIX matrix = {};
-              native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &matrix);
+            D3DMATRIX matrix = {};
+            if (!vertex_shader_bound
+                && SUCCEEDED(native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &matrix))) {
               transform.matrix = matrix;
             }
             state.texture_transforms.push_back(transform);
           }
           std::array<DWORD, BUMP_MATRIX_STATES.size()> bump_matrix = {};
+          bool bump_matrix_known = true;
           for (std::size_t index = 0u; index < BUMP_MATRIX_STATES.size(); ++index) {
-            native_device->GetTextureStageState(stage, BUMP_MATRIX_STATES[index], &bump_matrix[index]);
+            if (FAILED(native_device->GetTextureStageState(stage, BUMP_MATRIX_STATES[index], &bump_matrix[index]))) {
+              bump_matrix_known = false;
+            }
           }
-          if (std::ranges::any_of(bump_matrix, [](DWORD entry) { return entry != 0u; })) {
-            D3D9DrawState::BumpEnvironment bump_environment = {.stage = stage};
+          D3D9DrawState::BumpEnvironment bump_environment = {.stage = stage};
+          if (bump_matrix_known && std::ranges::any_of(bump_matrix, [](DWORD entry) { return entry != 0u; })
+              && SUCCEEDED(native_device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &bump_environment.address_u))) {
             std::ranges::transform(bump_matrix, bump_environment.matrix.begin(), [](DWORD entry) {
               return std::bit_cast<float>(entry);
             });
-            native_device->GetSamplerState(stage, D3DSAMP_ADDRESSU, &bump_environment.address_u);
             state.bump_environments.push_back(bump_environment);
           }
         }
@@ -7310,8 +7325,10 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           Microsoft::WRL::ComPtr<IDirect3DBaseTexture9> texture;
           if (FAILED(native_device->GetTexture(sampler, &texture)) || texture == nullptr) continue;
           D3D9DrawState::SamplerFilter filter = {.sampler = sampler, .mag_filter = D3DTEXF_POINT, .min_filter = D3DTEXF_POINT};
-          native_device->GetSamplerState(sampler, D3DSAMP_MAGFILTER, &filter.mag_filter);
-          native_device->GetSamplerState(sampler, D3DSAMP_MINFILTER, &filter.min_filter);
+          if (FAILED(native_device->GetSamplerState(sampler, D3DSAMP_MAGFILTER, &filter.mag_filter))
+              || FAILED(native_device->GetSamplerState(sampler, D3DSAMP_MINFILTER, &filter.min_filter))) {
+            continue;
+          }
           if (filter.mag_filter == D3DTEXF_POINT && filter.min_filter == D3DTEXF_POINT) continue;
           state.sampler_filters.push_back(filter);
         }
@@ -7487,7 +7504,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       // made during snapshot frames, and none of a vertex shader's. They replace the pushed float registers (the int and
       // bool ones stay pushed) over the shader's constant table, or its shader model's registers without one, and every
       // register the game pushed. Words follow the push layout: register cN at word 4 * N.
-      if (device->get_api() == reshade::api::device_api::d3d9 && !device_data->is_d3d9_pure_device
+      if (device->get_api() == reshade::api::device_api::d3d9
           && (stage == reshade::api::pipeline_stage::pixel_shader || stage == reshade::api::pipeline_stage::vertex_shader)) {
         if (shader_details == nullptr) {
           shader_details = device_data->GetShaderDetails(shader_hash);

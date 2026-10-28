@@ -249,8 +249,8 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     its own (RenoDX shader injection, often from c50, which raises no push event) all show. A register the shader
     defines itself (`def`) shows the device's value, not the one the shader reads. A ps_1_x shader clamps its constants
     to [-1, 1] when it reads them; the device holds, and the Devkit reports, the unclamped values. The int and bool
-    registers (`layoutParam` 6/7) stay collected from pushes. On a pure device (`D3DCREATE_PUREDEVICE`), whose `Get*`
-    calls are not reliable, the float constants are collected from pushes too, pixel shader only. `layoutHandle` is
+    registers (`layoutParam` 6/7) stay collected from pushes. When the device refuses the read, the float constants are
+    collected from pushes too, pixel shader only. `layoutHandle` is
     ReShade's one D3D9 layout, or 0 until the game's first push of the snapshot (early draws of a snapshot can show 0).
   - OpenGL `glUniform*`: word 4 * location. Values are kept per program (the one current at each call) and per context,
     and a draw lists only its own program's (`glProgram`), since a location means something different in every program;
@@ -346,14 +346,19 @@ Why it matters for HDR: the stages compute in the hardware's fixed-point range, 
 stages clamp at white (1.0) before blending, and `add_signed`/`subtract` clamp at 0. A stand-in pixel shader that
 reproduces the stages in float has to clamp the same way where the game relies on it, or decide on purpose not to.
 
-The stages are read only on draws without a game pixel shader, only while a snapshot records, and not on a pure device
-(created with `D3DCREATE_PUREDEVICE`), whose `Get*` state calls are not reliable. `devkit_status` reports such a device
+The stages are read only on draws without a game pixel shader and only while a snapshot records. Every read checks its
+result: when one fails, `fixedFunction` is left out rather than filled with zeros.
+
+Pure devices (created with `D3DCREATE_PUREDEVICE`): Direct3D documents no `Get*` state calls for them, but the current
+D3D9 runtime answers them, so the Devkit reads them like any other device; a read the runtime refuses leaves its field out.
+Verified in Prince of Persia: The Sands of Time (GOG, whose wrapper creates a pure device): the blend state read per draw
+matched the frame (opaque scene, unblended glow downsample, ONE + ONE glow add). `devkit_status` reports such a device
 with `isD3D9PureDevice: true`, and `ReShade.log` has a warning from the Devkit when it is created.
 
 ### D3D9 porting state (`d3d9State` in `devkit_get_draw`)
 
-What a port of a D3D9 draw has to reproduce beyond its shaders, read from the device at every recorded D3D9 draw (not on
-a pure device). Default values are left out, so most draws carry only a few fields:
+What a port of a D3D9 draw has to reproduce beyond its shaders, read from the device at every recorded D3D9 draw. Default
+values, and values whose read failed, are left out, so most draws carry only a few fields:
 
 - `fvfHex` (the FVF code, when not 0) and `vertexElements` (the vertex declaration: `stream`, `offset`, `type` as the
   D3DDECLTYPE name such as `float3` or `d3dcolor`, `usage` as the D3DDECLUSAGE name such as `position`, `texcoord`,
