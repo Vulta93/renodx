@@ -7261,11 +7261,14 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
         constexpr std::array<D3DTEXTURESTAGESTATETYPE, 4> BUMP_MATRIX_STATES = {
             D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11};
         // A vertex shader ignores D3DTSS_TEXCOORDINDEX and the texture matrices; D3DTTFF_PROJECTED still applies to ps_1_x.
-        const bool game_vertex_shader_bound = std::ranges::any_of(get_bound_shaders().shaders, [](const auto& bound) {
-          return bound.stage == reshade::api::pipeline_stage::vertex_shader;
-        });
+        // The device's binding decides, since any vertex shader (an add-on's, or one the snapshot did not identify) does.
+        Microsoft::WRL::ComPtr<IDirect3DVertexShader9> device_vertex_shader;
+        bool vertex_shader_bound = false;
+        if (SUCCEEDED(native_device->GetVertexShader(&device_vertex_shader))) {
+          vertex_shader_bound = (device_vertex_shader != nullptr);
+        }
         for (DWORD stage = 0u; stage < 8u; ++stage) {
-          if (!game_vertex_shader_bound) {
+          if (!vertex_shader_bound) {
             DWORD texture_coordinate_index = stage;
             native_device->GetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, &texture_coordinate_index);
             if (texture_coordinate_index != stage) {
@@ -7276,7 +7279,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           native_device->GetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, &transform_flags);
           if (transform_flags != D3DTTFF_DISABLE) {
             D3D9DrawState::TextureTransform transform = {.stage = stage, .flags = transform_flags};
-            if (!game_vertex_shader_bound) {
+            if (!vertex_shader_bound) {
               D3DMATRIX matrix = {};
               native_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(D3DTS_TEXTURE0 + stage), &matrix);
               transform.matrix = matrix;
