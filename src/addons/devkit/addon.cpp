@@ -430,7 +430,7 @@ struct DrawDetails {
   ConstantBufferValuesSource constant_buffer_values_source = ConstantBufferValuesSource::UNSUPPORTED_API;
   // Copied while the draw is recorded, since games rewrite the same constant buffer between draws. std::nullopt is a
   // buffer the constants tracker does not know (CPU_CACHE: Trace Constant Buffers off at startup) or one that was not
-  // read (CPU_MAPPED: untracked or released, not CPU-visible, or Map failed).
+  // read (CPU_MAPPED: untracked or released, not a buffer, GPU-only or reserved, empty, or Map failed).
   std::map<std::pair<uint32_t, uint32_t>, std::optional<std::vector<uint8_t>>> constant_buffer_bytes;
   std::map<PushConstantKey, PushConstantValues> push_constants;
   std::map<uint32_t, ResourceViewDetails> render_targets;
@@ -7942,7 +7942,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     // that a snapshot of thousands of draws stays small.
     const bool has_reflected_shader_binds = draw_details.resource_binds.has_value() && !draw_details.resource_binds->empty();
     // D3D12 and Vulkan games write constant buffers through persistent maps or copies, which the CPU-side cache never
-    // sees. D3D12 buffers are mapped and read while the draw is recorded (OnDraw runs at record time), when games
+    // sees, so D3D12 buffers are mapped and read by the Devkit while the draw is recorded (OnDraw runs at record time), when games
     // usually have written its constants already; after execution a ring allocator may have reused them. Vulkan memory
     // the game already mapped cannot be mapped again.
     switch (device_api) {
@@ -7975,7 +7975,9 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       // The entry starts as std::nullopt (not CPU readable) and gets bytes only after a successful read.
       auto& captured_bytes = draw_details.constant_buffer_bytes[slot_space];
       // Cached descriptor heaps can still hold views of released resources, so only a tracked, live buffer is touched.
-      // Map on a GPU-only heap or a reserved resource (heap unknown) fails and is a debug-layer error, so it is not tried.
+      // Map on a default heap or a reserved resource (heap unknown) fails and is a debug-layer error, so it is not tried
+      // (a custom heap without CPU access still is). A release on another thread between this check and Map is not
+      // guarded; the window is short and only open during snapshots.
       std::optional<reshade::api::resource_desc> buffer_desc = std::nullopt;
       renodx::utils::resource::GetResourceInfo(
           buffer_range.buffer,
@@ -7992,6 +7994,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       if (buffer_range.offset >= buffer_size) continue;
       // Root constant buffer views arrive with size UINT64_MAX: the read stops at the end of the buffer.
       const auto read_size = std::min(captured_size, buffer_size - buffer_range.offset);
+      if (read_size == 0u) continue;
       // D3D12 Map is reference-counted, so mapping a buffer the game keeps mapped is legal. ReShade's own map call reaches
       // the unhooked Map, so no map events fire.
       void* mapped_data = nullptr;
