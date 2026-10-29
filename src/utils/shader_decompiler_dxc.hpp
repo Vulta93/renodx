@@ -2244,7 +2244,7 @@ class Decompiler {
                 ParseInt(alignment),
             };
           }
-        } else if (functionName == "@dx.op.bufferLoad.i32") {
+        } else if (functionName == "@dx.op.bufferLoad.i32" || functionName == "@dx.op.bufferLoad.f32") {
           // call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %4, i32 6, i32 undef)  ; BufferLoad(srv,index,wot)
           // call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %31, i32 %28, i32 undef)  ; BufferLoad(srv,index,wot)
           auto [opNumber, srv, index, wot] = StringViewSplit<4>(functionParamsString, param_regex, 2);
@@ -2255,38 +2255,13 @@ class Decompiler {
           } else if (resource_class == "1") {
             assignment_type = preprocess_state.uav_resources[range_index].data_type;
           } else {
-            throw std::runtime_error("Unknown @dx.op.bufferLoad.i32 resource");
+            throw std::runtime_error(std::format("Unknown {} resource", functionName));
           }
           // On a structured buffer (SM 6.0/6.1) wot is the byte offset into the element: resolved per member at extractvalue,
           // as for rawBufferLoad. A dynamic offset keeps the typed-buffer form.
-          const bool is_constant_offset = !wot.empty() && std::ranges::all_of(wot, [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
-          if (is_constant_offset && resource_class == "0"
-              && preprocess_state.srv_resources[range_index].shape == Resource::ResourceKind::StructuredBuffer) {
-            preprocess_state.srv_binding_load_variables[variable] = {
-                &preprocess_state.srv_resources[range_index], ParseInt(index), std::string(wot), "4"};
-          } else if (is_constant_offset && resource_class == "1"
-                     && preprocess_state.uav_resources[range_index].shape == Resource::ResourceKind::StructuredBuffer) {
-            preprocess_state.uav_binding_load_variables[variable] = {
-                &preprocess_state.uav_resources[range_index], ParseInt(index), std::string(wot), "4"};
-          } else {
-            assignment_value = std::format("{}.Load{}", res_name, ParseWrapped(ParseInt(index)));
-          }
-
-        } else if (functionName == "@dx.op.bufferLoad.f32") {
-          // call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %31, i32 %28, i32 undef)  ; BufferLoad(srv,index,wot)
-          auto [opNumber, srv, index, wot] = StringViewSplit<4>(functionParamsString, param_regex, 2);
-          auto ref = std::string{srv.substr(1)};
-          auto [res_name, range_index, resource_class] = preprocess_state.resource_binding_variables.at(ref);
-          if (resource_class == "0") {
-            assignment_type = preprocess_state.srv_resources[range_index].data_type;
-          } else if (resource_class == "1") {
-            assignment_type = preprocess_state.uav_resources[range_index].data_type;
-          } else {
-            throw std::runtime_error("Unknown @dx.op.bufferLoad.f32 resource");
-          }
-          // On a structured buffer (SM 6.0/6.1) wot is the byte offset into the element: resolved per member at extractvalue,
-          // as for rawBufferLoad. A dynamic offset keeps the typed-buffer form.
-          const bool is_constant_offset = !wot.empty() && std::ranges::all_of(wot, [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+          const bool is_constant_offset = !wot.empty() && std::ranges::all_of(wot, [](char c) {
+            return std::isdigit(static_cast<unsigned char>(c)) != 0;
+          });
           if (is_constant_offset && resource_class == "0"
               && preprocess_state.srv_resources[range_index].shape == Resource::ResourceKind::StructuredBuffer) {
             preprocess_state.srv_binding_load_variables[variable] = {
