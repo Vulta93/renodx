@@ -4607,6 +4607,39 @@ class Decompiler {
     auto convergences = current_code_function->ListConvergences();
     auto recursions = current_code_function->ListRecursions();
 
+    // Whether every path from `from` passes through `target` before the function returns. A block every branch can reach
+    // is not enough to converge on: with short-circuit conditions (a || b) one path can skip it and the code after it would
+    // be emitted twice. No return is emitted, so a branch that returns early converges only at the shared exit, and the
+    // code after it is emitted in both arms. A path back to the innermost loop's header ends there (emitted as continue).
+    const auto is_on_every_path = [&](int target, int from) {
+      std::set<int> visited;
+      std::vector<int> pending = {from};
+      while (!pending.empty()) {
+        const int block_number = pending.back();
+        pending.pop_back();
+        if (block_number == target || !visited.insert(block_number).second) continue;
+        if (!current_loops.empty() && block_number == current_loops.back()) continue;
+        const auto found_block = current_code_function->code_blocks.find(block_number);
+        if (found_block == current_code_function->code_blocks.end()) return false;
+        const auto& [found_number, code_block] = *found_block;
+        const auto pending_size = pending.size();
+        if (code_block.code_branch.branch_condition_true > 0) {
+          pending.push_back(code_block.code_branch.branch_condition_true);
+        }
+        if (code_block.code_branch.branch_condition_false > 0) {
+          pending.push_back(code_block.code_branch.branch_condition_false);
+        }
+        if (!code_block.code_switch.switch_condition.empty()) {
+          pending.push_back(code_block.code_switch.case_default);
+          for (const auto& [case_value, case_function] : code_block.code_switch.case_values) {
+            pending.push_back(case_function);
+          }
+        }
+        if (pending.size() == pending_size) return false;
+      }
+      return true;
+    };
+
 #if DECOMPILER_DXC_DEBUG >= 2
     for (const auto& [a, b] : convergences) {
       std::cout << "Convergences " << a << " = ";
@@ -4633,7 +4666,10 @@ class Decompiler {
     }
 #endif
 
-    std::function<void(int line_number)> append_code_block = [&](int line_number) {
+    // Each nested block is a recursion level: control flow the emitter cannot structure must fail as an error, not
+    // overflow the stack of the thread that decompiles (a game's, for the Devkit).
+    std::function<void(int line_number, int depth)> append_code_block = [&](int line_number, int depth) {
+      if (depth >= 256) throw std::runtime_error("Control flow nested too deeply");
       std::set<int> recursion_pops;
       if (!pending_recursions.empty()) {
         recursion_pops = pending_recursions.rbegin()[0];
@@ -4756,7 +4792,7 @@ class Decompiler {
             throw std::runtime_error("Unexpected goto");
           }
         } else {
-          append_code_block(branch_number);
+          append_code_block(branch_number, depth + 1);
         }
       };
 
@@ -4767,7 +4803,8 @@ class Decompiler {
           bool missing = false;
           bool has_match = false;
           for (const auto branch : code_block.code_switch.branches) {
-            if (convergence_line_number == branch || callers.contains(branch)) {
+            if ((convergence_line_number == branch || callers.contains(branch))
+                && is_on_every_path(convergence_line_number, branch)) {
               has_match = true;
             } else {
               missing = true;
@@ -4891,7 +4928,9 @@ class Decompiler {
       for (auto& [convergence_line_number, callers] : convergences) {
         if (
             (convergence_line_number == code_block.code_branch.branch_condition_true || callers.contains(code_block.code_branch.branch_condition_true))
-            && (convergence_line_number == code_block.code_branch.branch_condition_false || callers.contains(code_block.code_branch.branch_condition_false))) {
+            && (convergence_line_number == code_block.code_branch.branch_condition_false || callers.contains(code_block.code_branch.branch_condition_false))
+            && is_on_every_path(convergence_line_number, code_block.code_branch.branch_condition_true)
+            && is_on_every_path(convergence_line_number, code_block.code_branch.branch_condition_false)) {
           if (convergence_line_number == next_convergence) break;
           pair_convergence = convergence_line_number;
           if (!pending_convergences.empty()) {
@@ -5046,7 +5085,7 @@ class Decompiler {
     }
 
     indent_spacing();
-    append_code_block(0);
+    append_code_block(0, 0);
     unindent_spacing();
 
     if (output_signature_count == 0) {
