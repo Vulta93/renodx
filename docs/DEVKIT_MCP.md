@@ -92,6 +92,7 @@ blocks other Devkit tool calls (worst case 60 s key + 30 s delay + 120 s).
 - `devkit_dump_resource_with_hash`
 - `devkit_analyze_lut`
 - `devkit_set_resource_clone`
+- `devkit_upgrade_rules` (resource upgrade rules for the next launch)
 
 ### Texture replacement rules (experimental)
 
@@ -679,6 +680,66 @@ Use `devkit_set_resource_clone` to enable cloning, then analyze the same resourc
 - `preferClone: true`
 
 This is the authoritative way to answer whether the upgraded path is actually preserving HDR data.
+
+### Upgrade rules for the next launch (`devkit_upgrade_rules`)
+
+A live clone (`devkit_set_resource_clone`) swaps one existing texture. It cannot reach resources the game creates at
+startup, and it is not what a mod does. Upgrade rules are: they are saved in `ReShade.ini` and applied at the next
+launch, as the game creates its resources, by the same create-time upgrade a mod's `resource_upgrade_infos` gets.
+
+Rules are deliberately narrow and never on by default:
+
+- `add` with a `resourceHandle` (e.g. a render target from a snapshot) writes the narrowest rule for that texture:
+  its exact creation format, width, height, depth, usage and initial state. It dry-runs the rule on the live resources
+  and refuses when it matches more than that one, unless `allowMultiple: true` or an `index` is passed. The Devkit does
+  not know creation order: `index` counts matching creations from 0 since the last swap chain creation or resize
+  (`upgrade::OnInitSwapchain` resets the counts), so the right value is found by trying.
+- `add` does not enable. `enable` / `disable` switch all rules (`UpgradeRulesEnabled`, off by default); `remove` takes
+  `rule` (a slot); `clear` removes every rule and disables.
+- One rule per key, `[renodx-dev] UpgradeRule0` to `UpgradeRule7`, fields named after `ResourceUpgradeInfo`, all required:
+
+  ```ini
+  [renodx-dev]
+  UpgradeRulesEnabled=1
+  UpgradeRule0=old_format=r8g8b8a8_unorm new_format=r16g16b16a16_float width=1920 height=1080 depth=1 usage=0x... state=0x... index=-1
+  ```
+
+  A working rule translates one-to-one into mod code: `old_format`, `new_format`, `dimensions = {width, height, depth}`,
+  `usage` (exact match), `state`, `index`. `state=0x0` matches any initial state. The new format is the one
+  `VIEW_UPGRADES_RGBA16F` maps the old format to (`r16g16b16a16_float`; `r16g16b16a16_typeless` for typeless
+  resources); other targets are not offered yet. One unreadable rule disables all of them for that launch (ReShade.log
+  says which).
+- On Vulkan the Devkit's own create_resource (Copyable Vulkan Images) runs before the upgrade's, so the usage a rule
+  matches includes the `copy_source` bit the Devkit adds, as the tracked usage `add` reads does. Translating a rule into
+  mod code for Vulkan: drop that bit unless the game sets it itself. Keep the setting as it was when the rule was added,
+  or the rule stops matching (`upgradeCount` 0).
+- Refused: buffers, swap chain buffers, clones, shared resources, depth-stencil, resources already upgraded, and formats
+  `VIEW_UPGRADES_RGBA16F` does not map.
+
+`status` (the default) reports:
+
+- `launchState`: `applied`; `off` (no enabled rules); `mod_owns_upgrades` (a loaded RenoDX mod owns the shared resource
+  upgrade handlers and their per-device rule list, so the Devkit refuses to apply rules: disable the mod, e.g. with
+  `install-addon.ps1 -Disable`; a mod that upgrades nothing still blocks them); `crash_guard` (see below).
+- `appliedRules` (empty unless `applied`) with `upgradeCount`: matching creations since the last swap chain creation or
+  resize, copied on present. The rule upgraded a resource once the count exceeds `index` (above 0 for `index=-1`); 0
+  means nothing matched (for example the game's usage or initial state differs from what was tracked).
+- `savedRules` and `enabledNextLaunch`: what the next launch will apply.
+
+Crash guard: a launch that applies rules writes its process id and executable name to
+`renodx-dev\upgrade_rules_launch.pending` and removes the file after 600 presents of the game's swap chain (about
+10 s). If a file from another process of the same executable is there at the next launch, that launch starts
+with rules switched off and saves `UpgradeRulesEnabled=0` (the file goes after 600 presents of that launch, or at the
+next launch without enabled rules). The same process id is the same launch reloading the add-on (ReShade unloads
+add-ons when a game releases its last device), which does not trip it. A crash later in play does not trip it;
+quitting the game within about 10 s does.
+
+Without enabled rules the Devkit does not register the resource upgrade handlers at all, as before. Deleting the
+`UpgradeRule*` keys (or setting `UpgradeRulesEnabled=0`) undoes everything. Ownership is checked at load and again when the
+game's device starts; a mod loaded after the Devkit also gives `mod_owns_upgrades`.
+
+APIs: whatever `utils/resource_upgrade.hpp` handles for mods (D3D9, D3D10/11, D3D12, Vulkan, OpenGL). Game-tested so
+far on D3D11 only.
 
 ## 10. Dump formats
 
