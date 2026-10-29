@@ -866,12 +866,18 @@ void RunCmdDecompiler(const std::filesystem::path& cmd_decompiler_path,
       sections.disassembly = disassembly_string;
       if (renodx::utils::shader::compiler::directx::DecodeShaderVersion(shader_data).GetMajor() < 6) {
         sections.decompilation = DecompileDxbcWithCmdDecompiler(shader_data);
-      } else {
+        return sections;
+      }
+      // A shader the decompiler cannot handle keeps its disassembly. use_do_while is not a fallback: on a UE LUT builder's
+      // short-circuit branch it emitted code that compiles but runs the shared continuation twice.
+      try {
         sections.decompilation = renodx::utils::shader::decompiler::dxc::Decompiler().Decompile(
             disassembly_string,
             {
                 .flatten = true,
             });
+      } catch (const std::exception& e) {
+        sections.decompilation = e;
       }
       return sections;
     }

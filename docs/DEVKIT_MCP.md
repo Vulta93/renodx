@@ -626,7 +626,7 @@ to repair it: delete `bin\cmd_Decompiler.exe`, then run the script with `-Instal
 `bin` once per game; a decompilation that failed before is tried again on the next `devkit_get_shader` or
 `devkit_write_shader_stub` call. For the full tool bootstrap and the remaining optional reverse-engineering binaries, see `docs/CONTRIBUTING.md`.
 
-Devkit MCP can already disassemble tracked DirectX shaders. Decompilation is best-effort: DXBC SM4/5 shaders use `cmd_Decompiler.exe` from the configured tools path, while DXIL SM6 shaders use the internal DXC decompiler path. The external tools in `.\bin` are still useful when you want standalone files on disk or alternate reverse-engineering workflows.
+Devkit MCP can already disassemble tracked DirectX shaders. Decompilation is best-effort: DXBC SM4/5 shaders use `cmd_Decompiler.exe` from the configured tools path, while DXIL SM6 shaders use the internal DXC decompiler path (it fails on branches with no structured form, such as the short-circuit conditions of UE LUT builders ("Unexpected goto"); mesh, hull and domain shaders fail on their patch constant or primitive signature, and geometry and amplification shaders use calls it does not handle; the disassembly is still returned). The external tools in `.\bin` are still useful when you want standalone files on disk or alternate reverse-engineering workflows.
 
 Example:
 
