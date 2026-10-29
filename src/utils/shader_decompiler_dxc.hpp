@@ -2250,7 +2250,20 @@ class Decompiler {
           } else {
             throw std::runtime_error("Unknown @dx.op.bufferLoad.i32 resource");
           }
-          assignment_value = std::format("{}.Load{}", res_name, ParseWrapped(ParseInt(index)));
+          // On a structured buffer (SM 6.0/6.1) wot is the byte offset into the element: resolved per member at extractvalue,
+          // as for rawBufferLoad. A dynamic offset keeps the typed-buffer form.
+          const bool is_constant_offset = !wot.empty() && std::ranges::all_of(wot, [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+          if (is_constant_offset && resource_class == "0"
+              && preprocess_state.srv_resources[range_index].shape == Resource::ResourceKind::StructuredBuffer) {
+            preprocess_state.srv_binding_load_variables[variable] = {
+                &preprocess_state.srv_resources[range_index], ParseInt(index), std::string(wot), "4"};
+          } else if (is_constant_offset && resource_class == "1"
+                     && preprocess_state.uav_resources[range_index].shape == Resource::ResourceKind::StructuredBuffer) {
+            preprocess_state.uav_binding_load_variables[variable] = {
+                &preprocess_state.uav_resources[range_index], ParseInt(index), std::string(wot), "4"};
+          } else {
+            assignment_value = std::format("{}.Load{}", res_name, ParseWrapped(ParseInt(index)));
+          }
 
         } else if (functionName == "@dx.op.bufferLoad.f32") {
           // call %dx.types.ResRet.i32 @dx.op.bufferLoad.i32(i32 68, %dx.types.Handle %31, i32 %28, i32 undef)  ; BufferLoad(srv,index,wot)
@@ -2264,7 +2277,20 @@ class Decompiler {
           } else {
             throw std::runtime_error("Unknown @dx.op.bufferLoad.f32 resource");
           }
-          assignment_value = std::format("{}.Load{}", res_name, ParseWrapped(ParseInt(index)));
+          // On a structured buffer (SM 6.0/6.1) wot is the byte offset into the element: resolved per member at extractvalue,
+          // as for rawBufferLoad. A dynamic offset keeps the typed-buffer form.
+          const bool is_constant_offset = !wot.empty() && std::ranges::all_of(wot, [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; });
+          if (is_constant_offset && resource_class == "0"
+              && preprocess_state.srv_resources[range_index].shape == Resource::ResourceKind::StructuredBuffer) {
+            preprocess_state.srv_binding_load_variables[variable] = {
+                &preprocess_state.srv_resources[range_index], ParseInt(index), std::string(wot), "4"};
+          } else if (is_constant_offset && resource_class == "1"
+                     && preprocess_state.uav_resources[range_index].shape == Resource::ResourceKind::StructuredBuffer) {
+            preprocess_state.uav_binding_load_variables[variable] = {
+                &preprocess_state.uav_resources[range_index], ParseInt(index), std::string(wot), "4"};
+          } else {
+            assignment_value = std::format("{}.Load{}", res_name, ParseWrapped(ParseInt(index)));
+          }
         } else if (functionName == "@dx.op.threadId.i32") {
           // call i32 @dx.op.threadId.i32(i32 93, i32 0)  ; ThreadId(component)
           auto [opNumber, component] = StringViewSplit<2>(functionParamsString, param_regex, 2);
@@ -4396,17 +4422,21 @@ class Decompiler {
 
     for (const auto& srv_resource : preprocess_state.srv_resources) {
       auto pair = preprocess_state.type_definitions.find(srv_resource.data_type);
+      if (pair == preprocess_state.type_definitions.end()) {
+        // A structured buffer's data_type is its bare element name; its type is keyed by the resource pointer's type.
+        pair = preprocess_state.type_definitions.find(srv_resource.pointer.substr(0, srv_resource.pointer.length() - 1));
+      }
       if (pair != preprocess_state.type_definitions.end()) {
-        auto& resource_type_definition = pair->second;
+        const auto* resource_type_definition = &pair->second;
 
-        if (resource_type_definition.name.starts_with("%\"class.StructuredBuffer<")) {
-          auto struct_pair = preprocess_state.type_definitions.find(resource_type_definition.variables[0].type);
+        if (resource_type_definition->name.starts_with("%\"class.StructuredBuffer<")) {
+          auto struct_pair = preprocess_state.type_definitions.find(resource_type_definition->variables[0].type);
           if (struct_pair != preprocess_state.type_definitions.end()) {
-            resource_type_definition = struct_pair->second;
+            resource_type_definition = &struct_pair->second;
           }
         }
         if (srv_resource.shape == SRVResource::ResourceKind::StructuredBuffer) {
-          declare_definition(resource_type_definition.name, "");
+          declare_definition(resource_type_definition->name, "");
         }
       }
 
