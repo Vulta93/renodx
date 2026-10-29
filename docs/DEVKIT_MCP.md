@@ -726,11 +726,11 @@ Rules are deliberately narrow and never on by default:
   means nothing matched (for example the game's usage or initial state differs from what was tracked).
 - `savedRules` and `enabledNextLaunch`: what the next launch will apply.
 
-Crash guard: a launch that applies rules writes its process id and executable name to
-`renodx-dev\upgrade_rules_launch.pending` and removes the file after 600 presents of the game's swap chain (about
-10 s). If a file from another process of the same executable is there at the next launch, that launch starts
+Crash guard: a launch that applies rules writes its process id to `renodx-dev\upgrade_rules_launch.<exe>.pending`
+(one file per executable, so a launcher sharing the ReShade folder does not touch the game's) and removes it after 600
+presents of the game's swap chain (about 10 s). If a file from another process is there at the next launch, that launch starts
 with rules switched off and saves `UpgradeRulesEnabled=0` (the file goes after 600 presents of that launch, or at the
-next launch without enabled rules). The same process id is the same launch reloading the add-on (ReShade unloads
+next launch without enabled rules, or on `enable`). The same process id is the same launch reloading the add-on (ReShade unloads
 add-ons when a game releases its last device), which does not trip it. A crash later in play does not trip it;
 quitting the game within about 10 s does.
 

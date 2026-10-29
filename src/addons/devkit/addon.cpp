@@ -1642,8 +1642,20 @@ std::atomic_uint32_t upgrade_rules_presents = 0u;
 // Each applied rule's matching creations since the last swap chain creation or resize, copied on present.
 std::array<std::atomic_uint32_t, MAX_UPGRADE_RULES> launch_upgrade_counts = {};
 
+// One marker per executable: a launcher sharing this ReShade folder (and its rules) must not overwrite the game's.
 [[nodiscard]] std::filesystem::path GetUpgradeRulesLaunchMarkerPath() {
-  return renodx::utils::path::GetOutputPath() / "upgrade_rules_launch.pending";
+  auto executable_path = std::wstring(32768, L'\0');
+  SetLastError(ERROR_SUCCESS);
+  const auto executable_path_size = GetModuleFileNameW(
+      nullptr,
+      executable_path.data(),
+      static_cast<DWORD>(executable_path.size()));
+  std::wstring executable_name = L"unknown";
+  if (executable_path_size > 0 && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+    executable_path.resize(executable_path_size);
+    executable_name = std::filesystem::path(executable_path).filename().wstring();
+  }
+  return renodx::utils::path::GetOutputPath() / std::format(L"upgrade_rules_launch.{}.pending", executable_name);
 }
 
 // The format VIEW_UPGRADES_RGBA16F gives this format's views (typeless stays typeless), unknown when it has none.
@@ -5107,6 +5119,11 @@ void DumpPendingShaders() {
     if (action == "enable" && upgrade_rules_ini.rules.empty()) return make_error("There are no saved rules to enable.");
     upgrade_rules_ini.enabled = (action == "enable");
     upgrade_rules_save_requested.store(true);
+    // Re-enabled after the guard tripped: the failed launch's marker would trip it again at the next launch.
+    if (action == "enable" && upgrade_rules_launch_state == UpgradeRulesLaunchState::CRASH_GUARD) {
+      std::error_code marker_error;
+      std::filesystem::remove(GetUpgradeRulesLaunchMarkerPath(), marker_error);
+    }
     action_text = std::format("Rules {}. ", (action == "enable" ? "enabled" : "disabled"));
   } else if (action != "status") {
     return make_error("action must be 'status', 'add', 'remove', 'clear', 'enable' or 'disable'.");
@@ -12958,9 +12975,9 @@ void OnPresent(
     }
   }
   // APPLIED: the launch ran cleanly. CRASH_GUARD: ReShade has long flushed the saved UpgradeRulesEnabled=0.
+  // Display Proxy presents returned above, so only the game's swap chain counts.
   if (const auto launch_state = upgrade_rules_launch_state.load();
-      !data->is_display_proxy
-      && (launch_state == UpgradeRulesLaunchState::APPLIED || launch_state == UpgradeRulesLaunchState::CRASH_GUARD)
+      (launch_state == UpgradeRulesLaunchState::APPLIED || launch_state == UpgradeRulesLaunchState::CRASH_GUARD)
       && upgrade_rules_presents.fetch_add(1u) + 1u == UPGRADE_RULES_STABLE_PRESENTS) {
     std::error_code marker_error;
     std::filesystem::remove(GetUpgradeRulesLaunchMarkerPath(), marker_error);
@@ -12973,7 +12990,7 @@ void OnPresent(
     if (auto* upgrade_data = renodx::utils::data::Get<renodx::utils::resource::upgrade::DeviceData>(device);
         upgrade_data != nullptr) {
       const std::shared_lock upgrade_lock(upgrade_data->mutex);
-      // A Display Proxy device has no rules of its own.
+      // A device whose SetUpgradeInfos failed has no counts for these rules.
       if (upgrade_data->upgrade_counts.size() == launch_upgrade_rules.size()) {
         for (std::size_t slot = 0u; slot < launch_upgrade_rules.size(); ++slot) {
           launch_upgrade_counts[slot].store(upgrade_data->upgrade_counts[slot].load());
@@ -13216,20 +13233,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       {
         std::error_code marker_error;
         const auto marker_path = GetUpgradeRulesLaunchMarkerPath();
-        // The marker holds the process id and executable name of the launch that wrote it. The same id is this launch's
-        // add-on reload (ReShade unloads add-ons when a game releases its last device), not a failed launch; another
-        // executable sharing this ReShade folder (a launcher) is not this game's launch.
-        std::wstring executable_path(MAX_PATH, L'\0');
-        executable_path.resize(GetModuleFileNameW(nullptr, executable_path.data(), MAX_PATH));
-        const auto executable_name = renodx::utils::path::ToUtf8(std::filesystem::path(executable_path).filename());
+        // The marker holds the process id of the launch that wrote it. The same id is this launch's add-on reload
+        // (ReShade unloads add-ons when a game releases its last device), not a failed launch. A reused process id
+        // could hide a failed launch; that is accepted.
         bool previous_launch_failed = false;
         if (std::ifstream marker_file(marker_path); marker_file.is_open()) {
           DWORD marker_process_id = 0u;
-          std::string marker_executable_name;
           marker_file >> marker_process_id;
-          marker_file >> std::ws;
-          std::getline(marker_file, marker_executable_name);
-          previous_launch_failed = marker_executable_name == executable_name && marker_process_id != GetCurrentProcessId();
+          previous_launch_failed = marker_process_id != GetCurrentProcessId();
         }
         if (launch_upgrade_rules.empty()) {
           // Rules switched off since that launch: its marker would trip the guard when they are enabled again.
@@ -13256,7 +13267,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
             upgrade_rules_launch_state = UpgradeRulesLaunchState::APPLIED;
             std::filesystem::create_directories(marker_path.parent_path(), marker_error);
             std::ofstream marker_file(marker_path);
-            marker_file << GetCurrentProcessId() << "\n" << executable_name << "\n";
+            marker_file << GetCurrentProcessId() << "\n";
             if (!marker_file) {
               reshade::log::message(
                   reshade::log::level::warning,
