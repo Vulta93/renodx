@@ -830,6 +830,14 @@ class Decompiler {
       FromStringView(ParseKeyValue(metadata[4])[1], this->signature_index);
       FromStringView(ParseKeyValue(metadata[5])[1], this->signature_range);
 
+      const auto register_name = [&]() {
+        auto name = (space == 0u)
+                        ? std::format("{}{}", prefix, signature_index)
+                        : std::format("{}{}_space{}", prefix, signature_index, space);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        return name;
+      };
+
       if (this->name.empty()) {
         std::string hlsl_bind = (space == 0u)
                                     ? std::format("{}{}", prefix, signature_index)
@@ -838,19 +846,18 @@ class Decompiler {
         for (const auto& description : resource_descriptions) {
           if (description.hlsl_binding == hlsl_bind) {
             if (description.name.empty()) {
-              if (space == 0u) {
-                this->name = std::format("{}{}", prefix, signature_index);
-              } else {
-                this->name = std::format("{}{}_space{}", prefix, signature_index, space);
-              }
-              std::transform(this->name.begin(), this->name.end(), this->name.begin(),
-                             [](unsigned char c) { return std::tolower(c); });
+              this->name = register_name();
             } else {
               this->name = description.name;
             }
             break;
           }
         }
+      }
+      // Names like _12 (shaders translated by spirv-cross) collide with the decompiler's own temporaries (_<id>).
+      static const auto TEMPORARY_NAME = std::regex{R"(_\d+)"};
+      if (std::regex_match(this->name, TEMPORARY_NAME)) {
+        this->name = register_name();
       }
     };
 
