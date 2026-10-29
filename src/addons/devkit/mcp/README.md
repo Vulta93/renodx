@@ -81,6 +81,7 @@ This keeps tool definitions readable without building large raw JSON blobs by ha
 | [`resource_analysis.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_analysis.hpp) | Resource readback, preview, EXR/PNG dump, and hash-named dump handlers. |
 | [`resource_clone.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/resource_clone.hpp) | Clone hotswap toggle tool handler. |
 | [`watch_region.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/watch_region.hpp) | `devkit_watch_region`: GPU region statistics before every writer of a texture (D3D11 in place; D3D12/Vulkan copies reduced at frame end), per-writer trace and aggregates. |
+| [`gpu_timing.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/gpu_timing.hpp) | `devkit_gpu_timing`: timestamp queries per draw/dispatch on normal frames (D3D11 immediate context, D3D12 per command list), GPU ms per pass and per shader, plain-versus-instrumented check, match to a snapshot. |
 | [`texture_replace.hpp`](/C:/Mods/renodx/src/addons/devkit/mcp/texture_replace.hpp) | Texture replacement rule, observation, dump, and enable-state tool handlers. |
 
 ## Runtime Flow

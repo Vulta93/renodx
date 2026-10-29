@@ -89,6 +89,7 @@ blocks other Devkit tool calls (worst case 60 s key + 30 s delay + 120 s).
 
 - `devkit_analyze_resource`
 - `devkit_watch_region`
+- `devkit_gpu_timing` (GPU ms per pass and per shader of normal frames, D3D11 and D3D12, see section 10)
 - `devkit_dump_resource_with_hash`
 - `devkit_analyze_lut`
 - `devkit_set_resource_clone`
@@ -1028,6 +1029,53 @@ of averaging. `devkit_dump_resource_with_hash` shares this path. The numbers des
 for a plain box resolve. Refused: multisampled depth-stencil resources, and every multisampled resource on D3D12 and
 Vulkan, where the resolve needs the texture in a resolve-source state the tool does not know. `devkit_watch_region` still
 refuses multisampled textures: watch the texture the game resolves into instead.
+
+### GPU time per pass and shader (`devkit_gpu_timing`, D3D11 and D3D12)
+
+The snapshot records every draw on the CPU, which starves the GPU, so a snapshot frame cannot be timed. `devkit_gpu_timing`
+times normally running frames instead: each draw and dispatch gets one timestamp query right before it, and the tool reports
+GPU milliseconds per pass and per shader. It is meant for relative comparison (a mod's extra passes, upgraded targets and
+swap chain proxy against vanilla, same scene, Release builds), not for absolute benchmarks.
+
+- A run lasts a few dozen presents. Phases of 4 presents alternate between instrumented frames (a stamp per draw) and plain
+  frames (a stamp per command list only). Each frame is classified afterwards from the lists it executed; a mix is dropped.
+  The result shows both medians, so the cost of the stamps is visible (`frame.instrumentedMinusPlainFraction`, and
+  `contaminated` above 10%).
+- A draw's time is the interval to the next stamp in GPU order. GPUs overlap draws, so only passes (draws on the same render
+  target set, dispatches of the same shader) and shaders are reported, never single draws. `sumOfPassMinimaMs` adds each
+  pass's best frame and is not a frame time; compare `frame.instrumentedMedianMs`.
+- Clears, copies and resolves have no stamp and are billed to the previous draw. So is the work a mod inserts in its own draw
+  handler before the Devkit's handler (the Devkit loads last), and D3D12 bundles and D3D11 deferred contexts (counted under
+  `untimed`). The last interval of a frame runs to the Devkit's present handler, so it contains a mod's present-time passes
+  (swap chain proxy, intermediate pass).
+- D3D12 records the stamps per command list (the model of `devkit_watch_region`) and orders them by submission. Only lists
+  executed on the presenting queue count. Lists on other queues overlap the timed queue and are billed to no interval; lists
+  executed again without a reset (their stamps are invalidated, both executions) and lists already recording when the run
+  started are billed to the previous interval. All three are reported under `untimed`, counted per execution (a list that is
+  never reset adds one per frame). The first stamp of each list ends a "between lists" interval
+  (`frame.betweenListsMedianMs`): GPU idle time plus the previous list's last draw. That draw is still counted in its pass
+  and shader (`draws`), with 0 ms, so the pass layout still matches the snapshot's. The query heap is native (ReShade's own makes one fence per slot); a finished
+  run keeps the heap, its readback buffer and fence until the game exits (at most 8 runs), because a list recorded during
+  the run may still execute its stamps. The resolves ride in ReShade's immediate list, which ReShade flushes at the end of
+  the present, and the fence is signalled at the next present, so no extra flush is added.
+- D3D11 stamps the immediate context only and wraps every frame in a `D3D11_QUERY_TIMESTAMP_DISJOINT` (its frequency is used,
+  disjoint frames are dropped). Results are polled at later presents without sleeping.
+- `frame.cpuBound` is true when the plain frames' GPU span is below 80% of their present-to-present interval
+  (`plainPresentIntervalMedianMs`). The GPU then waits for the CPU and per-pass times include that idle time.
+- The passes are matched to the latest `devkit_queue_snapshot` by sequence and target sizes (`snapshotLink`). Matched passes
+  carry `snapshotFirstDraw` / `snapshotLastDraw`, the draw indexes `devkit_frame_overview` passes use (overview passes also
+  split on blend state, so one timed pass can cover several). Another scene or layout leaves them unmatched, with the reason;
+  the per-shader numbers always work.
+- GPU clocks vary: set "Prefer maximum performance" in the GPU driver for a comparison. `stablePowerState: true` (D3D12 only)
+  calls `SetStablePowerState`, which removes the device when Windows Developer Mode is off, so the tool reads
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock\AllowDevelopmentWithoutDevLicense` first and reports
+  `unavailable` unless it is 1. The pinned clock is the base clock, below the boost clock of play.
+- Per-pass `draws` come from the first instrumented frame; `medianMs` / `minMs` use the frames whose pass layout matches it.
+  `framesWithReferenceLayout` counts those, `framesWithOtherLayout` the rest, which still count in the frame totals and in
+  `shaders`. The call fails after 15 s if the game presents nothing (paused, minimised) and when the swap chain it times is
+  replaced during the run (a fullscreen switch); it returns a timeout error after 180 s if the game stops presenting later.
+- Not on Vulkan (ReShade's timestamp query resets the pool inside the command buffer, which is illegal inside a render pass),
+  OpenGL or D3D9 yet. Nothing is created or hooked while no run is active; a draw pays one atomic load.
 
 ### Watching a region over time (`devkit_watch_region`, D3D9Ex, D3D11, D3D12, Vulkan, OpenGL)
 
