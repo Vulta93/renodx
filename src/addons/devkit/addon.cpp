@@ -28,6 +28,7 @@
 #include <exception>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -1606,6 +1607,159 @@ struct DumpedShaderRecord {
 };
 std::shared_mutex dumped_shader_records_mutex;
 std::vector<DumpedShaderRecord> dumped_shader_records;
+
+// Resource upgrade rules, [renodx-dev] UpgradeRule0..7 in ReShade.ini, applied as the game creates its resources (the
+// same create-time upgrade a mod's resource_upgrade_infos gets). A launch reads them once: ResourceInfo::upgrade_target
+// points into the applied list, so devkit_upgrade_rules only edits the ini, for the next launch.
+constexpr std::size_t MAX_UPGRADE_RULES = 8u;
+// A launch with rules that presented this many frames started cleanly; its crash-guard marker is removed.
+constexpr std::uint32_t UPGRADE_RULES_STABLE_PRESENTS = 600u;
+
+enum class UpgradeRulesLaunchState : std::uint8_t {
+  OFF,
+  APPLIED,
+  // A loaded RenoDX mod owns the shared resource upgrade handlers (and their per-device rule list).
+  MOD_OWNS_UPGRADES,
+  // The previous launch with rules did not present long enough: rules were switched off.
+  CRASH_GUARD,
+};
+
+// The ini's rules as devkit_upgrade_rules edits them.
+struct UpgradeRulesIniState {
+  std::shared_mutex mutex;
+  std::vector<std::string> rules;
+  bool enabled = false;
+};
+UpgradeRulesIniState upgrade_rules_ini;
+// Present saves upgrade_rules_ini, since ReShade's ini cache is flushed on that thread.
+std::atomic_bool upgrade_rules_save_requested = false;
+// Fixed when the Devkit loads.
+std::vector<renodx::utils::resource::ResourceUpgradeInfo> launch_upgrade_rules;
+std::vector<std::string> launch_upgrade_rule_texts;
+// Set at load; OnInitDevice lowers APPLIED to MOD_OWNS_UPGRADES when a mod took the upgrade handlers afterwards.
+std::atomic<UpgradeRulesLaunchState> upgrade_rules_launch_state = UpgradeRulesLaunchState::OFF;
+std::atomic_uint32_t upgrade_rules_presents = 0u;
+// Each applied rule's matching creations since the last swap chain creation or resize, copied on present.
+std::array<std::atomic_uint32_t, MAX_UPGRADE_RULES> launch_upgrade_counts = {};
+
+[[nodiscard]] std::filesystem::path GetUpgradeRulesLaunchMarkerPath() {
+  return renodx::utils::path::GetOutputPath() / "upgrade_rules_launch.pending";
+}
+
+// The format VIEW_UPGRADES_RGBA16F gives this format's views (typeless stays typeless), unknown when it has none.
+[[nodiscard]] reshade::api::format GetUpgradeRuleNewFormat(reshade::api::format old_format) {
+  const auto view_upgrade = renodx::utils::resource::VIEW_UPGRADES_RGBA16F.find(
+      {reshade::api::resource_usage::shader_resource, old_format});
+  if (view_upgrade == renodx::utils::resource::VIEW_UPGRADES_RGBA16F.end()) return reshade::api::format::unknown;
+  return view_upgrade->second;
+}
+
+// One rule is space-separated field=value pairs named after ResourceUpgradeInfo, all required so that no field falls
+// back to the struct's back-buffer or any-size defaults:
+// "old_format=r8g8b8a8_unorm new_format=r16g16b16a16_float width=1920 height=1080 depth=1 usage=0x... state=0x... index=-1".
+// state=0x0 matches any initial state; index counts matching creations from 0 (-1: every match).
+[[nodiscard]] std::optional<renodx::utils::resource::ResourceUpgradeInfo> ParseUpgradeRule(
+    std::string_view text, std::size_t slot, std::string* error) {
+  renodx::utils::resource::ResourceUpgradeInfo rule = {
+      .name = std::format("devkit_upgrade_rule_{}", slot).c_str(),
+  };
+  std::set<std::string_view> fields_seen;
+  for (const auto field_range : std::views::split(text, ' ')) {
+    const auto field = std::string_view(field_range.begin(), field_range.end());
+    if (field.empty()) continue;
+    const auto separator = field.find('=');
+    if (separator == std::string_view::npos) {
+      *error = std::format("'{}' is not field=value.", field);
+      return std::nullopt;
+    }
+    const auto key = field.substr(0, separator);
+    const auto value = field.substr(separator + 1);
+    if (!fields_seen.insert(key).second) {
+      *error = std::format("Field '{}' appears twice.", key);
+      return std::nullopt;
+    }
+    if (key == "old_format" || key == "new_format") {
+      auto format = reshade::api::format::unknown;
+      for (const auto& [usage_and_format, upgraded_format] : renodx::utils::resource::VIEW_UPGRADES_RGBA16F) {
+        const auto& [view_usage, view_format] = usage_and_format;
+        if (StreamToString(view_format) == value) {
+          format = view_format;
+          break;
+        }
+      }
+      if (format == reshade::api::format::unknown) {
+        *error = std::format("{} '{}' is not a format VIEW_UPGRADES_RGBA16F upgrades.", key, value);
+        return std::nullopt;
+      }
+      if (key == "old_format") {
+        rule.old_format = format;
+      } else {
+        rule.new_format = format;
+      }
+      continue;
+    }
+    const bool is_hex = value.starts_with("0x");
+    const auto digits = is_hex ? value.substr(2) : value;
+    std::int64_t number = 0;
+    const auto [end, parse_error] = std::from_chars(digits.data(), digits.data() + digits.size(), number, is_hex ? 16 : 10);
+    if (parse_error != std::errc() || end != digits.data() + digits.size()) {
+      *error = std::format("{} '{}' is not a number.", key, value);
+      return std::nullopt;
+    }
+    if (key == "width" || key == "height" || key == "depth") {
+      if (number < 1 || number > std::numeric_limits<std::int16_t>::max()) {
+        *error = std::format("{} {} is out of range (1 to 32767).", key, number);
+        return std::nullopt;
+      }
+      auto* dimension = &rule.dimensions.width;
+      if (key == "height") {
+        dimension = &rule.dimensions.height;
+      } else if (key == "depth") {
+        dimension = &rule.dimensions.depth;
+      }
+      *dimension = static_cast<std::int16_t>(number);
+    } else if (key == "usage" || key == "state") {
+      if (number < 0 || number > std::numeric_limits<std::uint32_t>::max()) {
+        *error = std::format("{} {} is out of range.", key, value);
+        return std::nullopt;
+      }
+      const auto usage = static_cast<reshade::api::resource_usage>(static_cast<std::uint32_t>(number));
+      if (key == "usage") {
+        rule.usage = usage;
+      } else {
+        rule.state = usage;
+      }
+    } else if (key == "index") {
+      if (number < -1 || number > std::numeric_limits<std::int32_t>::max()) {
+        *error = std::format("index {} is out of range (-1 or more).", number);
+        return std::nullopt;
+      }
+      rule.index = static_cast<std::int32_t>(number);
+    } else {
+      *error = std::format("Unknown field '{}'.", key);
+      return std::nullopt;
+    }
+  }
+  for (const auto required : {"old_format", "new_format", "width", "height", "depth", "usage", "state", "index"}) {
+    if (!fields_seen.contains(required)) {
+      *error = std::format("Field '{}' is missing.", required);
+      return std::nullopt;
+    }
+  }
+  if (rule.usage == reshade::api::resource_usage::undefined) {
+    *error = "usage 0x0 would match any usage; a rule names the exact usage.";
+    return std::nullopt;
+  }
+  if (rule.new_format != GetUpgradeRuleNewFormat(rule.old_format) || rule.new_format == rule.old_format) {
+    *error = std::format(
+        "{} upgrades only to {}, and not to itself.",
+        StreamToString(rule.old_format),
+        StreamToString(GetUpgradeRuleNewFormat(rule.old_format)));
+    return std::nullopt;
+  }
+  return rule;
+}
+
 bool setting_live_reload = false;
 uint32_t setting_nav_item = 0;
 uint32_t setting_device_proxy_output_mode = 2;
@@ -4821,6 +4975,199 @@ void DumpPendingShaders() {
   };
 }
 
+[[nodiscard]] ToolResult UpgradeRulesForMcp(
+    std::uint32_t device_index,
+    std::string_view action,
+    const std::optional<std::uint64_t>& resource_handle,
+    const std::optional<std::int64_t>& rule_slot,
+    std::int32_t creation_index,
+    bool allow_multiple) {
+  const auto make_error = [](const std::string& error) {
+    return ToolResult{
+        .text = error,
+        .structured_content = json{{"error", error}},
+        .is_error = true,
+    };
+  };
+
+  std::string action_text;
+  if (action == "add") {
+    if (!resource_handle.has_value()) return make_error("add needs resourceHandle.");
+    std::shared_lock list_lock(device_data_list_mutex);
+    if (device_index >= device_data_list.size()) return make_error(std::format("Device #{} is not available.", device_index));
+    auto* device = device_data_list[device_index]->device;
+    if (device_data_list[device_index]->is_display_proxy) return make_error("The Display Proxy device has no game resources.");
+
+    // Copied under the tracking map's lock: the entry can change or go once the lock is released.
+    renodx::utils::resource::ResourceInfo info;
+    const bool tracked = renodx::utils::resource::GetResourceInfo(
+        reshade::api::resource{resource_handle.value()},
+        [&info](const renodx::utils::resource::ResourceInfo& tracked_info) {
+          info = tracked_info;
+        });
+    if (!tracked) return make_error(std::format("Resource {} is not tracked.", FormatHandle(resource_handle.value())));
+    if (info.device != device) return make_error(std::format("Resource {} belongs to a different device.", FormatHandle(resource_handle.value())));
+    if (info.destroyed) return make_error("The resource was destroyed.");
+    if (info.is_clone) return make_error("The resource is a clone; add the rule for the game's own resource.");
+    if (info.is_swap_chain) return make_error("Swap chain buffers are upgraded by a mod's swap chain settings, not by rules.");
+    if (info.upgraded) return make_error("The resource is already upgraded.");
+    if (info.desc.type != reshade::api::resource_type::texture_2d
+        && info.desc.type != reshade::api::resource_type::texture_3d
+        && info.desc.type != reshade::api::resource_type::surface) {
+      return make_error("Only 2D/3D textures and surfaces can be upgraded.");
+    }
+    if (renodx::utils::bitwise::HasAnyFlag(
+            info.desc.flags,
+            reshade::api::resource_flags::shared | reshade::api::resource_flags::shared_nt_handle)) {
+      return make_error("Shared resources are not upgraded: another device or process reads them in their original format.");
+    }
+    if (renodx::utils::bitwise::HasFlag(info.desc.usage, reshade::api::resource_usage::depth_stencil)) {
+      return make_error("Depth-stencil resources are not upgraded.");
+    }
+
+    // The tracked usage includes the copy_source the Devkit adds to Vulkan images; the upgrade's create_resource runs
+    // after the Devkit's (registration order in DllMain), so it compares against the same usage.
+    const auto rule_text = std::format(
+        "old_format={} new_format={} width={} height={} depth={} usage=0x{:X} state=0x{:X} index={}",
+        StreamToString(info.desc.texture.format),
+        StreamToString(GetUpgradeRuleNewFormat(info.desc.texture.format)),
+        info.desc.texture.width,
+        info.desc.texture.height,
+        info.desc.texture.depth_or_layers,
+        static_cast<std::uint32_t>(info.desc.usage),
+        static_cast<std::uint32_t>(info.initial_state),
+        creation_index);
+    std::string parse_error;
+    const auto rule = ParseUpgradeRule(rule_text, 0u, &parse_error);
+    if (!rule.has_value()) return make_error(std::format("This resource cannot become a rule: {}", parse_error));
+
+    // Dry run on the live resources: what the rule would match if they were created again.
+    constexpr std::size_t MAX_LISTED_MATCHES = 16u;
+    std::size_t match_count = 0u;
+    json matches = json::array();
+    renodx::utils::resource::ForEachResourceInfo([&](const renodx::utils::resource::ResourceInfo& candidate) {
+      if (candidate.device != device || candidate.destroyed || candidate.is_clone) return;
+      if (candidate.is_swap_chain || candidate.upgraded) return;
+      if (!rule->CheckResourceDesc(candidate.desc, {}, candidate.initial_state)) return;
+      ++match_count;
+      if (matches.size() < MAX_LISTED_MATCHES) {
+        matches.push_back(FormatHandle(candidate.resource.handle));
+      }
+    });
+    if (match_count > 1u && creation_index == -1 && !allow_multiple) {
+      return ToolResult{
+          .text = std::format(
+              "Not added: the rule matches {} live resources, not only this one. The Devkit does not know their creation "
+              "order: pass allowMultiple true to upgrade all of them, or try index values (counted from 0 among matching "
+              "creations since the last swap chain creation or resize) and check which resource comes out RGBA16F.",
+              match_count),
+          .structured_content = json{
+              {"error", "rule matches more than one resource"},
+              {"rule", rule_text},
+              {"matchCount", match_count},
+              {"matches", std::move(matches)},
+          },
+          .is_error = true,
+      };
+    }
+
+    const std::unique_lock lock(upgrade_rules_ini.mutex);
+    if (std::ranges::find(upgrade_rules_ini.rules, rule_text) != upgrade_rules_ini.rules.end()) return make_error("The same rule is already saved.");
+    if (upgrade_rules_ini.rules.size() >= MAX_UPGRADE_RULES) {
+      return make_error(std::format("At most {} rules; remove one first.", MAX_UPGRADE_RULES));
+    }
+    upgrade_rules_ini.rules.push_back(rule_text);
+    upgrade_rules_save_requested.store(true);
+    action_text = std::format(
+        "Rule {} saved: {} (matches {} live resource{} now). ",
+        upgrade_rules_ini.rules.size() - 1u,
+        rule_text,
+        match_count,
+        (match_count == 1u ? "" : "s"));
+  } else if (action == "remove") {
+    if (!rule_slot.has_value()) return make_error("remove needs rule.");
+    const std::unique_lock lock(upgrade_rules_ini.mutex);
+    if (rule_slot.value() < 0 || std::cmp_greater_equal(rule_slot.value(), upgrade_rules_ini.rules.size())) {
+      return make_error(std::format("There is no saved rule {}.", rule_slot.value()));
+    }
+    upgrade_rules_ini.rules.erase(upgrade_rules_ini.rules.begin() + rule_slot.value());
+    if (upgrade_rules_ini.rules.empty()) {
+      upgrade_rules_ini.enabled = false;
+    }
+    upgrade_rules_save_requested.store(true);
+    action_text = std::format("Rule {} removed; later rules moved up one. ", rule_slot.value());
+  } else if (action == "clear") {
+    const std::unique_lock lock(upgrade_rules_ini.mutex);
+    upgrade_rules_ini.rules.clear();
+    upgrade_rules_ini.enabled = false;
+    upgrade_rules_save_requested.store(true);
+    action_text = "All rules removed. ";
+  } else if (action == "enable" || action == "disable") {
+    const std::unique_lock lock(upgrade_rules_ini.mutex);
+    if (action == "enable" && upgrade_rules_ini.rules.empty()) return make_error("There are no saved rules to enable.");
+    upgrade_rules_ini.enabled = (action == "enable");
+    upgrade_rules_save_requested.store(true);
+    action_text = std::format("Rules {}. ", (action == "enable" ? "enabled" : "disabled"));
+  } else if (action != "status") {
+    return make_error("action must be 'status', 'add', 'remove', 'clear', 'enable' or 'disable'.");
+  }
+
+  const auto launch_state = upgrade_rules_launch_state.load();
+  const char* launch_state_name = "off";
+  switch (launch_state) {
+    case UpgradeRulesLaunchState::APPLIED:
+      launch_state_name = "applied";
+      break;
+    case UpgradeRulesLaunchState::MOD_OWNS_UPGRADES:
+      launch_state_name = "mod_owns_upgrades";
+      break;
+    case UpgradeRulesLaunchState::CRASH_GUARD:
+      launch_state_name = "crash_guard";
+      break;
+    case UpgradeRulesLaunchState::OFF:
+      break;
+  }
+
+  // Only rules this launch applies. upgradeCount counts matching creations since the last swap chain creation or resize
+  // (upgrade::OnInitSwapchain resets it): the rule upgraded when it exceeds index (above 0 for index -1).
+  json applied_rules = json::array();
+  if (launch_state == UpgradeRulesLaunchState::APPLIED) {
+    for (std::size_t slot = 0u; slot < launch_upgrade_rule_texts.size(); ++slot) {
+      applied_rules.push_back({
+          {"rule", slot},
+          {"text", launch_upgrade_rule_texts[slot]},
+          {"upgradeCount", launch_upgrade_counts[slot].load()},
+      });
+    }
+  }
+
+  json saved_rules = json::array();
+  bool enabled_next_launch = false;
+  {
+    const std::shared_lock lock(upgrade_rules_ini.mutex);
+    for (std::size_t slot = 0u; slot < upgrade_rules_ini.rules.size(); ++slot) {
+      saved_rules.push_back({{"rule", slot}, {"text", upgrade_rules_ini.rules[slot]}});
+    }
+    enabled_next_launch = upgrade_rules_ini.enabled;
+  }
+
+  return ToolResult{
+      .text = std::format(
+          "{}This launch: {} ({} rule(s) applied). Next launch: {} saved rule(s), {}. Changes apply only after a restart.",
+          action_text,
+          launch_state_name,
+          applied_rules.size(),
+          saved_rules.size(),
+          (enabled_next_launch ? "enabled" : "disabled")),
+      .structured_content = json{
+          {"launchState", launch_state_name},
+          {"appliedRules", std::move(applied_rules)},
+          {"enabledNextLaunch", enabled_next_launch},
+          {"savedRules", std::move(saved_rules)},
+      },
+  };
+}
+
 [[nodiscard]] ToolResult SetTextureReplaceEnabledForMcp(bool enabled) {
   renodx::utils::resource::replace::SetEnabled(enabled);
   return ToolResult{
@@ -6022,6 +6369,7 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                       .resolve_device_index = BuildResolveDeviceIndexCallback(false),
                                                       .set_resource_clone = SetResourceCloneForMcp,
                                                       .replace_resource_with_file = ReplaceTrackedResourceWithFileForMcp,
+                                                      .upgrade_rules = UpgradeRulesForMcp,
                                                   }; },
       .build_texture_replace_tool_context = []() { return devkit_texture_replace::ToolContext{
                                                        .resolve_device_index = BuildResolveDeviceIndexCallback(false),
@@ -6118,6 +6466,24 @@ void OnInitDevice(reshade::api::device* device) {
   device_data->is_display_proxy = is_display_proxy;
   device_data_list.emplace_back(device_data);
   if (is_display_proxy) return;
+
+  if (upgrade_rules_launch_state == UpgradeRulesLaunchState::APPLIED) {
+    if (renodx::utils::resource::upgrade::shared.IsEventHandler()) {
+      if (!renodx::utils::resource::upgrade::SetUpgradeInfos(device, launch_upgrade_rules)) {
+        reshade::log::message(
+            reshade::log::level::error,
+            "devkit: upgrade rules not applied: no resource upgrade data on this device.");
+      }
+    } else {
+      // A mod loaded after the Devkit took the upgrade handlers; its device data and rule list are not ours to replace.
+      upgrade_rules_launch_state = UpgradeRulesLaunchState::MOD_OWNS_UPGRADES;
+      std::error_code marker_error;
+      std::filesystem::remove(GetUpgradeRulesLaunchMarkerPath(), marker_error);
+      reshade::log::message(
+          reshade::log::level::warning,
+          "devkit: upgrade rules not applied: a RenoDX mod loaded after the Devkit owns resource upgrades.");
+    }
+  }
 
   uint32_t unknown_api = 0u;
   devkit_primary_device_api.compare_exchange_strong(
@@ -11800,6 +12166,39 @@ void InitializeUserSettings() {
     setting_auto_dump.store(auto_dump);
   }
   {
+    bool enabled = false;
+    reshade::get_config_value(nullptr, "renodx-dev", "UpgradeRulesEnabled", enabled);
+    std::vector<std::string> rules;
+    for (std::size_t slot = 0u; slot < MAX_UPGRADE_RULES; ++slot) {
+      char temp[512] = "";
+      size_t size = sizeof(temp);
+      if (!reshade::get_config_value(nullptr, "renodx-dev", std::format("UpgradeRule{}", slot).c_str(), temp, &size)) continue;
+      auto rule_text = devkit_tools_path::TrimTrailingWhitespace(std::string(temp));
+      if (rule_text.empty()) continue;
+      rules.push_back(std::move(rule_text));
+    }
+    if (enabled) {
+      for (const auto& rule_text : rules) {
+        std::string error;
+        auto rule = ParseUpgradeRule(rule_text, launch_upgrade_rules.size(), &error);
+        if (!rule.has_value()) {
+          // One unreadable rule disables all: a partial set is not the experiment that was asked for.
+          reshade::log::message(
+              reshade::log::level::error,
+              std::format("devkit: upgrade rules not applied: rule '{}': {}", rule_text, error).c_str());
+          launch_upgrade_rules.clear();
+          launch_upgrade_rule_texts.clear();
+          break;
+        }
+        launch_upgrade_rules.push_back(std::move(rule.value()));
+        launch_upgrade_rule_texts.push_back(rule_text);
+      }
+    }
+    const std::unique_lock lock(upgrade_rules_ini.mutex);
+    upgrade_rules_ini.rules = std::move(rules);
+    upgrade_rules_ini.enabled = enabled;
+  }
+  {
     char temp[256] = "";
     size_t size = 256;
     if (reshade::get_config_value(nullptr, "renodx-dev", "LivePath", temp, &size)) {
@@ -12402,7 +12801,8 @@ void OnDestroyEffectRuntime(reshade::api::effect_runtime* runtime) {
 // default) the flag is added to every image, or every buffer with uniform usage, the game creates from then on. Same rules
 // as the Vulkan clone targets in utils/resource_upgrade.hpp OnCreateResource: shared and sparse resources, and image
 // formats without copy support, are left alone. ReShade hands the same desc to every add-on's handler and RenoDX resource
-// upgrades only add usage bits, so the flag survives whatever the handler order.
+// upgrades only add usage bits, so the flag survives whatever the handler order. It must run before the upgrade handler
+// for devkit_upgrade_rules, whose rules carry the tracked usage with this flag (DllMain registers it first).
 bool OnCreateResource(
     reshade::api::device* device,
     reshade::api::resource_desc& desc,
@@ -12541,6 +12941,45 @@ void OnPresent(
 
   if (auto_dump_save_requested.exchange(false)) {
     reshade::set_config_value(nullptr, "renodx-dev", "AutoDump", setting_auto_dump.load());
+  }
+  if (upgrade_rules_save_requested.exchange(false)) {
+    std::vector<std::string> rules_to_save;
+    bool enabled_to_save = false;
+    {
+      const std::shared_lock lock(upgrade_rules_ini.mutex);
+      rules_to_save = upgrade_rules_ini.rules;
+      enabled_to_save = upgrade_rules_ini.enabled;
+    }
+    reshade::set_config_value(nullptr, "renodx-dev", "UpgradeRulesEnabled", enabled_to_save);
+    for (std::size_t slot = 0u; slot < MAX_UPGRADE_RULES; ++slot) {
+      // ReShade cannot delete a key; an empty value is no rule.
+      const auto* rule_text = (slot < rules_to_save.size() ? rules_to_save[slot].c_str() : "");
+      reshade::set_config_value(nullptr, "renodx-dev", std::format("UpgradeRule{}", slot).c_str(), rule_text);
+    }
+  }
+  // APPLIED: the launch ran cleanly. CRASH_GUARD: ReShade has long flushed the saved UpgradeRulesEnabled=0.
+  if (const auto launch_state = upgrade_rules_launch_state.load();
+      !data->is_display_proxy
+      && (launch_state == UpgradeRulesLaunchState::APPLIED || launch_state == UpgradeRulesLaunchState::CRASH_GUARD)
+      && upgrade_rules_presents.fetch_add(1u) + 1u == UPGRADE_RULES_STABLE_PRESENTS) {
+    std::error_code marker_error;
+    std::filesystem::remove(GetUpgradeRulesLaunchMarkerPath(), marker_error);
+    reshade::log::message(reshade::log::level::info, "devkit: upgrade rules crash guard cleared.");
+  }
+  // Copied here, where the device is alive, for devkit_upgrade_rules: the upgrade frees its device data on destroy_device
+  // before the Devkit's own handler runs.
+  if (upgrade_rules_launch_state == UpgradeRulesLaunchState::APPLIED
+      && renodx::utils::resource::upgrade::shared.IsEventHandler()) {
+    if (auto* upgrade_data = renodx::utils::data::Get<renodx::utils::resource::upgrade::DeviceData>(device);
+        upgrade_data != nullptr) {
+      const std::shared_lock upgrade_lock(upgrade_data->mutex);
+      // A Display Proxy device has no rules of its own.
+      if (upgrade_data->upgrade_counts.size() == launch_upgrade_rules.size()) {
+        for (std::size_t slot = 0u; slot < launch_upgrade_rules.size(); ++slot) {
+          launch_upgrade_counts[slot].store(upgrade_data->upgrade_counts[slot].load());
+        }
+      }
+    }
   }
   // Nothing to walk on the frames where the game created no new shader.
   if ((dump_shaders_requested.exchange(false) || setting_auto_dump.load())
@@ -12769,6 +13208,77 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::utils::resource::replace::SetProvider(LoadBootTextureReplacement);
       renodx::utils::resource::Use(fdw_reason);
 
+      // Before the upgrade's create_resource: the upgrade then sees the copy_source usage the Devkit adds to Vulkan
+      // images, as the tracked desc that devkit_upgrade_rules builds rules from does.
+      reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
+
+      // Without rules the resource upgrade handlers stay unregistered, as before rules existed.
+      {
+        std::error_code marker_error;
+        const auto marker_path = GetUpgradeRulesLaunchMarkerPath();
+        // The marker holds the process id and executable name of the launch that wrote it. The same id is this launch's
+        // add-on reload (ReShade unloads add-ons when a game releases its last device), not a failed launch; another
+        // executable sharing this ReShade folder (a launcher) is not this game's launch.
+        std::wstring executable_path(MAX_PATH, L'\0');
+        executable_path.resize(GetModuleFileNameW(nullptr, executable_path.data(), MAX_PATH));
+        const auto executable_name = renodx::utils::path::ToUtf8(std::filesystem::path(executable_path).filename());
+        bool previous_launch_failed = false;
+        if (std::ifstream marker_file(marker_path); marker_file.is_open()) {
+          DWORD marker_process_id = 0u;
+          std::string marker_executable_name;
+          marker_file >> marker_process_id;
+          marker_file >> std::ws;
+          std::getline(marker_file, marker_executable_name);
+          previous_launch_failed = marker_executable_name == executable_name && marker_process_id != GetCurrentProcessId();
+        }
+        if (launch_upgrade_rules.empty()) {
+          // Rules switched off since that launch: its marker would trip the guard when they are enabled again.
+          if (previous_launch_failed) {
+            std::filesystem::remove(marker_path, marker_error);
+          }
+        } else if (previous_launch_failed) {
+          // The marker stays until present has saved UpgradeRulesEnabled=0, so a launch that never gets that far trips
+          // the guard again.
+          upgrade_rules_launch_state = UpgradeRulesLaunchState::CRASH_GUARD;
+          {
+            const std::unique_lock lock(upgrade_rules_ini.mutex);
+            upgrade_rules_ini.enabled = false;
+          }
+          upgrade_rules_save_requested.store(true);
+          reshade::log::message(
+              reshade::log::level::warning,
+              "devkit: upgrade rules switched off: the previous launch with rules ended before 600 presents "
+              "(crash guard). Re-enable them with devkit_upgrade_rules.");
+        } else {
+          // Registered before the Devkit's init_device below, so the upgrade device data exists when it runs.
+          renodx::utils::resource::upgrade::Use(fdw_reason);
+          if (renodx::utils::resource::upgrade::shared.IsEventHandler()) {
+            upgrade_rules_launch_state = UpgradeRulesLaunchState::APPLIED;
+            std::filesystem::create_directories(marker_path.parent_path(), marker_error);
+            std::ofstream marker_file(marker_path);
+            marker_file << GetCurrentProcessId() << "\n" << executable_name << "\n";
+            if (!marker_file) {
+              reshade::log::message(
+                  reshade::log::level::warning,
+                  "devkit: could not write the upgrade rules crash marker; the crash guard is off for this launch.");
+            }
+            reshade::log::message(
+                reshade::log::level::info,
+                std::format(
+                    "devkit: {} upgrade rule(s) will apply as the game creates resources.",
+                    launch_upgrade_rules.size())
+                    .c_str());
+          } else {
+            // Staying registered is harmless: the upgrade callbacks return early in a module that is not the handler.
+            upgrade_rules_launch_state = UpgradeRulesLaunchState::MOD_OWNS_UPGRADES;
+            reshade::log::message(
+                reshade::log::level::warning,
+                "devkit: upgrade rules not applied: a loaded RenoDX mod owns resource upgrades. Disable the mod to test "
+                "rules.");
+          }
+        }
+      }
+
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::register_event<reshade::addon_event::init_command_list>(OnInitCommandList);
@@ -12804,7 +13314,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
       reshade::register_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
       reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
-      reshade::register_event<reshade::addon_event::create_resource>(OnCreateResource);
       reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
@@ -12841,6 +13350,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       renodx::utils::gpu_fence::Use(fdw_reason);
       renodx::utils::resource::replace::Use(fdw_reason);
       renodx::utils::resource::replace::SetProvider({});
+      // CRASH_GUARD never registered the handlers; MOD_OWNS_UPGRADES did, and may have been APPLIED at load.
+      if (upgrade_rules_launch_state == UpgradeRulesLaunchState::APPLIED
+          || upgrade_rules_launch_state == UpgradeRulesLaunchState::MOD_OWNS_UPGRADES) {
+        // The crash marker stays: a failed launch (device removed, error shown) can still unload add-ons cleanly.
+        renodx::utils::resource::upgrade::Use(fdw_reason);
+      }
       renodx::utils::resource::Use(fdw_reason);
 
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);

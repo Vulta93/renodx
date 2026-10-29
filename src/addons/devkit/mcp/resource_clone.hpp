@@ -33,6 +33,13 @@ struct ToolContext {
       const std::optional<std::uint64_t>& resource_view_handle,
       const std::optional<std::uint64_t>& resource_handle,
       const std::filesystem::path& path)> replace_resource_with_file;
+  std::function<ToolResult(
+      std::uint32_t device_index,
+      std::string_view action,
+      const std::optional<std::uint64_t>& resource_handle,
+      const std::optional<std::int64_t>& rule_slot,
+      std::int32_t creation_index,
+      bool allow_multiple)> upgrade_rules;
 };
 
 struct TrackedResourceSummary {
@@ -128,6 +135,24 @@ inline ToolResult HandleReplaceResourceWithFileTool(const json& arguments, const
 
   const auto path = std::filesystem::path(mcp_arguments::GetRequired<std::string>(arguments, "path"));
   return context.replace_resource_with_file(device_index, resource_view_handle, resource_handle_value, path);
+}
+
+inline ToolResult HandleUpgradeRulesTool(const json& arguments, const ToolContext& context) {
+  if (!context.resolve_device_index || !context.upgrade_rules) {
+    throw std::runtime_error("The resource clone tool context is not configured.");
+  }
+
+  std::optional<std::uint64_t> resource_handle_value = std::nullopt;
+  if (const auto* value = mcp_arguments::FindValue(arguments, "resourceHandle"); value != nullptr && !value->is_null()) {
+    resource_handle_value = resource_handle::GetRequired(arguments, "resourceHandle");
+  }
+  return context.upgrade_rules(
+      context.resolve_device_index(arguments),
+      mcp_arguments::GetOptional<std::string>(arguments, "action").value_or("status"),
+      resource_handle_value,
+      mcp_arguments::GetOptional<std::int64_t>(arguments, "rule"),
+      mcp_arguments::GetOptional<std::int32_t>(arguments, "index").value_or(-1),
+      mcp_arguments::GetOptional<bool>(arguments, "allowMultiple").value_or(false));
 }
 
 }  // namespace renodx::addons::devkit::mcp::resource_clone

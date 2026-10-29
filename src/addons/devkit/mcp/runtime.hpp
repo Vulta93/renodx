@@ -211,6 +211,10 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                                          const renodx::utils::mcp::json& arguments) {
     return resource_clone::HandleReplaceResourceWithFileTool(arguments, build_resource_clone_tool_context());
   });
+  register_tool("devkit_upgrade_rules", [build_resource_clone_tool_context = context.build_resource_clone_tool_context](
+                                            const renodx::utils::mcp::json& arguments) {
+    return resource_clone::HandleUpgradeRulesTool(arguments, build_resource_clone_tool_context());
+  });
   register_tool("devkit_set_texture_replace_enabled", [build_texture_replace_tool_context = context.build_texture_replace_tool_context](
                                                            const renodx::utils::mcp::json& arguments) {
     return texture_replace::HandleSetTextureReplaceEnabledTool(arguments, build_texture_replace_tool_context());

@@ -468,6 +468,23 @@ inline const renodx::utils::mcp::ToolCatalog METADATA = {
         },
     },
     {
+        "devkit_upgrade_rules",
+        {
+            .title = "Upgrade Rules",
+            .description = "Resource upgrade rules tried without building a mod: saved in ReShade.ini as [renodx-dev] UpgradeRule0..7 plus UpgradeRulesEnabled (off by default), and applied at the NEXT launch as the game creates its resources, through the same create-time upgrade a mod's resource_upgrade_infos gets (format and views become what VIEW_UPGRADES_RGBA16F maps them to: RGBA16F, typeless stays typeless). Nothing changes in the running game. 'add' turns one tracked texture (resourceHandle, e.g. from a snapshot) into the narrowest rule: its exact creation format, width, height, depth, usage and initial state, with fields named after ResourceUpgradeInfo so a working rule copies into mod code; it dry-runs the rule on the live resources and refuses when it matches more than this one unless you pass allowMultiple true or an index (the Devkit does not know creation order: index counts matching creations from 0 since the last swap chain creation or resize, so find the right value by trying). On Vulkan the rule's usage includes the copy_source bit the Devkit adds (Copyable Vulkan Images), which the upgrade also sees. 'add' does not enable: 'enable' / 'disable' switch all rules, 'remove' takes rule (slot), 'clear' removes all and disables; 'status' (default) reports launchState (applied, off, mod_owns_upgrades: a loaded RenoDX mod owns resource upgrades and rules are refused, so disable the mod; crash_guard: the previous launch with rules ended before 600 presents, a crash or a quit within about 10 s, so rules were switched off), appliedRules (empty unless applied) with upgradeCount (matching creations since the last swap chain creation or resize; the rule upgraded once it exceeds index, above 0 for index -1) and the savedRules for the next launch. Refused: swap chain buffers, clones, shared, depth-stencil, already upgraded, buffers, formats VIEW_UPGRADES_RGBA16F does not map. Deleting the ini keys undoes everything.",
+            .input_schema = {
+                .properties = {
+                    {"deviceIndex", {.types = {"integer"}, .minimum = 0}},
+                    {"action", {.types = {"string"}, .enum_values = {"status", "add", "remove", "clear", "enable", "disable"}}},
+                    {"resourceHandle", MakeFlexibleHandleProperty()},
+                    {"rule", {.types = {"integer"}, .minimum = 0, .maximum = 7}},
+                    {"index", {.types = {"integer"}, .minimum = -1}},
+                    {"allowMultiple", {.types = {"boolean"}}},
+                },
+            },
+        },
+    },
+    {
         "devkit_set_texture_replace_enabled",
         {
             .title = "Set Texture Replace Enabled",
