@@ -639,6 +639,11 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::unordered_map<uint64_t, reshade::api::blend_desc> pipeline_blends;
   // OpenGL uniform names per program, read once per snapshot (program names can be reused between snapshots).
   std::unordered_map<uint32_t, std::shared_ptr<const std::vector<ConstantVariable>>> gl_program_uniforms;
+  // D3D12 constant buffer ranges read during the running snapshot, keyed by buffer, offset, captured size and command list
+  // recording (unique across command lists): the draws of one recording sharing a range (per-view or per-pass buffers)
+  // read its upload memory, slow to read from the CPU, only once. They all execute after the recording, so they normally
+  // read the same bytes; another recording can run after the game rewrote the range. Only successful reads are kept.
+  std::map<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t>, std::vector<uint8_t>> snapshot_mapped_constant_buffer_bytes;
 
   reshade::api::effect_runtime* runtime = nullptr;
   std::deque<std::shared_ptr<devkit_resource_analysis::PendingRequest>> pending_resource_analysis_requests;
@@ -6446,6 +6451,7 @@ uint64_t StartSnapshotFrame(DeviceData* device_data) {
   device_data->snapshot_rows_valid = false;
   device_data->snapshot_id = ++snapshots_started;
   device_data->gl_program_uniforms.clear();
+  device_data->snapshot_mapped_constant_buffer_bytes.clear();
   snapshot_submission_counter.store(0u, std::memory_order_relaxed);
   snapshot_device = device_data->device;
   return device_data->snapshot_id;
@@ -7231,6 +7237,12 @@ void OnDestroyResource(reshade::api::device* device, reshade::api::resource reso
   if (data == nullptr) return;
   devkit_watch_region::OnResourceDestroyed(&data->watch_region_watcher, resource);
   const std::unique_lock lock(data->mutex);
+  // A D3D12 resource handle is its address, which a new buffer can reuse during the snapshot (in a later recording, unless
+  // the game releases a buffer a recorded list still uses).
+  auto& mapped_bytes = data->snapshot_mapped_constant_buffer_bytes;
+  mapped_bytes.erase(
+      mapped_bytes.lower_bound({resource.handle, 0u, 0u, 0u}),
+      mapped_bytes.lower_bound({resource.handle + 1u, 0u, 0u, 0u}));
   auto pair = data->preview_srvs.find(resource.handle);
   if (pair == data->preview_srvs.end()) return;
   auto srvs = pair->second;
@@ -8429,6 +8441,14 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       }
       // The entry starts as std::nullopt (not CPU readable) and gets bytes only after a successful read.
       auto& captured_bytes = draw_details.constant_buffer_bytes[slot_space];
+      const auto snapshot_bytes_key = std::make_tuple(
+          buffer_range.buffer.handle, buffer_range.offset, captured_size, draw_details.cmd_list_recording);
+      if (const auto snapshot_bytes = device_data->snapshot_mapped_constant_buffer_bytes.find(snapshot_bytes_key);
+          snapshot_bytes != device_data->snapshot_mapped_constant_buffer_bytes.end()) {
+        const auto& [range_key, range_bytes] = *snapshot_bytes;
+        captured_bytes = range_bytes;
+        continue;
+      }
       // Cached descriptor heaps can still hold views of released resources, so only a tracked, live buffer is touched.
       // Map on a default heap or a reserved resource (heap unknown) fails and is a debug-layer error, so it is not tried
       // (a custom heap without CPU access still is). A release on another thread between this check and Map is not
@@ -8460,6 +8480,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       if (renodx::utils::resource::IsReadableMemory(mapped_data, static_cast<size_t>(read_size))) {
         const auto* mapped_bytes = static_cast<const uint8_t*>(mapped_data);
         captured_bytes = std::vector<uint8_t>(mapped_bytes, mapped_bytes + static_cast<size_t>(read_size));
+        device_data->snapshot_mapped_constant_buffer_bytes.emplace(snapshot_bytes_key, captured_bytes.value());
       }
       device->unmap_buffer_region(buffer_range.buffer);
     }
@@ -13060,6 +13081,7 @@ void OnPresent(
     device_data->snapshot_rows.clear();
     device_data->snapshot_row_layout_key = 0u;
     device_data->snapshot_rows_valid = false;
+    device_data->snapshot_mapped_constant_buffer_bytes.clear();
 
     // Vulkan constant values (DrawDetails::ConstantBufferValuesSource::GPU_COPY): each bound range a snapshot draw reads
     // is copied once, after the frame, on the effect runtime's queue's immediate command list (a game can present from

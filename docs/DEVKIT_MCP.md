@@ -227,9 +227,13 @@ Exposure, white point, LUT strength and grade parameters usually live in constan
     off when the game started (it only registers its hooks at startup, so enable it and restart), or the buffer was not created
     as a constant buffer, or it was mapped at that moment.
   - `cpu_mapped`: D3D12. The Devkit maps the buffer itself (D3D12 `Map` is reference-counted, so a buffer the game
-    keeps mapped can be mapped again) and copies it while the draw is recorded. Games usually write a draw's constants
-    before recording it (UE-style ring allocators included), so these are usually the bytes the GPU reads; an engine
-    that writes them later, before submitting, would show older values. A read after the frame ran could see a reused
+    keeps mapped can be mapped again) and copies it while the draw is recorded; a range several draws of one command
+    list recording share (same buffer, offset and size) is copied once, at the first of them, since they all execute
+    after the recording and normally read the same bytes (upload memory is slow to read from the CPU: one read per draw
+    cost seconds per snapshot in Gears of War: E-Day). Games usually write a draw's constants before recording it
+    (UE-style ring allocators included), so these are usually the bytes the GPU reads; an engine that writes them later,
+    before submitting, would show older values, and a range the game rewrites between draws of one recording shows the
+    first draw's bytes on all of them. A read after the frame ran could see a reused
     ring slot. A root constant buffer view (`fullRange`) has no size: the read runs to the end of the buffer (capped at
     4096 bytes, and then `valuesTruncated` is usually set), so words past the cbuffer's own size belong to whatever
     follows it. A stale descriptor whose buffer was released and its address reused by another buffer reads that one.
