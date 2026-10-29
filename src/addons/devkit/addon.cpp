@@ -85,6 +85,7 @@
 #include "./mcp/device_selection.hpp"
 #include "./mcp/device_summary.hpp"
 #include "./mcp/draw_summary.hpp"
+#include "./mcp/gpu_timing.hpp"
 #include "./mcp/live_shaders.hpp"
 #include "./mcp/resource_analysis.hpp"
 #include "./mcp/resource_clone.hpp"
@@ -109,6 +110,7 @@ namespace devkit_resource_clone = renodx::addons::devkit::mcp::resource_clone;
 namespace devkit_resource_view_summary = renodx::addons::devkit::mcp::resource_view_summary;
 namespace devkit_texture_replace = renodx::addons::devkit::mcp::texture_replace;
 namespace devkit_watch_region = renodx::addons::devkit::mcp::watch_region;
+namespace devkit_gpu_timing = renodx::addons::devkit::mcp::gpu_timing;
 namespace devkit_device_selection = renodx::addons::devkit::mcp::device_selection;
 namespace devkit_device_summary = renodx::addons::devkit::mcp::device_summary;
 namespace devkit_draw_summary = renodx::addons::devkit::mcp::draw_summary;
@@ -684,6 +686,7 @@ struct __declspec(uuid("0190ec1a-2e19-74a6-ad41-4df0d4d8caed")) DeviceData {
   std::unordered_map<reshade::api::swapchain*, std::vector<DisplayProxyBackBufferView>> display_proxy_back_buffer_views;
   bool has_synced_addon_shaders = false;
   devkit_watch_region::Watcher watch_region_watcher;
+  devkit_gpu_timing::Timer gpu_timing_timer;
 
   ShaderDetails* GetShaderDetails(uint32_t shader_hash) {
     // assert(shader_hash != 0u);
@@ -4091,6 +4094,27 @@ void CancelPendingWatchRegionRequest(
   devkit_watch_region::CancelRequest(&device_data->watch_region_watcher, request);
 }
 
+[[nodiscard]] std::optional<std::string> EnqueueGpuTimingRequest(
+    uint32_t device_index,
+    const std::shared_ptr<devkit_gpu_timing::Request>& request) {
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (device_index >= device_data_list.size()) {
+    return std::format("No device #{}.", device_index);
+  }
+  auto* device_data = device_data_list[device_index];
+  return devkit_gpu_timing::Start(&device_data->gpu_timing_timer, device_data->device, request);
+}
+
+void CancelGpuTimingRequest(
+    uint32_t device_index,
+    const std::shared_ptr<devkit_gpu_timing::Request>& request) {
+  std::shared_lock list_lock(device_data_list_mutex);
+  if (device_index >= device_data_list.size()) {
+    return;
+  }
+  devkit_gpu_timing::Cancel(&device_data_list[device_index]->gpu_timing_timer, request);
+}
+
 [[nodiscard]] bool EnqueuePendingLiveShaderRequest(
     uint32_t device_index,
     const std::shared_ptr<PendingLiveShaderRequest>& request) {
@@ -6393,6 +6417,12 @@ void RegisterDevkitMcpTools(renodx::utils::mcp::Server& server) {
                                                     .cancel_request = CancelPendingWatchRegionRequest,
                                                     .collect_snapshot_commands = CollectFrameOverview,
                                                 }; },
+      .build_gpu_timing_tool_context = []() { return devkit_gpu_timing::ToolContext{
+                                                  .resolve_device_index = BuildResolveDeviceIndexCallback(false),
+                                                  .enqueue_request = EnqueueGpuTimingRequest,
+                                                  .cancel_request = CancelGpuTimingRequest,
+                                                  .collect_snapshot_commands = CollectFrameOverview,
+                                              }; },
       .build_resource_clone_tool_context = []() { return devkit_resource_clone::ToolContext{
                                                       .resolve_device_index = BuildResolveDeviceIndexCallback(false),
                                                       .set_resource_clone = SetResourceCloneForMcp,
@@ -6605,6 +6635,7 @@ void OnDestroyDevice(reshade::api::device* device) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return;
   devkit_watch_region::Shutdown(&device_data->watch_region_watcher, device);
+  devkit_gpu_timing::Shutdown(&device_data->gpu_timing_timer, device);
   std::optional<DeviceData::ConstantBufferReadback> pending_readback = std::nullopt;
   {
     std::unique_lock lock(device_data->mutex);
@@ -6859,6 +6890,7 @@ void OnInitCommandList(reshade::api::command_list* cmd_list) {
   auto* device_data = renodx::utils::data::Get<DeviceData>(cmd_list->get_device());
   if (device_data == nullptr) return;
   devkit_watch_region::OnCommandListReset(&device_data->watch_region_watcher, cmd_list, false);
+  devkit_gpu_timing::OnCommandListReset(&device_data->gpu_timing_timer, cmd_list, false);
   if (device_data->is_display_proxy) return;
   renodx::utils::data::Create<CommandListData>(cmd_list)->recording = ++command_list_recordings;
 }
@@ -6867,6 +6899,7 @@ void OnDestroyCommandList(reshade::api::command_list* cmd_list) {
   auto* device = cmd_list->get_device();
   if (auto* device_data = renodx::utils::data::Get<DeviceData>(device); device_data != nullptr) {
     devkit_watch_region::OnCommandListReset(&device_data->watch_region_watcher, cmd_list, true);
+    devkit_gpu_timing::OnCommandListReset(&device_data->gpu_timing_timer, cmd_list, true);
   }
   if (SupportsSnapshotSubmissionOrder(device->get_api())) {
     if (auto* device_data = renodx::utils::data::Get<DeviceData>(device);
@@ -6883,6 +6916,7 @@ void OnResetCommandList(reshade::api::command_list* cmd_list) {
   auto* device = cmd_list->get_device();
   if (auto* device_data = renodx::utils::data::Get<DeviceData>(device); device_data != nullptr) {
     devkit_watch_region::OnCommandListReset(&device_data->watch_region_watcher, cmd_list, false);
+    devkit_gpu_timing::OnCommandListReset(&device_data->gpu_timing_timer, cmd_list, false);
   }
   if (SupportsSnapshotSubmissionOrder(device->get_api())) {
     if (auto* device_data = renodx::utils::data::Get<DeviceData>(device);
@@ -7291,6 +7325,7 @@ void OnExecuteSecondaryCommandList(reshade::api::command_list* cmd_list, reshade
   auto* device_data = renodx::utils::data::Get<DeviceData>(cmd_list->get_device());
   if (device_data == nullptr) return;
   devkit_watch_region::OnExecuteSecondaryCommandList(&device_data->watch_region_watcher, cmd_list, secondary_cmd_list);
+  devkit_gpu_timing::OnExecuteSecondaryCommandList(&device_data->gpu_timing_timer, cmd_list);
 }
 
 void OnPushConstants(
@@ -7506,6 +7541,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
   auto* device_data = renodx::utils::data::Get<DeviceData>(device);
   if (device_data == nullptr) return false;
 
+  // First, so that the stamp is as close to the draw as possible.
+  devkit_gpu_timing::OnDrawOrDispatch(&device_data->gpu_timing_timer, cmd_list, draw_method == DrawDetails::DrawMethods::DISPATCH);
   devkit_watch_region::OnDrawOrDispatch(
       &device_data->watch_region_watcher,
       cmd_list,
@@ -12547,6 +12584,7 @@ void OnExecuteCommandList(
     reshade::api::command_list* cmd_list) {
   if (auto* watch_device_data = renodx::utils::data::Get<DeviceData>(cmd_list->get_device()); watch_device_data != nullptr) {
     devkit_watch_region::OnExecuteCommandList(&watch_device_data->watch_region_watcher, queue, cmd_list);
+    devkit_gpu_timing::OnExecuteCommandList(&watch_device_data->gpu_timing_timer, queue, cmd_list);
   }
   if (snapshot_device == nullptr) return;
 
@@ -12897,6 +12935,9 @@ void OnPresent(
     return data;
   };
 
+  // First, before any Devkit work of this present is recorded; a mod's present-time work (it loads before the Devkit) is
+  // already in the queue and falls in the frame's last interval.
+  devkit_gpu_timing::OnPresent(&data->gpu_timing_timer, queue, swapchain);
   if (!data->is_display_proxy) {
     EnsureDevkitMcpServerStarted();
     PumpDeviceProxyOutputWindowMessages();

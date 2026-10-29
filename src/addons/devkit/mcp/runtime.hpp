@@ -19,6 +19,7 @@
 
 #include "../../../utils/mcp/server.hpp"
 #include "../../../utils/mcp/arguments.hpp"
+#include "gpu_timing.hpp"
 #include "live_shaders.hpp"
 #include "resource_analysis.hpp"
 #include "resource_clone.hpp"
@@ -36,6 +37,7 @@ struct RegistrationContext {
   std::function<live_shaders::ToolContext()> build_live_shaders_tool_context;
   std::function<resource_analysis::ToolContext()> build_analyze_resource_tool_context;
   std::function<watch_region::ToolContext()> build_watch_region_tool_context;
+  std::function<gpu_timing::ToolContext()> build_gpu_timing_tool_context;
   std::function<resource_clone::ToolContext()> build_resource_clone_tool_context;
   std::function<texture_replace::ToolContext()> build_texture_replace_tool_context;
   std::function<renodx::utils::mcp::ToolResult(const std::optional<std::string>&)> set_tools_path;
@@ -189,6 +191,11 @@ inline void RegisterTools(renodx::utils::mcp::Server& server, const Registration
                                            const renodx::utils::mcp::json& arguments) {
     if (auto trigger_error = wait_for_capture_trigger(arguments)) return *trigger_error;
     return watch_region::HandleWatchRegionTool(arguments, build_watch_region_tool_context());
+  });
+  register_tool("devkit_gpu_timing", [wait_for_capture_trigger, build_gpu_timing_tool_context = context.build_gpu_timing_tool_context](
+                                         const renodx::utils::mcp::json& arguments) {
+    if (auto trigger_error = wait_for_capture_trigger(arguments)) return *trigger_error;
+    return gpu_timing::HandleGpuTimingTool(arguments, build_gpu_timing_tool_context());
   });
   register_tool("devkit_measure_tone_curve", [wait_for_capture_trigger, build_analyze_resource_tool_context = context.build_analyze_resource_tool_context](
                                                  const renodx::utils::mcp::json& arguments) {
