@@ -1316,7 +1316,8 @@ class Decompiler {
     std::string ResourceVariableNameAtIndex(const Resource& resource, uint32_t index) {
       auto type_name = resource.pointer.substr(0, resource.pointer.length() - 1);
       auto pair = type_definitions.find(type_name);
-      assert(pair != type_definitions.end());
+      // A buffer whose type the disassembly does not define has no member names; callers then name values by offset.
+      if (pair == type_definitions.end()) return "";
       auto& definition = pair->second;
 
       if (type_name.starts_with("%\"class.StructuredBuffer<")) {
@@ -1332,7 +1333,8 @@ class Decompiler {
     std::string ResourceVariableNameAtIndex(const CBVResource& resource, uint32_t index) {
       auto type_name = resource.pointer.substr(0, resource.pointer.length() - 1);
       auto pair = type_definitions.find(type_name);
-      assert(pair != type_definitions.end());
+      // A buffer whose type the disassembly does not define has no member names; callers then name values by offset.
+      if (pair == type_definitions.end()) return "";
       auto& definition = pair->second;
 
       if (definition.has_offsets || resource.buffer_size == definition.size) {
