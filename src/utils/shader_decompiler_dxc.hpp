@@ -219,21 +219,26 @@ class Decompiler {
     }
   }
 
+  // LLVM's undef (any value, such as a phi input from a path that never uses it) is written as zero.
   static std::string ParseBoolString(std::string_view input) {
+    if (input == "undef") return "false";
     return std::format("{}", input);
   }
 
   static std::string ParseIntString(std::string_view input) {
+    if (input == "undef") return "0";
     return std::format("{}", input);
   }
 
   static std::string ParseUintString(std::string_view input) {
+    if (input == "undef") return "0u";
     return std::format("{}u", input);
   }
 
   static std::string ParseSuffixedString(std::string_view input, char suffix = 'f') {
     std::string output;
 
+    if (input == "undef") return std::format("0.0{}", suffix);
     if (input == "0x7FF0000000000000") return "+1.#INF";
     if (input == "0xH7C00") return "+1.#INF";  // Special case for bfloat16 infinity
     if (input.starts_with("0xH")) {
