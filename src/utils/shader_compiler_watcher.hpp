@@ -13,6 +13,7 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -31,6 +32,12 @@
 namespace renodx::utils::shader::compiler::watcher {
 
 static std::atomic_size_t custom_shaders_count = 0;
+
+// A ".spirv_X_Y" extension before ".slang" selects the SPIR-V version (slangc -profile); same grammar as CMakeLists.txt.
+inline bool IsSpirvProfileTag(const std::string& extension) {
+  static const std::regex SPIRV_PROFILE_TAG(R"(\.spirv_[0-9]+_[0-9]+)");
+  return std::regex_match(extension, SPIRV_PROFILE_TAG);
+}
 
 struct CustomShader {
   std::variant<std::exception, std::vector<uint8_t>> compilation;
@@ -83,6 +90,9 @@ struct CustomShader {
     if (is_slang) {
       if (auto suffix_pos = filename.rfind(".slang"); suffix_pos != std::string::npos) {
         filename.erase(suffix_pos);
+      }
+      if (auto tag_pos = filename.rfind('.'); tag_pos != std::string::npos && IsSpirvProfileTag(filename.substr(tag_pos))) {
+        filename.erase(tag_pos);
       }
       if (auto target_pos = filename.rfind('.'); target_pos != std::string::npos) {
         filename.erase(target_pos);
@@ -371,6 +381,7 @@ static bool CompileCustomShaders() {
       std::string shader_target;
       bool compile_glsl_to_spirv = false;
       auto glsl_device_api = reshade::api::device_api::opengl;
+      std::string spirv_profile;
       if (is_hlsl) {
         auto length = basename.length();
         if (length < strlen("0x12345678.xx_x_x")) continue;
@@ -383,7 +394,12 @@ static bool CompileCustomShaders() {
         // uint32_t versionMajor = shader_target[3] - '0';
         hash_string = basename.substr(length - strlen("12345678.xx_x_x"), 8);
       } else if (is_slang) {
-        if (!parse_stage_target_and_hash(entry_path, ".slang", shader_target, hash_string)) continue;
+        std::string slang_suffix = ".slang";
+        if (auto profile_tag = entry_path.stem().extension().string(); IsSpirvProfileTag(profile_tag)) {
+          spirv_profile = profile_tag.substr(1);
+          slang_suffix = profile_tag + slang_suffix;
+        }
+        if (!parse_stage_target_and_hash(entry_path, slang_suffix.c_str(), shader_target, hash_string)) continue;
       } else if (is_glsl) {
         const auto filename = entry_path.filename().string();
         const bool is_opengl_spirv = filename.ends_with(".gl.glsl");
@@ -513,6 +529,7 @@ static bool CompileCustomShaders() {
                   .file_path = entry_path,
                   .shader_target = shader_target,
                   .shader_hash = shader_hash,
+                  .spirv_profile = spirv_profile,
               }},
               shared_shader_defines);
           if (results.empty()) {

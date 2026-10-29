@@ -410,7 +410,8 @@ inline std::string DecompileSpirvToGlsl(std::span<const uint8_t> data) {
 inline std::vector<uint8_t> CompileShaderFromFile(
     LPCWSTR file_path,
     LPCSTR shader_target,
-    const std::vector<std::pair<std::string, std::string>>& defines = {}) {
+    const std::vector<std::pair<std::string, std::string>>& defines = {},
+    const std::string& spirv_profile = {}) {
   if (file_path == nullptr || shader_target == nullptr) {
     throw std::exception("Missing slang compile arguments.");
   }
@@ -455,6 +456,12 @@ inline std::vector<uint8_t> CompileShaderFromFile(
     args.emplace_back(L"spirv");
   }
 
+  // slangc's default SPIR-V version (1.5 in 2026.14) is rejected by Vulkan 1.0/1.1 games.
+  if (!spirv_profile.empty()) {
+    args.emplace_back(L"-profile");
+    args.emplace_back(spirv_profile.begin(), spirv_profile.end());
+  }
+
   for (const auto& [key, value] : defines) {
     if (key.empty()) continue;
     std::wstring definition = L"-D";
@@ -492,6 +499,7 @@ struct ShaderCompileRequest {
   std::filesystem::path file_path;
   std::string shader_target;
   uint32_t shader_hash = 0;
+  std::string spirv_profile;
 };
 
 struct ShaderCompileResult {
@@ -523,7 +531,8 @@ inline std::vector<ShaderCompileResult> CompileShadersFromFiles(
         result.compilation = CompileShaderFromFile(
             request.file_path.c_str(),
             request.shader_target.c_str(),
-            defines);
+            defines,
+            request.spirv_profile);
         result.processed = true;
         result.failed = false;
         results[index] = std::move(result);
