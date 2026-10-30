@@ -1070,7 +1070,9 @@ swap chain proxy against vanilla, same scene, Release builds), not for absolute 
   calls `SetStablePowerState`, which removes the device when Windows Developer Mode is off, so the tool reads
   `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock\AllowDevelopmentWithoutDevLicense` first and reports
   `unavailable` unless it is 1. The pinned clock is the base clock, below the boost clock of play.
-- Per-pass `draws` come from the first instrumented frame; `medianMs` / `minMs` use the frames whose pass layout matches it.
+- Per-pass `draws` come from the reference frame, the instrumented frame whose pass layout most frames share (the earliest of
+  equals; `instrumentedFrameDetails` lists lists, passes and times of every frame). `medianMs` / `minMs` use the frames whose
+  pass layout matches it.
   `framesWithReferenceLayout` counts those, `framesWithOtherLayout` the rest, which still count in the frame totals and in
   `shaders`. The call fails after 15 s if the game presents nothing (paused, minimised) and when the swap chain it times is
   replaced during the run (a fullscreen switch); it returns a timeout error after 180 s if the game stops presenting later.
