@@ -1070,7 +1070,7 @@ swap chain proxy against vanilla, same scene, Release builds), not for absolute 
   calls `SetStablePowerState`, which removes the device when Windows Developer Mode is off, so the tool reads
   `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock\AllowDevelopmentWithoutDevLicense` first and reports
   `unavailable` unless it is 1. The pinned clock is the base clock, below the boost clock of play.
-- Passes are matched across frames by identity (kind, the targets' sizes and formats, the first shader or the dispatch
+- Passes are matched across frames by identity (kind, the targets' sizes and formats or the dispatch
   shader, and the nth pass with that key in the frame), because a busy scene (Gears: about 1470-1480 passes, a few
   different every frame) never repeats a frame's exact layout. Targets are not matched by resource: a D3D12 swap chain
   rotates its back buffers and ping-pong targets swap every frame. The match can still shift when a frame splits or drops
