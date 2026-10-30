@@ -22,6 +22,7 @@
 #include <format>
 #include <functional>
 #include <iterator>
+#include <numeric>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -187,7 +188,7 @@ struct FrameResult {
   double total_ms = 0.0;
   double between_lists_ms = 0.0;
   double present_interval_ms = 0.0;
-  // Command lists the frame executed on the presenting queue (with stamps).
+  // Command lists the frame executed on the presenting queue.
   std::size_t lists = 0u;
   std::vector<PassSegment> passes;
   std::map<std::pair<std::uint32_t, RunKind>, ShaderSegment> shaders;
@@ -1011,14 +1012,17 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
     return;
   }
 
-  // Passes are matched across frames by identity (kind, target resources or dispatch shader, and the nth pass with that
-  // key in the frame), so that the few passes a busy scene adds or drops from one frame to the next (culling, particles)
-  // do not discard a whole frame. The reference frame is the one with the most passes, and per-pass numbers use every
-  // frame that has the pass (`frames` in the output).
+  // Passes are matched across frames by identity (kind, the targets' size and format, the first shader or the dispatch
+  // shader, and the nth pass with that key in the frame), so that the few passes a busy scene adds or drops from one frame
+  // to the next (culling, particles) do not discard a whole frame. The targets are not matched by resource: a D3D12
+  // swap chain rotates its back buffers and ping-pong targets swap every frame. The reference frame is the one with the
+  // median pass count, and per-pass numbers use every frame that has the pass (`frames` in the output).
   struct PassKey {
     RunKind kind = RunKind::DRAW;
     std::uint32_t dispatch_shader_hash = 0u;
-    std::vector<std::uint64_t> targets;
+    std::uint32_t first_shader_hash = 0u;
+    // Width, height and format of every target, in order.
+    std::vector<std::uint64_t> target_shapes;
     std::uint32_t occurrence = 0u;
 
     auto operator<=>(const PassKey&) const = default;
@@ -1027,20 +1031,26 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
     std::vector<PassKey> keys;
     std::map<PassKey, std::uint32_t> seen;
     for (const auto& pass : frame.passes) {
-      PassKey key = {.kind = pass.run.kind, .dispatch_shader_hash = pass.run.dispatch_shader_hash};
+      PassKey key = {
+          .kind = pass.run.kind,
+          .dispatch_shader_hash = pass.run.dispatch_shader_hash,
+          .first_shader_hash = (pass.shader_hashes.empty() ? 0u : pass.shader_hashes.front()),
+      };
       for (const auto& target : pass.run.targets) {
-        key.targets.push_back(target.resource_handle);
+        key.target_shapes.insert(key.target_shapes.end(), {target.width, target.height, static_cast<std::uint64_t>(target.format)});
       }
       key.occurrence = seen[key]++;
       keys.push_back(std::move(key));
     }
     return keys;
   };
-  const auto reference_iterator = std::ranges::max_element(
-      session->instrumented_results,
-      [](const FrameResult& left, const FrameResult& right) { return left.passes.size() < right.passes.size(); });
-  const auto reference_index = static_cast<std::size_t>(reference_iterator - session->instrumented_results.begin());
-  const auto& reference = *reference_iterator;
+  std::vector<std::size_t> frames_by_pass_count(session->instrumented_results.size());
+  std::iota(frames_by_pass_count.begin(), frames_by_pass_count.end(), std::size_t{0});
+  std::ranges::stable_sort(frames_by_pass_count, [&](std::size_t left, std::size_t right) {
+    return session->instrumented_results[left].passes.size() < session->instrumented_results[right].passes.size();
+  });
+  const auto reference_index = frames_by_pass_count[frames_by_pass_count.size() / 2u];
+  const auto& reference = session->instrumented_results[reference_index];
   std::map<PassKey, std::size_t> reference_pass_index;
   const auto reference_keys = pass_keys(reference);
   for (std::size_t index = 0u; index < reference_keys.size(); ++index) {
@@ -1156,7 +1166,7 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
         {"medianMs", stats.median_ms},
         {"minMs", stats.min_ms},
         {"frames", pass_ms[stats.index].size()},
-        {"shareOfFrame",instrumented_median > 0.0 ? stats.median_ms / instrumented_median : 0.0},
+        {"shareOfFrame", instrumented_median > 0.0 ? stats.median_ms / instrumented_median : 0.0},
         {"shaderHashes", shader_hashes},
         {"targets", targets},
     });
