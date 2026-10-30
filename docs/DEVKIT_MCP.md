@@ -1070,12 +1070,16 @@ swap chain proxy against vanilla, same scene, Release builds), not for absolute 
   calls `SetStablePowerState`, which removes the device when Windows Developer Mode is off, so the tool reads
   `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock\AllowDevelopmentWithoutDevLicense` first and reports
   `unavailable` unless it is 1. The pinned clock is the base clock, below the boost clock of play.
-- Passes are matched across frames by identity (kind, target resources or dispatch shader, and the nth pass with that key in
-  the frame), because a busy scene (Gears: about 1470-1480 passes, a few different every frame) never repeats a frame's
-  exact layout. The reference frame is the one with the most passes: per-pass `draws` and the `pass` index come from it.
-  `medianMs` / `minMs` use every frame that has the pass (`frames` per pass; `instrumentedFrameDetails` lists the lists,
-  passes, `passesMatchedToReference`, times and present interval of every frame). The call fails after 15 s if the game presents nothing (paused, minimised) and when the swap chain it times is
-  replaced during the run (a fullscreen switch); it returns a timeout error after 180 s if the game stops presenting later.
+- Passes are matched across frames by identity (kind, the targets' sizes and formats, the first shader or the dispatch
+  shader, and the nth pass with that key in the frame), because a busy scene (Gears: about 1470-1480 passes, a few
+  different every frame) never repeats a frame's exact layout. Targets are not matched by resource: a D3D12 swap chain
+  rotates its back buffers and ping-pong targets swap every frame. The match can still shift when a frame splits or drops
+  one run of a common key, so a pass with a low `frames` count is a thin sample. The reference frame is the one with the
+  median pass count: per-pass `draws` and the `pass` index come from it. `medianMs` / `minMs` use every frame that has the
+  pass (`frames` per pass; `instrumentedFrameDetails` lists the lists, passes, `passesMatchedToReference`, times and present
+  interval of every frame).
+- The call fails after 15 s if the game presents nothing (paused, minimised) and when the swap chain it times is replaced
+  during the run (a fullscreen switch); it returns a timeout error after 180 s if the game stops presenting later.
 - Not on Vulkan (ReShade's timestamp query resets the pool inside the command buffer, which is illegal inside a render pass),
   OpenGL or D3D9 yet. Nothing is created or hooked while no run is active; a draw pays one atomic load.
 
