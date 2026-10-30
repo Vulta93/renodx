@@ -277,7 +277,6 @@ struct Session {
   std::uint32_t dropped_disjoint = 0u;
   std::uint32_t dropped_lost = 0u;
   std::uint32_t dropped_empty = 0u;
-  std::uint32_t dropped_inconsistent = 0u;
   std::uint32_t non_monotonic_intervals = 0u;
   // Only ReleaseFinishedSessions touches this, under the timer's lock.
   bool cpu_data_released = false;
@@ -1012,30 +1011,43 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
     return;
   }
 
-  // The reference frame is the one whose pass layout most instrumented frames share (the earliest of equals), not simply
-  // the first: the first frame runs right after the start, with lists already recording skipped. Frames with another
-  // pass layout count only in the totals and per-shader numbers.
-  const auto layouts_match = [](const FrameResult& left_frame, const FrameResult& right_frame) {
-    return left_frame.passes.size() == right_frame.passes.size()
-           && std::ranges::equal(left_frame.passes, right_frame.passes, [](const PassSegment& left, const PassSegment& right) {
-                return left.run.kind == right.run.kind && left.run.dispatch_shader_hash == right.run.dispatch_shader_hash
-                       && left.run.targets.size() == right.run.targets.size();
-              });
+  // Passes are matched across frames by identity (kind, target resources or dispatch shader, and the nth pass with that
+  // key in the frame), so that the few passes a busy scene adds or drops from one frame to the next (culling, particles)
+  // do not discard a whole frame. The reference frame is the one with the most passes, and per-pass numbers use every
+  // frame that has the pass (`frames` in the output).
+  struct PassKey {
+    RunKind kind = RunKind::DRAW;
+    std::uint32_t dispatch_shader_hash = 0u;
+    std::vector<std::uint64_t> targets;
+    std::uint32_t occurrence = 0u;
+
+    auto operator<=>(const PassKey&) const = default;
   };
-  std::size_t reference_index = 0u;
-  std::size_t reference_matches = 0u;
-  for (std::size_t candidate = 0u; candidate < session->instrumented_results.size(); ++candidate) {
-    const auto matches = static_cast<std::size_t>(std::ranges::count_if(session->instrumented_results, [&](const FrameResult& frame) {
-      return layouts_match(frame, session->instrumented_results[candidate]);
-    }));
-    if (matches > reference_matches) {
-      reference_index = candidate;
-      reference_matches = matches;
+  const auto pass_keys = [](const FrameResult& frame) {
+    std::vector<PassKey> keys;
+    std::map<PassKey, std::uint32_t> seen;
+    for (const auto& pass : frame.passes) {
+      PassKey key = {.kind = pass.run.kind, .dispatch_shader_hash = pass.run.dispatch_shader_hash};
+      for (const auto& target : pass.run.targets) {
+        key.targets.push_back(target.resource_handle);
+      }
+      key.occurrence = seen[key]++;
+      keys.push_back(std::move(key));
     }
+    return keys;
+  };
+  const auto reference_iterator = std::ranges::max_element(
+      session->instrumented_results,
+      [](const FrameResult& left, const FrameResult& right) { return left.passes.size() < right.passes.size(); });
+  const auto reference_index = static_cast<std::size_t>(reference_iterator - session->instrumented_results.begin());
+  const auto& reference = *reference_iterator;
+  std::map<PassKey, std::size_t> reference_pass_index;
+  const auto reference_keys = pass_keys(reference);
+  for (std::size_t index = 0u; index < reference_keys.size(); ++index) {
+    reference_pass_index.emplace(reference_keys[index], index);
   }
-  const auto& reference = session->instrumented_results[reference_index];
-  const auto same_layout = [&](const FrameResult& frame) { return layouts_match(frame, reference); };
   std::vector<std::vector<double>> pass_ms(reference.passes.size());
+  std::vector<std::size_t> matched_passes;
   std::vector<double> instrumented_totals;
   std::vector<double> between_lists;
   std::vector<double> instrumented_intervals;
@@ -1054,13 +1066,15 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
       series.ms.push_back(segment.ms);
       series.draws.push_back(static_cast<double>(segment.draws));
     }
-    if (!same_layout(frame)) {
-      ++session->dropped_inconsistent;
-      continue;
+    std::size_t matched = 0u;
+    const auto frame_keys = pass_keys(frame);
+    for (std::size_t index = 0u; index < frame_keys.size(); ++index) {
+      if (const auto found = reference_pass_index.find(frame_keys[index]); found != reference_pass_index.end()) {
+        pass_ms[found->second].push_back(frame.passes[index].ms);
+        ++matched;
+      }
     }
-    for (std::size_t index = 0u; index < frame.passes.size(); ++index) {
-      pass_ms[index].push_back(frame.passes[index].ms);
-    }
+    matched_passes.push_back(matched);
   }
   std::vector<double> plain_totals;
   for (const auto& frame : session->plain_results) {
@@ -1141,7 +1155,8 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
         {"draws", segment.draws},
         {"medianMs", stats.median_ms},
         {"minMs", stats.min_ms},
-        {"shareOfFrame", instrumented_median > 0.0 ? stats.median_ms / instrumented_median : 0.0},
+        {"frames", pass_ms[stats.index].size()},
+        {"shareOfFrame",instrumented_median > 0.0 ? stats.median_ms / instrumented_median : 0.0},
         {"shaderHashes", shader_hashes},
         {"targets", targets},
     });
@@ -1186,7 +1201,7 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
         {"totalMs", frame.total_ms},
         {"betweenListsMs", frame.between_lists_ms},
         {"presentIntervalMs", frame.present_interval_ms},
-        {"referenceLayout", same_layout(frame)},
+        {"passesMatchedToReference", matched_passes[index]},
         {"isReference", index == reference_index},
     });
   }
@@ -1199,8 +1214,6 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
       {"plainFrames", plain_count},
       {"frame", frame_json},
       {"passCount", reference.passes.size()},
-      {"framesWithReferenceLayout", static_cast<std::size_t>(pass_ms.empty() ? 0u : pass_ms.front().size())},
-      {"framesWithOtherLayout", session->dropped_inconsistent},
       {"sumOfPassMinimaMs", sum_of_minima},
       {"passes", passes},
       {"shaders", shaders},
