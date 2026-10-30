@@ -1012,15 +1012,14 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
     return;
   }
 
-  // Passes are matched across frames by identity (kind, the targets' size and format, the first shader or the dispatch
-  // shader, and the nth pass with that key in the frame), so that the few passes a busy scene adds or drops from one frame
+  // Passes are matched across frames by identity (kind, the targets' size and format or the dispatch shader, and the nth
+  // pass with that key in the frame), so that the few passes a busy scene adds or drops from one frame
   // to the next (culling, particles) do not discard a whole frame. The targets are not matched by resource: a D3D12
   // swap chain rotates its back buffers and ping-pong targets swap every frame. The reference frame is the one with the
   // median pass count, and per-pass numbers use every frame that has the pass (`frames` in the output).
   struct PassKey {
     RunKind kind = RunKind::DRAW;
     std::uint32_t dispatch_shader_hash = 0u;
-    std::uint32_t first_shader_hash = 0u;
     // Width, height and format of every target, in order.
     std::vector<std::uint64_t> target_shapes;
     std::uint32_t occurrence = 0u;
@@ -1034,7 +1033,6 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
       PassKey key = {
           .kind = pass.run.kind,
           .dispatch_shader_hash = pass.run.dispatch_shader_hash,
-          .first_shader_hash = (pass.shader_hashes.empty() ? 0u : pass.shader_hashes.front()),
       };
       for (const auto& target : pass.run.targets) {
         key.target_shapes.insert(key.target_shapes.end(), {target.width, target.height, static_cast<std::uint64_t>(target.format)});
