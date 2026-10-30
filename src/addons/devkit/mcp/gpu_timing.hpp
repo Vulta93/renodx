@@ -187,6 +187,8 @@ struct FrameResult {
   double total_ms = 0.0;
   double between_lists_ms = 0.0;
   double present_interval_ms = 0.0;
+  // Command lists the frame executed on the presenting queue (with stamps).
+  std::size_t lists = 0u;
   std::vector<PassSegment> passes;
   std::map<std::pair<std::uint32_t, RunKind>, ShaderSegment> shaders;
 };
@@ -951,7 +953,7 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
     }
 
     const double ms_per_tick = 1000.0 / static_cast<double>(session->frequency);
-    FrameResult result = {.present_interval_ms = frame.present_interval_ms};
+    FrameResult result = {.present_interval_ms = frame.present_interval_ms, .lists = lists_instrumented.size()};
     result.total_ms = static_cast<double>(ticks[order.back()] - std::min(ticks[order.back()], ticks[order.front()])) * ms_per_tick;
     for (std::size_t position = 0u; position + 1u < order.size(); ++position) {
       const auto& stamp = stamps[order[position]];
@@ -1010,16 +1012,29 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
     return;
   }
 
-  // The reference frame is the first instrumented one; frames with another pass layout count only in the totals and
-  // per-shader numbers.
-  const auto& reference = session->instrumented_results.front();
-  const auto same_layout = [&](const FrameResult& frame) {
-    return frame.passes.size() == reference.passes.size()
-           && std::ranges::equal(frame.passes, reference.passes, [](const PassSegment& left, const PassSegment& right) {
+  // The reference frame is the one whose pass layout most instrumented frames share (the earliest of equals), not simply
+  // the first: the first frame runs right after the start, with lists already recording skipped. Frames with another
+  // pass layout count only in the totals and per-shader numbers.
+  const auto layouts_match = [](const FrameResult& left_frame, const FrameResult& right_frame) {
+    return left_frame.passes.size() == right_frame.passes.size()
+           && std::ranges::equal(left_frame.passes, right_frame.passes, [](const PassSegment& left, const PassSegment& right) {
                 return left.run.kind == right.run.kind && left.run.dispatch_shader_hash == right.run.dispatch_shader_hash
                        && left.run.targets.size() == right.run.targets.size();
               });
   };
+  std::size_t reference_index = 0u;
+  std::size_t reference_matches = 0u;
+  for (std::size_t candidate = 0u; candidate < session->instrumented_results.size(); ++candidate) {
+    const auto matches = static_cast<std::size_t>(std::ranges::count_if(session->instrumented_results, [&](const FrameResult& frame) {
+      return layouts_match(frame, session->instrumented_results[candidate]);
+    }));
+    if (matches > reference_matches) {
+      reference_index = candidate;
+      reference_matches = matches;
+    }
+  }
+  const auto& reference = session->instrumented_results[reference_index];
+  const auto same_layout = [&](const FrameResult& frame) { return layouts_match(frame, reference); };
   std::vector<std::vector<double>> pass_ms(reference.passes.size());
   std::vector<double> instrumented_totals;
   std::vector<double> between_lists;
@@ -1162,8 +1177,23 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
     });
   }
 
+  json instrumented_frames_json = json::array();
+  for (std::size_t index = 0u; index < session->instrumented_results.size(); ++index) {
+    const auto& frame = session->instrumented_results[index];
+    instrumented_frames_json.push_back({
+        {"lists", frame.lists},
+        {"passes", frame.passes.size()},
+        {"totalMs", frame.total_ms},
+        {"betweenListsMs", frame.between_lists_ms},
+        {"presentIntervalMs", frame.present_interval_ms},
+        {"referenceLayout", same_layout(frame)},
+        {"isReference", index == reference_index},
+    });
+  }
+
   json output = {
       {"api", is_d3d12 ? "d3d12" : "d3d11"},
+      {"instrumentedFrameDetails", instrumented_frames_json},
       {"frequencyHz", session->frequency},
       {"instrumentedFrames", instrumented_count},
       {"plainFrames", plain_count},
@@ -1328,7 +1358,7 @@ inline void OnPresent(Timer* timer, reshade::api::command_queue* queue, reshade:
   } else {
     link["firstMismatchingPass"] = first_mismatch;
     link["reason"] = (snapshot_runs.empty() ? "No snapshot is available (devkit_queue_snapshot first)."
-                                            : "The snapshot's pass sequence differs from the timed frame's (another scene, or passes that merge differently).");
+                                            : "The snapshot's pass sequence differs from the timed frame's: another scene, passes that merge differently, or work the timing leaves out (lists on other queues such as async compute, lists already recording when the run started; see untimed).");
     result.text += std::format(" Snapshot not matched: {}", link["reason"].get<std::string>());
   }
   content["snapshotLink"] = std::move(link);
