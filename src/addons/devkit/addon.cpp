@@ -405,7 +405,10 @@ struct D3D9DrawState {
     uint32_t sampler = 0u;
     DWORD mag_filter = 0u;
     DWORD min_filter = 0u;
+    bool srgb_texture = false;
   };
+  // D3DRS_SRGBWRITEENABLE; std::nullopt when the read failed.
+  std::optional<bool> srgb_write_enable = std::nullopt;
   std::vector<SamplerFilter> sampler_filters;
 };
 
@@ -3934,10 +3937,13 @@ std::vector<DeviceData*> device_data_list;
           .sampler = filter.sampler,
           .mag_filter = filter_name(filter.mag_filter),
           .min_filter = filter_name(filter.min_filter),
+          .srgb_texture = filter.srgb_texture,
       });
     }
-    // Left out when every value is the default.
+    state_summary.srgb_write_enable = state.srgb_write_enable;
+    // Left out when every value is the default; srgbWriteEnable is reported whenever it was read, including false.
     if (state_summary.fvf_hex.has_value() || !state_summary.vertex_elements.empty() || state_summary.alpha_test.has_value()
+        || state_summary.srgb_write_enable.has_value()
         || !state_summary.texture_coordinate_indexes.empty() || !state_summary.texture_transforms.empty()
         || !state_summary.bump_environments.empty() || !state_summary.sampler_filters.empty()) {
       draw_summary.d3d9_state = std::move(state_summary);
@@ -7949,16 +7955,24 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
             state.bump_environments.push_back(bump_environment);
           }
         }
-        // Filters of the pixel shader samplers that have a texture bound, unless both are D3DTEXF_POINT (the default).
+        DWORD srgb_write_enable = FALSE;
+        if (SUCCEEDED(native_device->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write_enable))) {
+          state.srgb_write_enable = (srgb_write_enable != FALSE);
+        }
+        // Filters and sRGB decode of the pixel shader samplers that have a texture bound, unless both filters are
+        // D3DTEXF_POINT (the default) and D3DSAMP_SRGBTEXTURE is off (the default).
         for (DWORD sampler = 0u; sampler < 16u; ++sampler) {
           Microsoft::WRL::ComPtr<IDirect3DBaseTexture9> texture;
           if (FAILED(native_device->GetTexture(sampler, &texture)) || texture == nullptr) continue;
           D3D9DrawState::SamplerFilter filter = {.sampler = sampler, .mag_filter = D3DTEXF_POINT, .min_filter = D3DTEXF_POINT};
+          DWORD srgb_texture = FALSE;
           if (FAILED(native_device->GetSamplerState(sampler, D3DSAMP_MAGFILTER, &filter.mag_filter))
-              || FAILED(native_device->GetSamplerState(sampler, D3DSAMP_MINFILTER, &filter.min_filter))) {
+              || FAILED(native_device->GetSamplerState(sampler, D3DSAMP_MINFILTER, &filter.min_filter))
+              || FAILED(native_device->GetSamplerState(sampler, D3DSAMP_SRGBTEXTURE, &srgb_texture))) {
             continue;
           }
-          if (filter.mag_filter == D3DTEXF_POINT && filter.min_filter == D3DTEXF_POINT) continue;
+          filter.srgb_texture = (srgb_texture != FALSE);
+          if (filter.mag_filter == D3DTEXF_POINT && filter.min_filter == D3DTEXF_POINT && !filter.srgb_texture) continue;
           state.sampler_filters.push_back(filter);
         }
         draw_details.d3d9_state = std::move(state);

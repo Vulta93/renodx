@@ -411,11 +411,18 @@ carry only a few fields:
 - `bumpEnvironments`: stages with a non-zero bump-environment matrix (`matrix` = BUMPENVMAT00, 01, 10, 11), which `texbem`
   and the `bump_env_map` ops read, and that stage's `addressU` (`wrap`, `mirror`, `clamp`, `border`, `mirror_once`). A
   port passes the matrix as a constant.
-- `samplerFilters`: samplers 0-15 with a texture bound whose filters are not both `point` (the default): `magFilter` and
-  `minFilter` (`point`, `linear`, `anisotropic`, ...). A port that sets its own filters must restore the game's, or later
-  draws inherit them.
+- `srgbWriteEnable`: D3DRS_SRGBWRITEENABLE. Unlike the other fields it is reported with its default too (`false`), so a
+  draw that does not encode is distinguishable from an unreadable one; it is left out only when the read fails. `true`:
+  the hardware encodes the pixel shader's output to sRGB as it writes the render target. `false`: the output is stored
+  as written.
+- `samplerFilters`: samplers 0-15 with a texture bound whose filters are not both `point` (the default) or whose
+  D3DSAMP_SRGBTEXTURE is on: `magFilter` and `minFilter` (`point`, `linear`, `anisotropic`, ...) and `srgbTexture`
+  (`true`: the hardware decodes the texture from sRGB to linear on the read, `false`: it returns the stored values). A
+  texture-bound sampler without an entry has `point` filters and `srgbTexture` off, or its reads failed. A port that
+  sets its own filters or sRGB decode must restore the game's, or later draws inherit them.
 
-`d3d9State` is left out when every value is the default. Not covered: D3D9 lighting and material state, fog, the world,
+`d3d9State` is left out when every value is the default; `srgbWriteEnable` is always reported when it could be read, so
+in practice every D3D9 draw carries it. Not covered: D3D9 lighting and material state, fog, the world,
 view and projection transforms, clip planes and the vertex shader samplers.
 
 ### Replacement status (`devkit_list_replacements`)

@@ -436,6 +436,7 @@ struct D3D9SamplerFilterSummary {
   std::uint32_t sampler = 0u;
   std::string mag_filter;
   std::string min_filter;
+  bool srgb_texture = false;
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
@@ -444,6 +445,7 @@ inline void to_json(json& j, const D3D9SamplerFilterSummary& value) {
       {"sampler", value.sampler},
       {"magFilter", value.mag_filter},
       {"minFilter", value.min_filter},
+      {"srgbTexture", value.srgb_texture},
   };
 }
 
@@ -455,6 +457,8 @@ struct D3D9StateSummary {
   std::vector<D3D9TextureCoordinateIndexSummary> texture_coordinate_indexes;
   std::vector<D3D9TextureTransformSummary> texture_transforms;
   std::vector<D3D9BumpEnvironmentSummary> bump_environments;
+  // D3DRS_SRGBWRITEENABLE, left out when the read failed.
+  std::optional<bool> srgb_write_enable = std::nullopt;
   std::vector<D3D9SamplerFilterSummary> sampler_filters;
 };
 
@@ -478,6 +482,9 @@ inline void to_json(json& j, const D3D9StateSummary& value) {
   }
   if (!value.bump_environments.empty()) {
     j["bumpEnvironments"] = value.bump_environments;
+  }
+  if (value.srgb_write_enable.has_value()) {
+    j["srgbWriteEnable"] = value.srgb_write_enable.value();
   }
   if (!value.sampler_filters.empty()) {
     j["samplerFilters"] = value.sampler_filters;
