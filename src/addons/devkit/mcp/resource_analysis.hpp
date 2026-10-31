@@ -5,6 +5,10 @@
 
 #pragma once
 
+#include <Windows.h>
+
+#include <d3d9.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -996,8 +1000,22 @@ inline void EncodePreviewPixel(
       return make_error("A LUT is a 3D texture or a 2D strip.");
     }
     if (lut_desc.texture.samples != 1u) return make_error("A multisampled texture is not a LUT.");
-    if (is_volume && device->get_api() == reshade::api::device_api::d3d9) {
-      return make_error("3D LUTs are not read on D3D9 (ReShade does not copy volume textures there); 2D strip LUTs are.");
+    // ReShade's D3D9 backend cannot copy out of a volume texture, but its map_texture_region locks one (LockBox), so the
+    // game's own volume is read in place when its pool and usage allow a lock.
+    const bool lock_in_place = (is_volume && device->get_api() == reshade::api::device_api::d3d9);
+    if (lock_in_place) {
+      auto* native_resource = reinterpret_cast<IDirect3DResource9*>(static_cast<std::uintptr_t>(target.resolved_resource.handle));
+      D3DVOLUME_DESC volume_desc = {};
+      if (native_resource->GetType() != D3DRTYPE_VOLUMETEXTURE
+          || FAILED(static_cast<IDirect3DVolumeTexture9*>(native_resource)->GetLevelDesc(0, &volume_desc))) {
+        return make_error("This D3D9 3D texture is not a volume texture whose level 0 can be described.");
+      }
+      if (volume_desc.Pool == D3DPOOL_DEFAULT && (volume_desc.Usage & D3DUSAGE_DYNAMIC) == 0u) {
+        return make_error(std::format(
+            "This D3D9 volume texture is in D3DPOOL_DEFAULT without D3DUSAGE_DYNAMIC (usage 0x{:X}), so it cannot be locked "
+            "for reading; only managed, system-memory, scratch and dynamic volumes can.",
+            volume_desc.Usage));
+      }
     }
     // ReShade reads textures back on Vulkan through LINEAR-tiled images, which Vulkan guarantees only for 2D.
     if (is_volume && device->get_api() == reshade::api::device_api::vulkan) {
@@ -1067,30 +1085,36 @@ inline void EncodePreviewPixel(
                                     ? view_format
                                     : readback_format);
     reshade::api::resource readback = {0u};
-    if (!device->create_resource(
-            reshade::api::resource_desc(
-                lut_desc.type,
-                lut_width,
-                lut_height,
-                static_cast<uint16_t>(lut_depth),
-                1,
-                readback_format,
-                1,
-                reshade::api::memory_heap::gpu_to_cpu,
-                reshade::api::resource_usage::copy_dest),
-            nullptr,
-            reshade::api::resource_usage::copy_dest,
-            &readback)) {
-      return make_error("Failed to create a GPU-to-CPU readback texture for the LUT.");
+    if (!lock_in_place) {
+      if (!device->create_resource(
+              reshade::api::resource_desc(
+                  lut_desc.type,
+                  lut_width,
+                  lut_height,
+                  static_cast<uint16_t>(lut_depth),
+                  1,
+                  readback_format,
+                  1,
+                  reshade::api::memory_heap::gpu_to_cpu,
+                  reshade::api::resource_usage::copy_dest),
+              nullptr,
+              reshade::api::resource_usage::copy_dest,
+              &readback)) {
+        return make_error("Failed to create a GPU-to-CPU readback texture for the LUT.");
+      }
+      queue->get_immediate_command_list()->copy_texture_region(target.resolved_resource, 0, nullptr, readback, 0, nullptr);
+      queue->flush_immediate_command_list();
+      queue->wait_idle();
     }
-    queue->get_immediate_command_list()->copy_texture_region(target.resolved_resource, 0, nullptr, readback, 0, nullptr);
-    queue->flush_immediate_command_list();
-    queue->wait_idle();
 
+    // A locked game volume is only unlocked afterwards, never destroyed.
+    const auto mapped_resource = (lock_in_place ? target.resolved_resource : readback);
     reshade::api::subresource_data mapped = {};
-    if (!device->map_texture_region(readback, 0, nullptr, reshade::api::map_access::read_only, &mapped)) {
-      device->destroy_resource(readback);
-      return make_error("Failed to map the LUT readback texture.");
+    if (!device->map_texture_region(mapped_resource, 0, nullptr, reshade::api::map_access::read_only, &mapped)) {
+      if (!lock_in_place) {
+        device->destroy_resource(readback);
+      }
+      return make_error(lock_in_place ? "Failed to lock the D3D9 volume texture (LockBox)." : "Failed to map the LUT readback texture.");
     }
     const auto texel_stride = static_cast<std::size_t>(reshade::api::format_row_pitch(readback_format, 1));
     uint32_t channel_count = 4u;
@@ -1125,8 +1149,10 @@ inline void EncodePreviewPixel(
         }
       }
     }
-    device->unmap_texture_region(readback, 0);
-    device->destroy_resource(readback);
+    device->unmap_texture_region(mapped_resource, 0);
+    if (!lock_in_place) {
+      device->destroy_resource(readback);
+    }
     if (!decoded) {
       return make_error(std::format("Readback is not implemented for format {}.", FormatFormat(context, decode_format)));
     }

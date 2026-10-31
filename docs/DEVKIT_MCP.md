@@ -930,9 +930,19 @@ describe the table, not display light.
 - `outputPath` (absolute `.csv`) writes every lattice point with its indices, input and output, for plots
   (`analysis-graphing` skill), for N up to 65; it is written on the game's thread, so larger LUTs get `csvError` instead.
 
-The view must select the top level of a single texture. 3D LUTs are read on D3D10/11/12 and OpenGL; they are refused on
-D3D9 (ReShade does not copy volume textures there) and on Vulkan (ReShade reads back through LINEAR-tiled images, which
-Vulkan guarantees only for 2D). Strips are read on every API. As in `devkit_analyze_resource`, the copy issues no state
+The view must select the top level of a single texture. 3D LUTs are read on D3D9, D3D10/11/12 and OpenGL; they are
+refused on Vulkan (ReShade reads back through LINEAR-tiled images, which Vulkan guarantees only for 2D). Strips are read
+on every API. On D3D9 ReShade cannot copy out of a volume texture, so the Devkit locks the game's own volume
+(`LockBox`, read-only, level 0) at its next present instead of copying it: that works for a volume in `D3DPOOL_MANAGED`,
+`SYSTEMMEM` or `SCRATCH`, or in `DEFAULT` with `D3DUSAGE_DYNAMIC`. The Devkit changes no creation; on a D3D9Ex device
+ReShade turns the game's `MANAGED` request into `MANAGED_EX`, which the check accepts. Game-tested 2026-10-31 in Dark
+Messiah (Source engine, 32-bit): the 32x32x32 `b8g8r8x8_unorm` colour-correction volume reads identically on the pure
+device and on the D3D9Ex device of a RenoDX proxy mod (the analysis runs at the game device's own present). A `D3DPOOL_DEFAULT` volume without `D3DUSAGE_DYNAMIC` is refused with an error naming the pool and usage; that
+includes the clone of a volume (`preferClone`), so read the original. The lock goes through ReShade's `LockBox` hook, so
+other add-ons see a read-only `map_texture_region` event. The usual formats decode as for any texture, among them
+`b8g8r8x8_unorm` (D3DFMT_X8R8G8B8), `b8g8r8a8_unorm` and `r16g16b16a16_float`; D3D9 stores BGRA bytes and the decode
+swaps them to R, G, B, so a near-identity volume reads as near-identity and a swapped read shows a large deviation off the
+grey axis. As in `devkit_analyze_resource`, the copy issues no state
 transition on D3D12/Vulkan, so a LUT in a shader-read state is copied as it is (the validation layers would flag it).
 
 ### Tone curve of a pass (`devkit_measure_tone_curve`)
