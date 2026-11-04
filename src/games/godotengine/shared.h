@@ -113,7 +113,8 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection.swap_chain_clamp_color_space
 #define RENODX_SWAP_CHAIN_ENCODING             shader_injection.swap_chain_encoding
 #define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
-#define RENODX_RENO_DRT_TONE_MAP_METHOD        renodx::tonemap::renodrt::config::tone_map_method::REINHARD
+#define RENODX_RENO_DRT_TONE_MAP_METHOD             renodx::tonemap::renodrt::config::tone_map_method::NEUTWO
+#define RENODX_RENO_DRT_NEUTRAL_SDR_TONE_MAP_METHOD renodx::tonemap::renodrt::config::tone_map_method::NEUTWO
 
 #include "../../shaders/renodx.hlsl"
 

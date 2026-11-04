@@ -16,16 +16,37 @@
 
 #include "../../mods/shader.hpp"
 #include "../../mods/swapchain.hpp"
+#include "../../utils/data.hpp"
+#include "../../utils/resource.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/swapchain.hpp"
 #include "./shared.h"
 
 namespace {
 
+// Godot also tone maps SubViewports, whose narrower 8-bit targets are not cloned: an HDR result there would be
+// clipped per channel by the UNORM write, so those draws keep the original shader. Float targets are the viewport
+// clone, Godot's own RGBA16F tonemap destination (before FSR/SMAA) and HDR 2D viewports.
+bool IsFloatRenderTarget(reshade::api::command_list* cmd_list) {
+  auto* cmd_list_data = renodx::utils::data::Get<renodx::utils::swapchain::CommandListData>(cmd_list);
+  if (cmd_list_data == nullptr || cmd_list_data->current_render_targets.empty()) return false;
+  if (cmd_list_data->current_render_targets[0].handle == 0u) return false;
+  bool is_float = false;
+  renodx::utils::resource::GetResourceViewInfo(
+      cmd_list_data->current_render_targets[0],
+      [&is_float](const renodx::utils::resource::ResourceViewInfo& view_info) {
+        is_float = view_info.clone.handle != 0u
+                   || view_info.desc.format == reshade::api::format::r16g16b16a16_float;
+      });
+  return is_float;
+}
+
 renodx::mods::shader::CustomShaders custom_shaders = {
-    // CustomShaderEntry(0x00000000),
-    // CustomSwapchainShader(0x00000000),
-    // BypassShaderEntry(0x00000000),
-    // __ALL_CUSTOM_SHADERS
+    // Godot 4.6 Forward+ tonemap (tonemap.glsl), D3D12: 3D/1D colour-correction LUT x bilinear/bicubic glow.
+    CustomShaderEntryCallback(0x0656E0CE, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xBF1B5017, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x667C84AD, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x6291BC2F, &IsFloatRenderTarget),
 };
 
 ShaderInjectData shader_injection;
@@ -351,18 +372,22 @@ renodx::utils::settings::Settings settings = {
 };
 
 void OnPresetOff() {
-  //   renodx::utils::settings::UpdateSetting("toneMapType", 0.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapPeakNits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapGameNits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapUINits", 203.f);
-  //   renodx::utils::settings::UpdateSetting("toneMapGammaCorrection", 0);
-  //   renodx::utils::settings::UpdateSetting("colorGradeExposure", 1.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeHighlights", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeShadows", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeContrast", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeSaturation", 50.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeLUTStrength", 100.f);
-  //   renodx::utils::settings::UpdateSetting("colorGradeLUTScaling", 0.f);
+  renodx::utils::settings::UpdateSettings({
+      {"ToneMapType", 0.f},
+      {"ToneMapPeakNits", 203.f},
+      {"ToneMapGameNits", 203.f},
+      {"ToneMapUINits", 203.f},
+      {"GammaCorrection", 0.f},
+      {"ColorGradeExposure", 1.f},
+      {"ColorGradeHighlights", 50.f},
+      {"ColorGradeShadows", 50.f},
+      {"ColorGradeContrast", 50.f},
+      {"ColorGradeSaturation", 50.f},
+      {"ColorGradeHighlightSaturation", 50.f},
+      {"ColorGradeBlowout", 0.f},
+      {"ColorGradeFlare", 0.f},
+      {"ColorGradeScene", 100.f},
+  });
 }
 
 // NVIDIA can present a Vulkan game through a DXGI swap chain. ReShade then sees only the driver's D3D12 device, which
@@ -394,6 +419,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::shader::expected_constant_buffer_space = 50;
         renodx::mods::shader::expected_constant_buffer_index = 13;
         renodx::mods::shader::allow_multiple_push_constants = true;
+        // Godot's tonemap root signature already holds 28 root constants and 8 descriptor tables (36 of 64 DWORDs),
+        // too few for the injected constants; a root CBV costs 2.
+        renodx::mods::shader::use_root_signature_cbv = true;
 
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
