@@ -1,0 +1,9 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "godotengine",
+  "title": "Godot Engine",
+  "category": "engine",
+  "compatibility": "in-progress",
+  "maintainers": ["Vulta93"],
+  "support": "generic"
+}
