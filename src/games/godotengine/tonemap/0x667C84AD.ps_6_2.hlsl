@@ -1,4 +1,5 @@
 // Godot 4.6 Forward+ tonemap, 1D LUT, bilinear glow upscale (D3D12; seen in 4.6.3).
+#define GODOT_VERSION 406
 #define USE_1D_LUT
 #include "./tonemap.hlsl"
 

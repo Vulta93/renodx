@@ -1,4 +1,5 @@
 // Godot 4.6 Forward+ tonemap, 3D LUT, bicubic glow upscale (D3D12; seen in 4.6.3).
+#define GODOT_VERSION 406
 #define USE_GLOW_FILTER_BICUBIC
 #include "./tonemap.hlsl"
 

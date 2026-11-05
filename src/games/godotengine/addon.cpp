@@ -9,6 +9,8 @@
 
 #include <windows.h>
 
+#include <atomic>
+
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
@@ -24,10 +26,19 @@
 
 namespace {
 
+// Set once the addon leaves the game to itself (Vulkan, or Godot's own HDR swap chain): the swap chain then stays as
+// Godot made it, so the shader replacements must not write HDR either. Read from draw-time callbacks.
+std::atomic_bool standing_down = false;
+
+bool IsActive(reshade::api::command_list* /*cmd_list*/) {
+  return !standing_down;
+}
+
 // Godot also tone maps SubViewports, whose narrower 8-bit targets are not cloned: an HDR result there would be
 // clipped per channel by the UNORM write, so those draws keep the original shader. Float targets are the viewport
 // clone, Godot's own RGBA16F tonemap destination (before FSR/SMAA) and HDR 2D viewports.
 bool IsFloatRenderTarget(reshade::api::command_list* cmd_list) {
+  if (standing_down) return false;
   auto* cmd_list_data = renodx::utils::data::Get<renodx::utils::swapchain::CommandListData>(cmd_list);
   if (cmd_list_data == nullptr || cmd_list_data->current_render_targets.empty()) return false;
   if (cmd_list_data->current_render_targets[0].handle == 0u) return false;
@@ -42,11 +53,20 @@ bool IsFloatRenderTarget(reshade::api::command_list* cmd_list) {
 }
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-    // Godot 4.6 Forward+ tonemap (tonemap.glsl), D3D12: 3D/1D colour-correction LUT x bilinear/bicubic glow.
+    // Final viewport blit (blit.glsl), D3D12: 4.6, 4.7.
+    CustomShaderEntryCallback(0x83ADBE18, &IsActive),
+    CustomShaderEntryCallback(0x13955D03, &IsActive),
+    // Forward+ tonemap (tonemap.glsl), D3D12: 3D/1D colour-correction LUT x bilinear/bicubic glow.
+    // 4.6
     CustomShaderEntryCallback(0x0656E0CE, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0xBF1B5017, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0x667C84AD, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0x6291BC2F, &IsFloatRenderTarget),
+    // 4.7
+    CustomShaderEntryCallback(0xB21EACEC, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x3F415A05, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x32F7250B, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xEF76A934, &IsFloatRenderTarget),
 };
 
 ShaderInjectData shader_injection;
@@ -72,8 +92,10 @@ renodx::utils::settings::Settings settings = {
         .can_reset = true,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "None", "ACES", "RenoDRT"},
+        .tooltip = "Sets the tone mapper type"
+                   "\nGodot HDR: Godot 4.7's own HDR curve for AgX and Reinhard (white above 1), RenoDRT otherwise."
+                   " Not neutral: Reinhard lifts midtones. The grading sliders apply to RenoDRT only.",
+        .labels = {"Vanilla", "None", "ACES", "RenoDRT", "Godot HDR"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -397,8 +419,22 @@ void OnPresetOff() {
 // Registered before mods::swapchain::Use so it runs before its OnInitDevice.
 void OnInitDevice(reshade::api::device* device) {
   if (GetModuleHandleW(L"vulkan-1.dll") == nullptr) return;
+  standing_down = true;
   renodx::mods::swapchain::ignored_device_apis.insert(device->get_api());
   reshade::log::message(reshade::log::level::info, "Godot renders with Vulkan (vulkan-1.dll is loaded): device left untouched.");
+}
+
+// Godot 4.7+ can output HDR itself (Window.hdr_output_requested): it then recreates its swap chain as RGBA16F scRGB.
+// Leave the game to Godot from then on (swap chain and shaders). One-way: mods::swapchain drops its device data when
+// it aborts a swap chain, so a later 8-bit swap chain could not be converted correctly; a restart is needed after
+// turning Godot's HDR off. Registered before mods::swapchain::Use so it runs before its handler.
+bool OnCreateSwapchain(reshade::api::device_api device_api, reshade::api::swapchain_desc& desc, void* hwnd) {
+  if (device_api != reshade::api::device_api::d3d12) return false;
+  if (desc.back_buffer.texture.format != reshade::api::format::r16g16b16a16_float) return false;
+  standing_down = true;
+  renodx::mods::swapchain::ignored_device_apis.insert(device_api);
+  reshade::log::message(reshade::log::level::info, "Godot native HDR swap chain (r16g16b16a16_float): left to Godot.");
+  return false;
 }
 
 bool initialized = false;
@@ -413,6 +449,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
 
       if (!initialized) {
         renodx::mods::shader::force_pipeline_cloning = true;
@@ -532,6 +569,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_addon(h_module);
       break;

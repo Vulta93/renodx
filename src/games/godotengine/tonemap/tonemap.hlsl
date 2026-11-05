@@ -1,8 +1,9 @@
-// Godot 4.6 desktop Forward+ tonemap pass (servers/rendering/renderer_rd/shaders/effects/tonemap.glsl, 4.6-stable),
-// ported to HLSL from Godot's MIT source because the Devkit could not decompile the DXIL. Godot builds four desktop
-// variants from it with USE_GLOW_FILTER_BICUBIC and USE_1D_LUT; each per-hash file sets those and calls
-// GodotTonemap. The registers are the ones Godot's NIR-to-DXIL path assigns (set * 100000000 + binding * 100000,
-// push constants at b1700000000), read from the original shaders' resource bindings.
+// Godot 4 desktop Forward+ tonemap pass (servers/rendering/renderer_rd/shaders/effects/tonemap.glsl), ported to HLSL
+// from Godot's MIT source (4.3, 4.4.1, 4.5.1, 4.6 and 4.7.2 stable) because the Devkit could not decompile the DXIL.
+// Godot builds four desktop variants with USE_GLOW_FILTER_BICUBIC and USE_1D_LUT; each per-hash file sets those and
+// GODOT_VERSION (major * 100 + minor) and calls GodotTonemap. The registers are the ones Godot's NIR-to-DXIL path
+// assigns (set * 100000000 + binding * 100000, push constants at b1700000000), read from the original shaders.
+// Before 4.6 the operator output is clamped by an sRGB encode and glow (except mix) is blended after it in sRGB.
 //
 // Godot's tonemap.glsl:
 // Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md).
@@ -11,16 +12,20 @@
 
 #include "../shared.h"
 
-// std430 layout of the GLSL `Params` push-constant block (112 bytes). The float glow_levels[7] array is split so
-// that HLSL packing keeps every member at its std430 byte offset (an HLSL array would start each element on a new
-// 16-byte register).
+#ifndef GODOT_VERSION
+#error "GODOT_VERSION must be defined by the per-hash file"
+#endif
+
+// std430 layout of the GLSL `Params` push-constant block (96 bytes before 4.6, 112 after). The float glow_levels[7]
+// array is split so that HLSL packing keeps every member at its std430 byte offset (an HLSL array would start each
+// element on a new 16-byte register).
 struct Params {
   float3 bcs;
   uint flags;
 
   float2 pixel_size;
   uint tonemapper;
-  uint pad;
+  float output_max_value;  // `uint pad` (0) before 4.7, where SDR output_max_value is the constant 1.
 
   uint2 glow_texture_size;
   float glow_intensity;
@@ -35,7 +40,9 @@ struct Params {
   float auto_exposure_scale;
   float luminance_multiplier;
 
+#if GODOT_VERSION >= 406
   float4 tonemapper_params;
+#endif
 };
 
 ConstantBuffer<Params> params : register(b1700000000);
@@ -59,8 +66,13 @@ SamplerState source_color_correction_sampler : register(s300000000);
 #define FLAG_USE_AUTO_EXPOSURE    (1u << 2)
 #define FLAG_USE_COLOR_CORRECTION (1u << 3)
 #define FLAG_USE_FXAA             (1u << 4)
-#define FLAG_USE_8_BIT_DEBANDING  (1u << 5)
-#define FLAG_CONVERT_TO_SRGB      (1u << 6)
+#define FLAG_USE_8_BIT_DEBANDING  (1u << 5)  // FLAG_USE_DEBANDING before 4.5
+#if GODOT_VERSION == 405
+#define FLAG_USE_10_BIT_DEBANDING (1u << 6)
+#define FLAG_CONVERT_TO_SRGB      (1u << 7)
+#else
+#define FLAG_CONVERT_TO_SRGB (1u << 6)
+#endif
 
 #define TONEMAPPER_LINEAR   0u
 #define TONEMAPPER_REINHARD 1u
@@ -68,16 +80,45 @@ SamplerState source_color_correction_sampler : register(s300000000);
 #define TONEMAPPER_ACES     3u
 #define TONEMAPPER_AGX      4u
 
+// Tone Mapper setting value after RenoDX's Vanilla/None/ACES/RenoDRT (addon.cpp).
+#define TONE_MAP_TYPE_GODOT_HDR 4.f
+
 #define GLOW_MODE_ADD       0u
 #define GLOW_MODE_SCREEN    1u
 #define GLOW_MODE_SOFTLIGHT 2u
 #define GLOW_MODE_REPLACE   3u
 #define GLOW_MODE_MIX       4u
 
-float3 TonemapReinhard(float3 color) {
-  float white_squared = params.tonemapper_params.x;
-  float3 white_squared_color = white_squared * color;
-  return (white_squared_color + color * color) / (white_squared_color + white_squared);
+#if GODOT_VERSION >= 407
+#define GODOT_OUTPUT_MAX_VALUE params.output_max_value
+#else
+#define GODOT_OUTPUT_MAX_VALUE 1.f
+#endif
+
+// The parameters Godot's CPU derives from output_max_value (4.7 environment_storage.cpp): the pushed ones for the
+// vanilla curve, recomputed for a "Godot HDR" curve. Before 4.6 the shader derives them from `white` itself.
+struct TonemapCurve {
+  float output_max_value;
+  float reinhard_white_squared;
+  float agx_awp_w;
+};
+
+TonemapCurve VanillaCurve() {
+  TonemapCurve curve;
+  curve.output_max_value = GODOT_OUTPUT_MAX_VALUE;
+#if GODOT_VERSION >= 406
+  curve.reinhard_white_squared = params.tonemapper_params.x;
+  curve.agx_awp_w = params.tonemapper_params.w;
+#else
+  curve.reinhard_white_squared = params.white * params.white;
+  curve.agx_awp_w = 0.f;  // AgX before 4.6 is a fixed polynomial
+#endif
+  return curve;
+}
+
+// Godot 4.7's HDR form; at output_max_value 1 it equals 4.6's (w^2 c + c^2) / (w^2 c + w^2).
+float3 TonemapReinhard(float3 color, TonemapCurve curve) {
+  return color * (1.0f + color / curve.reinhard_white_squared) / (1.0f + color / curve.output_max_value);
 }
 
 float3 TonemapFilmic(float3 color) {
@@ -90,7 +131,13 @@ float3 TonemapFilmic(float3 color) {
   const float F = 0.30f;
 
   float3 color_tonemapped = ((color * (A * color + C * B) + D * E) / (color * (A * color + B) + D * F)) - E / F;
-  return color_tonemapped / params.tonemapper_params.x;
+#if GODOT_VERSION >= 406
+  float white_tonemapped = params.tonemapper_params.x;
+#else
+  float white = params.white;
+  float white_tonemapped = ((white * (A * white + C * B) + D * E) / (white * (A * white + B) + D * F)) - E / F;
+#endif
+  return color_tonemapped / white_tonemapped;
 }
 
 float3 TonemapAces(float3 color) {
@@ -115,10 +162,44 @@ float3 TonemapAces(float3 color) {
   color = mul(rgb_to_rrt, color);
   float3 color_tonemapped = (color * (color + A) - B) / (color * (C * color + D) + E);
   color_tonemapped = mul(odt_to_rgb, color_tonemapped);
-  return color_tonemapped / params.tonemapper_params.x;
+#if GODOT_VERSION >= 406
+  float white_tonemapped = params.tonemapper_params.x;
+#else
+  float white = params.white * exposure_bias;
+  float white_tonemapped = (white * (white + A) - B) / (white * (C * white + D) + E);
+#endif
+  return color_tonemapped / white_tonemapped;
 }
 
-float3 TonemapAgx(float3 color) {
+#if GODOT_VERSION < 406
+// Before 4.6: polynomial approximation of EaryChow's AgX sigmoid (no white, no output_max_value).
+float3 TonemapAgx(float3 color, TonemapCurve curve) {
+  // GLSL `m * color` with column-major literals: mul(color, m) with the same literal order as rows.
+  const float3x3 srgb_to_rec2020_agx_inset_matrix = float3x3(
+      0.54490813676363087053, 0.14044005884001287035, 0.088827411851915368603,
+      0.37377945959812267119, 0.75410959864013760045, 0.17887712465043811023,
+      0.081384976686407536266, 0.10543358536857773485, 0.73224999956948382528);
+  const float3x3 agx_outset_rec2020_to_srgb_matrix = float3x3(
+      1.9645509602733325934, -0.29932243390911083839, -0.16436833806080403409,
+      -0.85585845117807513559, 1.3264510741502356555, -0.23822464068860595117,
+      -0.10886710826831608324, -0.027084020983874825605, 1.402665347143271889);
+  const float min_ev = -12.4739311883324;
+  const float max_ev = 4.02606881166759;
+
+  color = max(color, 2e-10);
+  color = mul(color, srgb_to_rec2020_agx_inset_matrix);
+  color = clamp(log2(color), min_ev, max_ev);
+  color = (color - min_ev) / (max_ev - min_ev);
+  // agx_contrast_approx
+  float3 x2 = color * color;
+  float3 x4 = x2 * x2;
+  color = 0.021 * color + 4.0111 * x2 - 25.682 * x2 * color + 70.359 * x4 - 74.778 * x4 * color + 27.069 * x4 * x2;
+  color = pow(color, 2.4f);
+  color = mul(color, agx_outset_rec2020_to_srgb_matrix);
+  return color;
+}
+#else
+float3 TonemapAgx(float3 color, TonemapCurve curve) {
   // GLSL `m * color` with column-major literals: mul(color, m) with the same literal order as rows.
   const float3x3 rec709_to_rec2020_agx_inset_matrix = float3x3(
       0.544814746488245, 0.140416948464053, 0.0888104196149096,
@@ -129,15 +210,15 @@ float3 TonemapAgx(float3 color) {
       -0.855988495690215, 1.32639796461980, -0.238183969428088,
       -0.108898916004672, -0.0270845997150571, 1.40253671195648);
 
-  // SDR: output_max_value 1 and crossover 0.18 are constants in Godot 4.6; the CPU fills the rest.
+  // Crossover 0.18 is a constant in Godot; contrast, toe and slope do not depend on output_max_value.
   renodx::tonemap::allenwp::internal::Parameters awp;
-  awp.output_max_value = 1.f;
+  awp.output_max_value = curve.output_max_value;
   awp.awp_crossover_point = 0.18f;
   awp.awp_shoulder_max = awp.output_max_value - awp.awp_crossover_point;
   awp.awp_contrast = params.tonemapper_params.x;
   awp.awp_toe_a = params.tonemapper_params.y;
   awp.awp_slope = params.tonemapper_params.z;
-  awp.awp_w = params.tonemapper_params.w;
+  awp.awp_w = curve.agx_awp_w;
 
   color = mul(color, rec709_to_rec2020_agx_inset_matrix);
   color = renodx::tonemap::allenwp::internal::Curve(color, awp);
@@ -145,8 +226,9 @@ float3 TonemapAgx(float3 color) {
   color = mul(color, agx_outset_rec2020_to_rec709_matrix);
   return color;
 }
+#endif
 
-float3 ApplyTonemapping(float3 color) {
+float3 ApplyTonemapping(float3 color, TonemapCurve curve) {
   if (params.tonemapper == TONEMAPPER_LINEAR) {
     return color;
   }
@@ -154,13 +236,13 @@ float3 ApplyTonemapping(float3 color) {
   color = max(0.f, color);
 
   if (params.tonemapper == TONEMAPPER_REINHARD) {
-    return TonemapReinhard(color);
+    return TonemapReinhard(color, curve);
   } else if (params.tonemapper == TONEMAPPER_FILMIC) {
     return TonemapFilmic(color);
   } else if (params.tonemapper == TONEMAPPER_ACES) {
     return TonemapAces(color);
   } else {
-    return TonemapAgx(color);
+    return TonemapAgx(color, curve);
   }
 }
 
@@ -247,17 +329,30 @@ float3 SampleGlow(float2 uv) {
   return glow;
 }
 
-// Does not handle the mix blend mode.
+// Does not handle the mix blend mode. Before 4.6 it blends tone-mapped, sRGB-encoded glow and ignores `white`.
 float3 ApplyGlow(float3 color, float3 glow, float white) {
   if (params.glow_mode == GLOW_MODE_ADD) {
     return color + glow;
   } else if (params.glow_mode == GLOW_MODE_SCREEN) {
+#if GODOT_VERSION >= 406
     glow = clamp(glow, 0.0, white);
     return color + glow - (color * glow / white);
+#else
+    glow = saturate(glow);
+    return max((color + glow) - (color * glow), 0.0);
+#endif
   } else if (params.glow_mode == GLOW_MODE_SOFTLIGHT) {
     glow = saturate(glow);
+#if GODOT_VERSION >= 406
     float3 soft_light_base = select(color <= 0.25f, ((16.0f * color - 12.0f) * color + 4.0f) * color, sqrt(color));
     return select(color > 1.0f, color, color + glow * (soft_light_base - color));
+#else
+    glow = glow * 0.5f + 0.5f;
+    float3 darken = color - (1.0f - 2.0f * glow) * color * (1.0f - color);
+    float3 lighten_dark = color + (2.0f * glow - 1.0f) * (4.0f * color * (4.0f * color + 1.0f) * (color - 1.0f) + 7.0f * color);
+    float3 lighten = color + (2.0f * glow - 1.0f) * (sqrt(color) - color);
+    return select(glow <= 0.5f, darken, select(color <= 0.25f, lighten_dark, lighten));
+#endif
   } else {
     return glow;
   }
@@ -274,6 +369,52 @@ float3 ApplyColorCorrection(float3 color) {
 #endif
 }
 
+#if GODOT_VERSION < 405
+// Godot 4.3/4.4 FXAA (reduced FXAA 3.x, 5 taps).
+float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
+  const float FXAA_REDUCE_MIN = (1.0 / 128.0);
+  const float FXAA_REDUCE_MUL = (1.0 / 8.0);
+  const float FXAA_SPAN_MAX = 8.0;
+  const float scale = exposure * params.luminance_multiplier;
+
+  float3 rgb_nw = source_color.SampleLevel(source_color_sampler, uv_interp + float2(-0.5, -0.5) * params.pixel_size, 0.0).rgb * scale;
+  float3 rgb_ne = source_color.SampleLevel(source_color_sampler, uv_interp + float2(0.5, -0.5) * params.pixel_size, 0.0).rgb * scale;
+  float3 rgb_sw = source_color.SampleLevel(source_color_sampler, uv_interp + float2(-0.5, 0.5) * params.pixel_size, 0.0).rgb * scale;
+  float3 rgb_se = source_color.SampleLevel(source_color_sampler, uv_interp + float2(0.5, 0.5) * params.pixel_size, 0.0).rgb * scale;
+  const float3 luma = float3(0.299, 0.587, 0.114);
+  float luma_nw = dot(rgb_nw, luma);
+  float luma_ne = dot(rgb_ne, luma);
+  float luma_sw = dot(rgb_sw, luma);
+  float luma_se = dot(rgb_se, luma);
+  float luma_m = dot(color, luma);
+  float luma_min = min(luma_m, min(min(luma_nw, luma_ne), min(luma_sw, luma_se)));
+  float luma_max = max(luma_m, max(max(luma_nw, luma_ne), max(luma_sw, luma_se)));
+
+  float2 dir;
+  dir.x = -((luma_nw + luma_ne) - (luma_sw + luma_se));
+  dir.y = ((luma_nw + luma_sw) - (luma_ne + luma_se));
+
+  float dir_reduce = max((luma_nw + luma_ne + luma_sw + luma_se) * (0.25 * FXAA_REDUCE_MUL), FXAA_REDUCE_MIN);
+  float rcp_dir_min = 1.0 / (min(abs(dir.x), abs(dir.y)) + dir_reduce);
+  dir = min(FXAA_SPAN_MAX, max(-FXAA_SPAN_MAX, dir * rcp_dir_min)) * params.pixel_size;
+
+  float3 rgb_a = 0.5 * exposure
+                 * (source_color.SampleLevel(source_color_sampler, uv_interp + dir * (1.0 / 3.0 - 0.5), 0.0).rgb
+                    + source_color.SampleLevel(source_color_sampler, uv_interp + dir * (2.0 / 3.0 - 0.5), 0.0).rgb)
+                 * params.luminance_multiplier;
+  float3 rgb_b = rgb_a * 0.5
+                 + 0.25 * exposure
+                       * (source_color.SampleLevel(source_color_sampler, uv_interp + dir * -0.5, 0.0).rgb
+                          + source_color.SampleLevel(source_color_sampler, uv_interp + dir * 0.5, 0.0).rgb)
+                       * params.luminance_multiplier;
+
+  float luma_b = dot(rgb_b, luma);
+  if ((luma_b < luma_min) || (luma_b > luma_max)) {
+    return rgb_a;
+  }
+  return rgb_b;
+}
+#else
 // FXAA 3.11 compact (Godot's port of kosua20/Rendu, MIT; NVIDIA FXAA 3.11 by Timothy Lottes, BSD-3).
 float FxaaQuality(float q) {
   return (q < 5 ? 1.0 : (q > 5 ? (q < 10 ? 2.0 : (q < 11 ? 4.0 : 8.0)) : 1.5));
@@ -439,13 +580,44 @@ float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
 
   return source_color.SampleLevel(source_color_sampler, final_uv, 0.0).rgb * exposure * params.luminance_multiplier;
 }
+#endif
 
-// Everything Godot does after apply_tonemapping: soft-light glow, then (adjustments on) brightness, sRGB encode,
-// contrast, saturation and the colour-correction LUT, else the sRGB encode alone. The result is encoded the way
-// Godot writes it: sRGB when FLAG_CONVERT_TO_SRGB is set (SDR viewport), linear otherwise (HDR 2D).
+// Everything Godot does after apply_tonemapping. The result is encoded the way Godot writes it: sRGB when
+// FLAG_CONVERT_TO_SRGB is set (SDR viewport), linear otherwise (HDR 2D).
+// 4.6+: soft-light glow, then (adjustments on) brightness, sRGB encode, contrast, saturation and the colour-correction
+// LUT, else the sRGB encode alone.
+// Before 4.6: clamping sRGB encode, glow (all modes but mix, tone mapped and encoded the same way), BCS in that
+// encoding, then the LUT.
 float3 ApplyPostTonemap(float3 color, float2 uv) {
+#if GODOT_VERSION < 406
+  const bool convert_to_srgb = (params.flags & FLAG_CONVERT_TO_SRGB) != 0u;
+  if (convert_to_srgb) {
+    color = renodx::color::srgb::Encode(saturate(color));
+  }
+  if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode != GLOW_MODE_MIX) {
+    float3 glow = ApplyTonemapping(SampleGlow(uv), VanillaCurve());
+    if (convert_to_srgb) {
+      glow = renodx::color::srgb::Encode(saturate(glow));
+    }
+    color = ApplyGlow(color, glow, params.white);
+  }
+  if ((params.flags & FLAG_USE_BCS) != 0u) {
+    color = color * params.bcs.x;
+    color = lerp(0.5f, color, params.bcs.y);
+    color = lerp(dot(float3(1.0f, 1.0f, 1.0f), color) * 0.33333f, color, params.bcs.z);
+  }
+  if ((params.flags & FLAG_USE_COLOR_CORRECTION) != 0u) {
+#if GODOT_VERSION >= 405
+    if (!convert_to_srgb) {
+      color = renodx::color::srgb::Encode(saturate(color));
+    }
+#endif
+    color = ApplyColorCorrection(color);
+  }
+  return color;
+#else
   if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode == GLOW_MODE_SOFTLIGHT) {
-    color = ApplyGlow(color, ApplyTonemapping(SampleGlow(uv)), params.white);
+    color = ApplyGlow(color, ApplyTonemapping(SampleGlow(uv), VanillaCurve()), params.white);
   }
 
   if ((params.flags & FLAG_USE_BCS) != 0u) {
@@ -463,6 +635,7 @@ float3 ApplyPostTonemap(float3 color, float2 uv) {
     color = renodx::color::srgb::Encode(color);
   }
   return color;
+#endif
 }
 
 float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
@@ -479,7 +652,12 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
     color.rgb = DoFxaa(color.rgb, exposure, uv_interp);
   }
 
+  // Pre-tonemap glow: every mode but soft light from 4.6, only mix before.
+#if GODOT_VERSION >= 406
   if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode != GLOW_MODE_SOFTLIGHT) {
+#else
+  if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode == GLOW_MODE_MIX) {
+#endif
     float3 glow = SampleGlow(uv_interp);
     if (params.glow_mode == GLOW_MODE_MIX) {
       color.rgb = color.rgb * (1.0 - params.glow_intensity) + glow;
@@ -489,16 +667,21 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
   }
 
   const bool output_srgb = (params.flags & FLAG_CONVERT_TO_SRGB) != 0u;
+  const TonemapCurve vanilla_curve = VanillaCurve();
 
-  // An HDR 2D viewport (no sRGB conversion here) also stays vanilla: Godot's final blit converts it to sRGB and clamps
-  // it, so HDR written here would only be clipped.
-  if (RENODX_TONE_MAP_TYPE == 0.f || !output_srgb) {
-    float3 vanilla = ApplyPostTonemap(ApplyTonemapping(color.rgb), uv_interp);
+  // output_max_value > 1: Godot 4.7's own HDR output is on, and the addon leaves that swap chain alone.
+  if (RENODX_TONE_MAP_TYPE == 0.f || GODOT_OUTPUT_MAX_VALUE > 1.f) {
+    float3 vanilla = ApplyPostTonemap(ApplyTonemapping(color.rgb, vanilla_curve), uv_interp);
+    // screen_space_dither(gl_FragCoord.xy, 255.0 or 1023.0)
+    float3 dither = frac(dot(float2(171.0, 231.0), frag_coord.xy) / float3(103.0, 71.0, 97.0)) - 0.5;
     if ((params.flags & FLAG_USE_8_BIT_DEBANDING) != 0u) {
-      // screen_space_dither(gl_FragCoord.xy, 255.0)
-      float3 dither = frac(dot(float2(171.0, 231.0), frag_coord.xy) / float3(103.0, 71.0, 97.0));
-      vanilla += (dither - 0.5) / 255.0;
+      vanilla += dither / 255.0;
     }
+#if GODOT_VERSION == 405
+    else if ((params.flags & FLAG_USE_10_BIT_DEBANDING) != 0u) {
+      vanilla += dither / 1023.0;
+    }
+#endif
     // The SDR viewport target was RGBA8 UNORM before the upgrade; the HDR 2D one was already float.
     color.rgb = output_srgb ? saturate(vanilla) : vanilla;
     return color;
@@ -506,19 +689,71 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
 
   float3 untonemapped = color.rgb;
 
-  // Linear, and Reinhard with white 1 (identity), only clip at the UNORM write: the operator output is no SDR
-  // reference there, so the vanilla chain runs on RenoDRT's neutral SDR instead (graded == neutral without
+  // Linear, and Reinhard with white == output_max_value (identity), only clip at the UNORM write: the operator output
+  // is no SDR reference there, so the vanilla chain runs on RenoDRT's neutral SDR instead (graded == neutral without
   // adjustments, i.e. a plain RenoDRT tone map of the scene).
   const bool is_hard_clip = params.tonemapper == TONEMAPPER_LINEAR
-                            || (params.tonemapper == TONEMAPPER_REINHARD && params.tonemapper_params.x == 1.f);
-  float3 sdr_reference = is_hard_clip ? renodx::tonemap::renodrt::NeutralSDR(untonemapped) : ApplyTonemapping(untonemapped);
-  float3 graded_sdr = renodx::color::srgb::Decode(saturate(ApplyPostTonemap(sdr_reference, uv_interp)));
+                            || (params.tonemapper == TONEMAPPER_REINHARD
+                                && vanilla_curve.reinhard_white_squared == vanilla_curve.output_max_value);
+  float3 sdr_reference = is_hard_clip ? renodx::tonemap::renodrt::NeutralSDR(untonemapped)
+                                      : ApplyTonemapping(untonemapped, vanilla_curve);
+  float3 graded_sdr = saturate(ApplyPostTonemap(sdr_reference, uv_interp));
+  if (output_srgb) {
+    graded_sdr = renodx::color::srgb::Decode(graded_sdr);
+  }
 
-  // The operator (Filmic/ACES/AgX/Reinhard) is part of the vanilla look, so it stays in graded_sdr and RenoDRT's
-  // neutral SDR is the reference: midtones keep Godot's curve, highlights extend past it. Godot's 8-bit debanding
-  // dither is left out: the target is float now.
-  float3 tonemapped = renodx::draw::ToneMapPass(untonemapped, graded_sdr);
-  // The target keeps Godot's sRGB-shaped encoding so the 2D/UI canvas blends over it as in vanilla.
-  color.rgb = renodx::draw::RenderIntermediatePass(tonemapped);
+  // Godot HDR uses Godot 4.7's own HDR curve where Godot has one (Reinhard with white above 1, AgX; 4.6+), and
+  // RenoDRT otherwise (Linear, Filmic, ACES, Reinhard white 1, everything before 4.6).
+  bool use_godot_hdr_curve = false;
+#if GODOT_VERSION >= 406
+  use_godot_hdr_curve = RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_GODOT_HDR && !is_hard_clip
+                        && (params.tonemapper == TONEMAPPER_REINHARD || params.tonemapper == TONEMAPPER_AGX);
+#endif
+
+  float3 tonemapped;
+  if (use_godot_hdr_curve) {
+#if GODOT_VERSION >= 406
+    // output_max_value = Peak / Game Brightness, pre-compensated for gamma correction like RenoDRT's peak and at
+    // least 1 like Godot's (tone_mapper.cpp); the curve parameters are recomputed the way Godot's CPU does
+    // (environment_storage.cpp), and the vanilla grade is carried over from the SDR curve.
+    float peak_ratio = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+    if (RENODX_GAMMA_CORRECTION != 0.f) {
+      peak_ratio = renodx::color::correct::Gamma(peak_ratio, true, RENODX_GAMMA_CORRECTION == 1.f ? 2.2f : 2.4f);
+    }
+    TonemapCurve hdr_curve;
+    hdr_curve.output_max_value = max(1.f, peak_ratio);
+    float reinhard_white = max(hdr_curve.output_max_value,
+                               sqrt(vanilla_curve.reinhard_white_squared * vanilla_curve.output_max_value));
+    hdr_curve.reinhard_white_squared = reinhard_white * reinhard_white / hdr_curve.output_max_value;
+    // AgX high clip from the pushed SDR curve (awp_w = (high_clip - 0.18)^2 / (output_max - 0.18) * slope), so it
+    // follows the curve in use whatever `white` Godot's CPU started from; scaled with output_max_value like 4.7.
+    float awp_slope = params.tonemapper_params.z;
+    float sdr_high_clip = 0.18f + sqrt(vanilla_curve.agx_awp_w * (vanilla_curve.output_max_value - 0.18f) / awp_slope);
+    float agx_high_clip = sdr_high_clip / vanilla_curve.output_max_value * hdr_curve.output_max_value;
+    hdr_curve.agx_awp_w = (agx_high_clip - 0.18f) * (agx_high_clip - 0.18f) / (hdr_curve.output_max_value - 0.18f) * awp_slope;
+    tonemapped = renodx::tonemap::UpgradeToneMap(
+        ApplyTonemapping(untonemapped, hdr_curve),
+        sdr_reference,
+        graded_sdr,
+        RENODX_COLOR_GRADE_STRENGTH);
+#endif
+  } else {
+    // The operator (Filmic/ACES/AgX/Reinhard) is part of the vanilla look, so it stays in graded_sdr and RenoDRT's
+    // neutral SDR is the reference: midtones keep Godot's curve, highlights extend past it. Godot's 8-bit debanding
+    // dither is left out: the target is float now.
+    renodx::draw::Config config = renodx::draw::BuildConfig();
+    if (RENODX_TONE_MAP_TYPE == TONE_MAP_TYPE_GODOT_HDR) {
+      config.tone_map_type = renodx::tonemap::config::type::RENODRT;
+    }
+    tonemapped = renodx::draw::ToneMapPass(untonemapped, graded_sdr, config);
+  }
+
+  // The target keeps Godot's encoding so the 2D/UI canvas blends over it as in vanilla: sRGB-shaped on an SDR
+  // viewport, linear on an HDR 2D one (the replaced final blit then encodes it without Godot's clamp).
+  tonemapped = renodx::draw::RenderIntermediatePass(tonemapped);
+  if (!output_srgb) {
+    tonemapped = renodx::color::srgb::DecodeSafe(tonemapped);
+  }
+  color.rgb = tonemapped;
   return color;
 }
