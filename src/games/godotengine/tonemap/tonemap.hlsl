@@ -118,7 +118,12 @@ TonemapCurve VanillaCurve() {
 
 // Godot 4.7's HDR form; at output_max_value 1 it equals 4.6's (w^2 c + c^2) / (w^2 c + w^2).
 float3 TonemapReinhard(float3 color, TonemapCurve curve) {
+#if GODOT_VERSION < 404
+  // Godot 4.3's own form (2c / (1 + c) at white 1, so never an identity).
+  return (params.white * color + color) / (color * params.white + params.white);
+#else
   return color * (1.0f + color / curve.reinhard_white_squared) / (1.0f + color / curve.output_max_value);
+#endif
 }
 
 float3 TonemapFilmic(float3 color) {
@@ -691,9 +696,10 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
 
   // Linear, and Reinhard with white == output_max_value (identity), only clip at the UNORM write: the operator output
   // is no SDR reference there, so the vanilla chain runs on RenoDRT's neutral SDR instead (graded == neutral without
-  // adjustments, i.e. a plain RenoDRT tone map of the scene).
+  // adjustments, i.e. a plain RenoDRT tone map of the scene). Godot 4.3's Reinhard is a real curve below white (2c/(1+c)
+  // at white 1), so like Filmic/ACES it stays the reference even though it also reaches 1 at white.
   const bool is_hard_clip = params.tonemapper == TONEMAPPER_LINEAR
-                            || (params.tonemapper == TONEMAPPER_REINHARD
+                            || (GODOT_VERSION >= 404 && params.tonemapper == TONEMAPPER_REINHARD
                                 && vanilla_curve.reinhard_white_squared == vanilla_curve.output_max_value);
   float3 sdr_reference = is_hard_clip ? renodx::tonemap::renodrt::NeutralSDR(untonemapped)
                                       : ApplyTonemapping(untonemapped, vanilla_curve);

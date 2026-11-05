@@ -1,6 +1,6 @@
 # RenoDX for Godot Engine
 
-Work in progress: an engine-wide addon for Godot games. On Godot 4.6 and 4.7 Forward+ with D3D12 it replaces
+Work in progress: an engine-wide addon for Godot games. On Godot 4.3 to 4.7 Forward+ with D3D12 it replaces
 Godot's tone mapper and final blit, keeps a float viewport and outputs HDR10.
 
 ## Scope
@@ -8,7 +8,7 @@ Godot's tone mapper and final blit, keeps a float viewport and outputs HDR10.
 | Godot renderer / API | Status |
 |---|---|
 | Godot 4.6, 4.7 Forward+ on D3D12 | tone mapper and final blit replaced, float viewport target, HDR10 output |
-| Godot 4.3-4.5 Forward+ on D3D12 | shader port written (`GODOT_VERSION` 403-405), hashes not captured yet: float viewport and HDR10 only |
+| Godot 4.3, 4.4, 4.5 Forward+ on D3D12 | same, but only with the `override.cfg` workaround below (otherwise ReShade does not hook the device) |
 | Godot 4.7 with its own HDR output on (`Window.hdr_output_requested`) | left to Godot (swap chain and tone mapper) |
 | Godot 4 Forward+ on Vulkan | not handled yet: the addon leaves these games untouched |
 | Godot 4 Mobile | not tested |
@@ -30,18 +30,19 @@ Godot's tone mapper and final blit, keeps a float viewport and outputs HDR10.
 - Tone mapper: `tonemap.glsl` (TonemapShaderRD) has four desktop Forward+ variants per Godot version, all replaced
   by hash (`tonemap/`). 4.6: `0x0656E0CE` (3D LUT, bilinear glow), `0xBF1B5017` (bicubic glow), `0x667C84AD` (1D LUT),
   `0x6291BC2F` (1D LUT, bicubic glow). 4.7: `0xB21EACEC`, `0x3F415A05`, `0x32F7250B`, `0xEF76A934` in the same
-  order. The Devkit could not decompile the DXIL, so `tonemap/tonemap.hlsl` is a port of Godot's MIT GLSL source
+  order. 4.3: `0x914EEDB6`, `0x51BDE35D`, `0xC200205E`, `0xA71CD15D`; 4.4: `0xA0DD4706`, `0x4A3080B2`,
+  `0x9E1957A5`, `0xFDC2A39E`; 4.5: `0x2D4AED1E`, `0xD44A3465`, `0x19657F6D`, `0xF01F42A0`. The Devkit could not decompile the DXIL, so `tonemap/tonemap.hlsl` is a port of Godot's MIT GLSL source
   (4.3 to 4.7) with the original register layout; each per-hash file only sets `GODOT_VERSION` and Godot's two variant
   defines. Tone mapper, glow mode and adjustments are push-constant branches inside each variant. Before 4.6 the
   operator output is clamped by the sRGB encode and glow (except mix) is blended after it; the port follows that.
-- Final blit (`blit/`, 4.6 `0x83ADBE18`, 4.7 `0x13955D03`): for HDR 2D viewports Godot encodes linear to sRGB here
-  and clamps (4.6) or relies on the 8-bit swap chain to clamp (4.7). Outside Vanilla the replacement drops the clamp
+- Final blit (`blit/`, 4.3 `0x22687DAC`, 4.4 `0xA252A18D`, 4.5 `0x2845C867`, 4.6 `0x83ADBE18`, 4.7 `0x13955D03`): for HDR 2D viewports Godot encodes linear to sRGB here
+  and clamps (4.3/4.4 before the encode, 4.5/4.6 after the dither) or relies on the 8-bit swap chain to clamp (4.7). Outside Vanilla the replacement drops the clamp
   and the 8-bit dither, so HDR 2D viewports get HDR too.
 - Signals: `untonemapped` = scene after exposure, auto exposure, FXAA and pre-tonemap glow. `graded_sdr` = Godot's
   operator (Reinhard, Filmic, ACES, AgX) and everything after it (soft-light glow, brightness/contrast/saturation in
   sRGB, 1D/3D colour correction LUT), clamped like the 8-bit target and decoded to linear. The bridge is
   `ToneMapPass(untonemapped, graded_sdr)` with RenoDRT's neutral SDR, so midtones keep Godot's curve and highlights
-  extend. Linear and Reinhard with white 1 only clip at the 8-bit write: there the vanilla chain runs on RenoDRT's
+  extend. Linear and Reinhard with white 1 (4.4+) only clip at the 8-bit write: there the vanilla chain runs on RenoDRT's
   neutral SDR instead of the clipped value. RenoDRT uses Neutwo for both the HDR curve and its neutral SDR.
 - Tone mappers: Vanilla, None, ACES, RenoDRT (default) and Godot HDR. Godot HDR is Godot 4.7's own HDR curve
   (Reinhard with white above 1 and AgX take `output_max_value` = Peak / Game Brightness, with the parameters Godot's
@@ -96,6 +97,9 @@ Tested on Godot 4.6.1 (Road to Vostok demo) and on a Godot 4.6.3 test project, D
 8. HDR 2D viewport (`use_hdr_2d`) with RenoDRT: same output as the SDR viewport (peak 999 nits, UI 202.9 nits).
 9. Godot HDR tone mapper: AgX identical to Vanilla up to mid grey; Reinhard white 6 lifts mid grey by 18% (Godot's
    own HDR Reinhard does). Its grading sliders do nothing (they belong to RenoDRT).
+10. Godot 4.3, 4.4.1, 4.5.1 test exports (with the `override.cfg`): Vanilla vs Godot's shader within 0.62/255
+   outside the UI on 8-9 steps each (every operator incl. 4.3's own Reinhard, glow, 3D/1D LUT); RenoDRT peak 999
+   nits, UI 202.9 nits, no NaN.
 
 Known limitations:
 - 3D SubViewports stay SDR (8-bit targets, original tone mapper), except with SMAA or 3D scaling (FSR): their tone
@@ -103,7 +107,13 @@ Known limitations:
   channel (measured on the test project; the image differs from vanilla only in highlights).
 - HDR 2D viewports outside Vanilla: 2D content above 1 (bright canvas items, 2D glow) now reaches the display above
   UI Brightness instead of being clipped.
-- Godot 4.3-4.5: the port is written from Godot's source but untested; their shader hashes are not registered.
+- Godot 4.3-4.5 create their D3D12 device through the Agility SDK device factory (`ID3D12DeviceFactory::
+  CreateDevice`), which ReShade 6.8 does not hook: ReShade logs `Skipping swap chain because it was created without
+  a proxy Direct3D device.` and no add-on loads. Workaround: an `override.cfg` next to the game exe with
+  `[rendering]` / `rendering_device/d3d12/agility_sdk_version=99999` makes the factory fail, Godot falls back to
+  `D3D12CreateDevice` and ReShade hooks it (tested on the 4.3, 4.4.1 and 4.5.1 test exports). The 4.6.3 and 4.7.2 exports
+  reached `D3D12CreateDevice` without it on the test machine (4.6 no longer swaps in the system factory), but a 4.6+
+  game whose Agility factory succeeds would need the same `override.cfg`.
 - FSR1 sharpening now leaves small negative values (about -0.01) that the 8-bit target used to clip.
 - A D3D12 game is also left untouched when `vulkan-1.dll` is in the process for another reason: Godot's driver
   fallback from Vulkan to D3D12, or a tool that injects Vulkan into a D3D12 game. The Steam overlay did not (Road to

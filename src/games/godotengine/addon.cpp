@@ -53,10 +53,28 @@ bool IsFloatRenderTarget(reshade::api::command_list* cmd_list) {
 }
 
 renodx::mods::shader::CustomShaders custom_shaders = {
-    // Final viewport blit (blit.glsl), D3D12: 4.6, 4.7.
-    CustomShaderEntryCallback(0x83ADBE18, &IsActive),
-    CustomShaderEntryCallback(0x13955D03, &IsActive),
+    // Final viewport blit (blit.glsl), D3D12: 4.3, 4.4, 4.5, 4.6, 4.7.
+    CustomShaderEntryCallback(0x22687DAC, &IsActive),  // 4.3
+    CustomShaderEntryCallback(0xA252A18D, &IsActive),  // 4.4
+    CustomShaderEntryCallback(0x2845C867, &IsActive),  // 4.5
+    CustomShaderEntryCallback(0x83ADBE18, &IsActive),  // 4.6
+    CustomShaderEntryCallback(0x13955D03, &IsActive),  // 4.7
     // Forward+ tonemap (tonemap.glsl), D3D12: 3D/1D colour-correction LUT x bilinear/bicubic glow.
+    // 4.3
+    CustomShaderEntryCallback(0x914EEDB6, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x51BDE35D, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xC200205E, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xA71CD15D, &IsFloatRenderTarget),
+    // 4.4
+    CustomShaderEntryCallback(0xA0DD4706, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x4A3080B2, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x9E1957A5, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xFDC2A39E, &IsFloatRenderTarget),
+    // 4.5
+    CustomShaderEntryCallback(0x2D4AED1E, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xD44A3465, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x19657F6D, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xF01F42A0, &IsFloatRenderTarget),
     // 4.6
     CustomShaderEntryCallback(0x0656E0CE, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0xBF1B5017, &IsFloatRenderTarget),
