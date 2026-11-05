@@ -26,19 +26,22 @@
 
 namespace {
 
-// Set once the addon leaves the game to itself (Vulkan, or Godot's own HDR swap chain): the swap chain then stays as
-// Godot made it, so the shader replacements must not write HDR either. Read from draw-time callbacks.
+// Set once the addon leaves the game to Godot's own HDR swap chain: the swap chain then stays as Godot made it, so the
+// shader replacements must not write HDR either. Read from draw-time callbacks.
 std::atomic_bool standing_down = false;
+// Set once D3D12 devices are left alone because Godot renders with Vulkan (OnInitDevice); Vulkan stays converted.
+std::atomic_bool d3d12_left_alone = false;
 
-bool IsActive(reshade::api::command_list* /*cmd_list*/) {
-  return !standing_down;
+bool IsActive(reshade::api::command_list* cmd_list) {
+  if (standing_down) return false;
+  return !d3d12_left_alone || cmd_list->get_device()->get_api() != reshade::api::device_api::d3d12;
 }
 
 // Godot also tone maps SubViewports, whose narrower 8-bit targets are not cloned: an HDR result there would be
 // clipped per channel by the UNORM write, so those draws keep the original shader. Float targets are the viewport
 // clone, Godot's own RGBA16F tonemap destination (before FSR/SMAA) and HDR 2D viewports.
 bool IsFloatRenderTarget(reshade::api::command_list* cmd_list) {
-  if (standing_down) return false;
+  if (!IsActive(cmd_list)) return false;
   auto* cmd_list_data = renodx::utils::data::Get<renodx::utils::swapchain::CommandListData>(cmd_list);
   if (cmd_list_data == nullptr || cmd_list_data->current_render_targets.empty()) return false;
   if (cmd_list_data->current_render_targets[0].handle == 0u) return false;
@@ -59,6 +62,11 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x2845C867, &IsActive),  // 4.5
     CustomShaderEntryCallback(0x83ADBE18, &IsActive),  // 4.6
     CustomShaderEntryCallback(0x13955D03, &IsActive),  // 4.7
+    // Final viewport blit, Vulkan: 4.3, 4.4, 4.5 and 4.6, 4.7.
+    CustomShaderEntryCallback(0x7109F4EE, &IsActive),
+    CustomShaderEntryCallback(0xE52452DA, &IsActive),
+    CustomShaderEntryCallback(0x416C3F79, &IsActive),
+    CustomShaderEntryCallback(0x15F02F27, &IsActive),
     // Forward+ tonemap (tonemap.glsl), D3D12: 3D/1D colour-correction LUT x bilinear/bicubic glow.
     // 4.3
     CustomShaderEntryCallback(0x914EEDB6, &IsFloatRenderTarget),
@@ -85,6 +93,32 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x3F415A05, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0x32F7250B, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0xEF76A934, &IsFloatRenderTarget),
+    // Forward+ tonemap, Vulkan, same variant order.
+    // 4.3
+    CustomShaderEntryCallback(0x0941A535, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x4E7421AB, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xE5B09824, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xCCD1E425, &IsFloatRenderTarget),
+    // 4.4
+    CustomShaderEntryCallback(0xFA110435, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x679069A8, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x219BD7CC, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x12C854BA, &IsFloatRenderTarget),
+    // 4.5
+    CustomShaderEntryCallback(0xE1AC35ED, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x277EEA0D, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x8EA1E429, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x5B6C8FD0, &IsFloatRenderTarget),
+    // 4.6
+    CustomShaderEntryCallback(0x8D6FF34D, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x80315116, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xB4D324B8, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xCC2CAB8B, &IsFloatRenderTarget),
+    // 4.7
+    CustomShaderEntryCallback(0x548A4E8B, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x88473F26, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x67FE91D5, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xE6ABA95D, &IsFloatRenderTarget),
 };
 
 ShaderInjectData shader_injection;
@@ -433,11 +467,13 @@ void OnPresetOff() {
 // NVIDIA can present a Vulkan game through a DXGI swap chain. ReShade then sees only the driver's D3D12 device, which
 // copies Godot's finished RGBA8 image into the swap chain: modifying that swap chain gives a black screen, and Godot's
 // own shaders are not visible there. Godot loads vulkan-1.dll when it renders with (or tried) Vulkan, so leave every
-// device alone once it is loaded; a D3D12 fallback after a failed Vulkan start is skipped too, which is safe.
+// D3D12 device alone once it is loaded, swap chain and shader replacements (the Vulkan device itself, seen through ReShade's Vulkan
+// layer, is converted); a D3D12 fallback after a failed Vulkan start is skipped too, which is safe.
 // Registered before mods::swapchain::Use so it runs before its OnInitDevice.
 void OnInitDevice(reshade::api::device* device) {
+  if (device->get_api() != reshade::api::device_api::d3d12) return;
   if (GetModuleHandleW(L"vulkan-1.dll") == nullptr) return;
-  standing_down = true;
+  d3d12_left_alone = true;
   renodx::mods::swapchain::ignored_device_apis.insert(device->get_api());
   reshade::log::message(reshade::log::level::info, "Godot renders with Vulkan (vulkan-1.dll is loaded): device left untouched.");
 }
@@ -447,11 +483,13 @@ void OnInitDevice(reshade::api::device* device) {
 // it aborts a swap chain, so a later 8-bit swap chain could not be converted correctly; a restart is needed after
 // turning Godot's HDR off. Registered before mods::swapchain::Use so it runs before its handler.
 bool OnCreateSwapchain(reshade::api::device_api device_api, reshade::api::swapchain_desc& desc, void* hwnd) {
-  if (device_api != reshade::api::device_api::d3d12) return false;
+  // Also skips the APIs the addon does not convert (d3d9/10/11, OpenGL) and D3D12 left alone for Vulkan.
+  if (renodx::mods::swapchain::ignored_device_apis.contains(device_api)) return false;
+  // Godot asks for RGBA16F only when its own HDR output is on, on D3D12 and Vulkan alike (SDR is 8-bit).
   if (desc.back_buffer.texture.format != reshade::api::format::r16g16b16a16_float) return false;
   standing_down = true;
   renodx::mods::swapchain::ignored_device_apis.insert(device_api);
-  reshade::log::message(reshade::log::level::info, "Godot native HDR swap chain (r16g16b16a16_float): left to Godot.");
+  reshade::log::message(reshade::log::level::info, "Godot native HDR swap chain: left to Godot.");
   return false;
 }
 
@@ -477,20 +515,23 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         // Godot's tonemap root signature already holds 28 root constants and 8 descriptor tables (36 of 64 DWORDs),
         // too few for the injected constants; a root CBV costs 2.
         renodx::mods::shader::use_root_signature_cbv = true;
+        // Vulkan: Godot's push-constant ranges are fragment-only (tonemap) or vertex + fragment (blit). Extend those
+        // ranges for the injected data; the default (pixel + compute) would add a separate range the fragment shader
+        // cannot see.
+        renodx::mods::shader::minimum_constant_buffer_stages = reshade::api::shader_stage::pixel;
 
         renodx::mods::swapchain::expected_constant_buffer_index = 13;
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
         renodx::mods::swapchain::use_resource_cloning = true;
 
-        // Only Godot 4 Forward+ on D3D12 is proven so far. Without a proxy shader for the other APIs the swap chain
-        // would still switch to HDR10 and show SDR output as PQ, so leave those games untouched (no upgrades either:
-        // mods::swapchain stops at OnInitDevice for an ignored API).
+        // Only Godot 4 Forward+ on D3D12 and Vulkan is proven so far. Without a proxy shader for the other APIs the
+        // swap chain would still switch to HDR10 and show SDR output as PQ, so leave those games untouched (no
+        // upgrades either: mods::swapchain stops at OnInitDevice for an ignored API).
         renodx::mods::swapchain::ignored_device_apis = {
             reshade::api::device_api::d3d9,
             reshade::api::device_api::d3d10,
             reshade::api::device_api::d3d11,
             reshade::api::device_api::opengl,
-            reshade::api::device_api::vulkan,
         };
 
         // Godot 4 D3D12 creates the viewport target and the normal/roughness buffer with identical descs (RGBA8
@@ -510,6 +551,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                 {
                     .vertex_shader = __swap_chain_proxy_vertex_shader_dx12,
                     .pixel_shader = __swap_chain_proxy_pixel_shader_dx12,
+                },
+            },
+            {
+                reshade::api::device_api::vulkan,
+                {
+                    .vertex_shader = __swap_chain_proxy_vertex_shader,
+                    .pixel_shader = __swap_chain_proxy_pixel_shader,
                 },
             },
         };

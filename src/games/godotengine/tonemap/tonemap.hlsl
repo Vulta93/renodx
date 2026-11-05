@@ -10,15 +10,13 @@
 // Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.
 // SPDX-License-Identifier: MIT
 
-#include "../shared.h"
-
 #ifndef GODOT_VERSION
 #error "GODOT_VERSION must be defined by the per-hash file"
 #endif
 
-// std430 layout of the GLSL `Params` push-constant block (96 bytes before 4.6, 112 after). The float glow_levels[7]
-// array is split so that HLSL packing keeps every member at its std430 byte offset (an HLSL array would start each
-// element on a new 16-byte register).
+// The GLSL `Params` push-constant block (std430, 96 bytes before 4.6, 112 after). Scalars keep every member at its
+// std430 byte offset under both HLSL cbuffer packing (D3D12) and Slang's std430 push-constant layout (Vulkan): an
+// HLSL array would start each element on a new 16-byte register, a std430 float3 on a 16-byte boundary.
 struct Params {
   float3 bcs;
   uint flags;
@@ -32,8 +30,13 @@ struct Params {
   float glow_map_strength;
 
   uint glow_mode;
-  float3 glow_levels_0_2;
-  float4 glow_levels_3_6;
+  float glow_level_0;
+  float glow_level_1;
+  float glow_level_2;
+  float glow_level_3;
+  float glow_level_4;
+  float glow_level_5;
+  float glow_level_6;
 
   float exposure;
   float white;
@@ -45,6 +48,37 @@ struct Params {
 #endif
 };
 
+#ifdef __SLANG__
+// Vulkan: Godot's own block at offset 0 of the push-constant range, RenoDX's data right after it (shared.h).
+#define GODOT_PUSH_PARAMS Params
+#if GODOT_VERSION >= 406
+#define PUSH_CONSTANTS_OFFSET 112
+#else
+#define PUSH_CONSTANTS_OFFSET 96
+#endif
+#endif
+
+#include "../shared.h"
+
+#ifdef __SLANG__
+#define params push_data.godot_params
+
+// Godot's GLSL combined image samplers, at their (set, binding).
+[[vk::binding(0, 0)]] Sampler2D source_color;
+[[vk::binding(0, 1)]] Sampler2D source_auto_exposure;
+[[vk::binding(0, 2)]] Sampler2D source_glow;
+[[vk::binding(1, 2)]] Sampler2D glow_map;
+#ifdef USE_1D_LUT
+[[vk::binding(0, 3)]] Sampler2D source_color_correction;
+#else
+[[vk::binding(0, 3)]] Sampler3D source_color_correction;
+#endif
+
+#define GODOT_SAMPLE(texture, uv)                              texture.Sample(uv)
+#define GODOT_SAMPLE_LEVEL(texture, uv, lod)                   texture.SampleLevel(uv, lod)
+#define GODOT_SAMPLE_LEVEL_OFFSET(texture, uv, lod, offset)    texture.SampleLevel(uv, lod, offset)
+#define GODOT_LOAD(texture, coord)                             texture.Load(coord)
+#else
 ConstantBuffer<Params> params : register(b1700000000);
 
 Texture2D<float4> source_color : register(t0);
@@ -60,6 +94,12 @@ Texture2D<float4> source_color_correction : register(t300000000);
 Texture3D<float4> source_color_correction : register(t300000000);
 #endif
 SamplerState source_color_correction_sampler : register(s300000000);
+
+#define GODOT_SAMPLE(texture, uv)                              texture.Sample(texture##_sampler, uv)
+#define GODOT_SAMPLE_LEVEL(texture, uv, lod)                   texture.SampleLevel(texture##_sampler, uv, lod)
+#define GODOT_SAMPLE_LEVEL_OFFSET(texture, uv, lod, offset)    texture.SampleLevel(texture##_sampler, uv, lod, offset)
+#define GODOT_LOAD(texture, coord)                             texture.Load(coord)
+#endif
 
 #define FLAG_USE_BCS              (1u << 0)
 #define FLAG_USE_GLOW             (1u << 1)
@@ -305,20 +345,20 @@ float4 SampleGlowLevel(float2 uv, uint lod) {
   float2 p2 = (float2(iuv.x + h0x, iuv.y + h1y) - 0.5f) * pixel_size;
   float2 p3 = (float2(iuv.x + h1x, iuv.y + h1y) - 0.5f) * pixel_size;
 
-  return (G0(fuv.y) * (g0x * source_glow.SampleLevel(source_glow_sampler, p0, lod) + g1x * source_glow.SampleLevel(source_glow_sampler, p1, lod)))
-         + (G1(fuv.y) * (g0x * source_glow.SampleLevel(source_glow_sampler, p2, lod) + g1x * source_glow.SampleLevel(source_glow_sampler, p3, lod)));
+  return (G0(fuv.y) * (g0x * GODOT_SAMPLE_LEVEL(source_glow, p0, lod) + g1x * GODOT_SAMPLE_LEVEL(source_glow, p1, lod)))
+         + (G1(fuv.y) * (g0x * GODOT_SAMPLE_LEVEL(source_glow, p2, lod) + g1x * GODOT_SAMPLE_LEVEL(source_glow, p3, lod)));
 }
 #else
 float4 SampleGlowLevel(float2 uv, uint lod) {
-  return source_glow.SampleLevel(source_glow_sampler, uv, lod);
+  return GODOT_SAMPLE_LEVEL(source_glow, uv, lod);
 }
 #endif
 
 // gather_glow() * glow_intensity, then the glow map.
 float3 SampleGlow(float2 uv) {
   float glow_levels[7] = {
-    params.glow_levels_0_2.x, params.glow_levels_0_2.y, params.glow_levels_0_2.z,
-    params.glow_levels_3_6.x, params.glow_levels_3_6.y, params.glow_levels_3_6.z, params.glow_levels_3_6.w,
+    params.glow_level_0, params.glow_level_1, params.glow_level_2, params.glow_level_3,
+    params.glow_level_4, params.glow_level_5, params.glow_level_6,
   };
   float3 glow = 0.0f;
   [unroll]
@@ -329,7 +369,7 @@ float3 SampleGlow(float2 uv) {
   }
   glow = glow * params.luminance_multiplier * params.glow_intensity;
   if (params.glow_map_strength > 0.001) {
-    glow = lerp(glow, glow_map.Sample(glow_map_sampler, uv).rgb * glow, params.glow_map_strength);
+    glow = lerp(glow, GODOT_SAMPLE(glow_map, uv).rgb * glow, params.glow_map_strength);
   }
   return glow;
 }
@@ -365,12 +405,12 @@ float3 ApplyGlow(float3 color, float3 glow, float white) {
 
 float3 ApplyColorCorrection(float3 color) {
 #ifdef USE_1D_LUT
-  color.r = source_color_correction.Sample(source_color_correction_sampler, float2(color.r, 0.0f)).r;
-  color.g = source_color_correction.Sample(source_color_correction_sampler, float2(color.g, 0.0f)).g;
-  color.b = source_color_correction.Sample(source_color_correction_sampler, float2(color.b, 0.0f)).b;
+  color.r = GODOT_SAMPLE(source_color_correction, float2(color.r, 0.0f)).r;
+  color.g = GODOT_SAMPLE(source_color_correction, float2(color.g, 0.0f)).g;
+  color.b = GODOT_SAMPLE(source_color_correction, float2(color.b, 0.0f)).b;
   return color;
 #else
-  return source_color_correction.SampleLevel(source_color_correction_sampler, color, 0.0).rgb;
+  return GODOT_SAMPLE_LEVEL(source_color_correction, color, 0.0).rgb;
 #endif
 }
 
@@ -382,10 +422,10 @@ float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
   const float FXAA_SPAN_MAX = 8.0;
   const float scale = exposure * params.luminance_multiplier;
 
-  float3 rgb_nw = source_color.SampleLevel(source_color_sampler, uv_interp + float2(-0.5, -0.5) * params.pixel_size, 0.0).rgb * scale;
-  float3 rgb_ne = source_color.SampleLevel(source_color_sampler, uv_interp + float2(0.5, -0.5) * params.pixel_size, 0.0).rgb * scale;
-  float3 rgb_sw = source_color.SampleLevel(source_color_sampler, uv_interp + float2(-0.5, 0.5) * params.pixel_size, 0.0).rgb * scale;
-  float3 rgb_se = source_color.SampleLevel(source_color_sampler, uv_interp + float2(0.5, 0.5) * params.pixel_size, 0.0).rgb * scale;
+  float3 rgb_nw = GODOT_SAMPLE_LEVEL(source_color, uv_interp + float2(-0.5, -0.5) * params.pixel_size, 0.0).rgb * scale;
+  float3 rgb_ne = GODOT_SAMPLE_LEVEL(source_color, uv_interp + float2(0.5, -0.5) * params.pixel_size, 0.0).rgb * scale;
+  float3 rgb_sw = GODOT_SAMPLE_LEVEL(source_color, uv_interp + float2(-0.5, 0.5) * params.pixel_size, 0.0).rgb * scale;
+  float3 rgb_se = GODOT_SAMPLE_LEVEL(source_color, uv_interp + float2(0.5, 0.5) * params.pixel_size, 0.0).rgb * scale;
   const float3 luma = float3(0.299, 0.587, 0.114);
   float luma_nw = dot(rgb_nw, luma);
   float luma_ne = dot(rgb_ne, luma);
@@ -404,13 +444,13 @@ float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
   dir = min(FXAA_SPAN_MAX, max(-FXAA_SPAN_MAX, dir * rcp_dir_min)) * params.pixel_size;
 
   float3 rgb_a = 0.5 * exposure
-                 * (source_color.SampleLevel(source_color_sampler, uv_interp + dir * (1.0 / 3.0 - 0.5), 0.0).rgb
-                    + source_color.SampleLevel(source_color_sampler, uv_interp + dir * (2.0 / 3.0 - 0.5), 0.0).rgb)
+                 * (GODOT_SAMPLE_LEVEL(source_color, uv_interp + dir * (1.0 / 3.0 - 0.5), 0.0).rgb
+                    + GODOT_SAMPLE_LEVEL(source_color, uv_interp + dir * (2.0 / 3.0 - 0.5), 0.0).rgb)
                  * params.luminance_multiplier;
   float3 rgb_b = rgb_a * 0.5
                  + 0.25 * exposure
-                       * (source_color.SampleLevel(source_color_sampler, uv_interp + dir * -0.5, 0.0).rgb
-                          + source_color.SampleLevel(source_color_sampler, uv_interp + dir * 0.5, 0.0).rgb)
+                       * (GODOT_SAMPLE_LEVEL(source_color, uv_interp + dir * -0.5, 0.0).rgb
+                          + GODOT_SAMPLE_LEVEL(source_color, uv_interp + dir * 0.5, 0.0).rgb)
                        * params.luminance_multiplier;
 
   float luma_b = dot(rgb_b, luma);
@@ -430,12 +470,11 @@ float Rgb2Luma(float3 rgb) {
 }
 
 float FxaaLuma(float2 uv, float exposure) {
-  return Rgb2Luma(source_color.SampleLevel(source_color_sampler, uv, 0.0).rgb * exposure * params.luminance_multiplier);
+  return Rgb2Luma(GODOT_SAMPLE_LEVEL(source_color, uv, 0.0).rgb * exposure * params.luminance_multiplier);
 }
 
-float FxaaLumaOffset(float2 uv, float exposure, int2 offset) {
-  return Rgb2Luma(source_color.SampleLevel(source_color_sampler, uv, 0.0, offset).rgb * exposure * params.luminance_multiplier);
-}
+// A macro, not a function: texel offsets must be compile-time constants (Slang/SPIR-V).
+#define FXAA_LUMA_OFFSET(uv, exposure, offset)   Rgb2Luma(GODOT_SAMPLE_LEVEL_OFFSET(source_color, uv, 0.0, offset).rgb * (exposure) * params.luminance_multiplier)
 
 float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
   const float EDGE_THRESHOLD_MIN = 0.0312;
@@ -443,10 +482,10 @@ float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
   const int ITERATIONS = 12;
   const float SUBPIXEL_QUALITY = 0.75;
 
-  float luma_up = FxaaLumaOffset(uv_interp, exposure, int2(0, 1));
-  float luma_down = FxaaLumaOffset(uv_interp, exposure, int2(0, -1));
-  float luma_left = FxaaLumaOffset(uv_interp, exposure, int2(-1, 0));
-  float luma_right = FxaaLumaOffset(uv_interp, exposure, int2(1, 0));
+  float luma_up = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(0, 1));
+  float luma_down = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(0, -1));
+  float luma_left = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(-1, 0));
+  float luma_right = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(1, 0));
 
   float luma_center = Rgb2Luma(color);
 
@@ -459,10 +498,10 @@ float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
     return color;
   }
 
-  float luma_down_left = FxaaLumaOffset(uv_interp, exposure, int2(-1, -1));
-  float luma_up_right = FxaaLumaOffset(uv_interp, exposure, int2(1, 1));
-  float luma_up_left = FxaaLumaOffset(uv_interp, exposure, int2(-1, 1));
-  float luma_down_right = FxaaLumaOffset(uv_interp, exposure, int2(1, -1));
+  float luma_down_left = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(-1, -1));
+  float luma_up_right = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(1, 1));
+  float luma_up_left = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(-1, 1));
+  float luma_down_right = FXAA_LUMA_OFFSET(uv_interp, exposure, int2(1, -1));
 
   float luma_down_up = luma_down + luma_up;
   float luma_left_right = luma_left + luma_right;
@@ -583,7 +622,7 @@ float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
     final_uv.x += final_offset * step_length;
   }
 
-  return source_color.SampleLevel(source_color_sampler, final_uv, 0.0).rgb * exposure * params.luminance_multiplier;
+  return GODOT_SAMPLE_LEVEL(source_color, final_uv, 0.0).rgb * exposure * params.luminance_multiplier;
 }
 #endif
 
@@ -644,12 +683,12 @@ float3 ApplyPostTonemap(float3 color, float2 uv) {
 }
 
 float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
-  float4 color = source_color.SampleLevel(source_color_sampler, uv_interp, 0.0f);
+  float4 color = GODOT_SAMPLE_LEVEL(source_color, uv_interp, 0.0f);
   color.rgb *= params.luminance_multiplier;
 
   float exposure = params.exposure;
   if ((params.flags & FLAG_USE_AUTO_EXPOSURE) != 0u) {
-    exposure *= 1.0 / (source_auto_exposure.Load(int3(0, 0, 0)).r * params.luminance_multiplier / params.auto_exposure_scale);
+    exposure *= 1.0 / (GODOT_LOAD(source_auto_exposure, int3(0, 0, 0)).r * params.luminance_multiplier / params.auto_exposure_scale);
   }
   color.rgb *= exposure;
 

@@ -6,8 +6,6 @@
 // 8-bit swap chain, which RenoDX makes float. The Vanilla tone mapper keeps that clamp (emulated on 4.7); the other
 // tone mappers drop the clamp and the 8-bit dither, so the tone mapper's HDR (written linear on those viewports)
 // reaches the swap chain proxy in the same sRGB-shaped encoding as on an SDR viewport.
-#include "../shared.h"
-
 #ifndef GODOT_VERSION
 #error "GODOT_VERSION must be defined by the per-hash file"
 #endif
@@ -48,15 +46,36 @@ struct Pos {
 #endif
 };
 
+#ifdef __SLANG__
+// Vulkan: Godot's own block at offset 0 of the push-constant range, RenoDX's data right after it (shared.h).
+#define GODOT_PUSH_PARAMS Pos
+#if GODOT_VERSION >= 407
+#define PUSH_CONSTANTS_OFFSET 96
+#elif GODOT_VERSION >= 404
+#define PUSH_CONSTANTS_OFFSET 80
+#else
+#define PUSH_CONSTANTS_OFFSET 64
+#endif
+#endif
+
+#include "../shared.h"
+
+#ifdef __SLANG__
+#define data push_data.godot_params
+[[vk::binding(0, 0)]] Sampler2D src_rt;
+#define GODOT_SAMPLE_SRC(uv) src_rt.Sample(uv)
+#else
 ConstantBuffer<Pos> data : register(b1700000000);
 
 Texture2D<float4> src_rt : register(t0);
 SamplerState src_rt_sampler : register(s0);
+#define GODOT_SAMPLE_SRC(uv) src_rt.Sample(src_rt_sampler, uv)
+#endif
 
 #define COLOR_SPACE_REC709_LINEAR 0u
 
 float4 GodotBlit(float2 uv, float4 frag_coord) {
-  float4 color = src_rt.Sample(src_rt_sampler, uv);
+  float4 color = GODOT_SAMPLE_SRC(uv);
 
 #if GODOT_VERSION >= 407
   if (data.target_color_space == COLOR_SPACE_REC709_LINEAR) {

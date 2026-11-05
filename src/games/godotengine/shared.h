@@ -74,6 +74,26 @@ struct ShaderInjectData {
 };
 
 #ifndef __cplusplus
+#ifdef __SLANG__
+// Vulkan: RenoDX extends the pipeline layout's push-constant range; a replacement shader defines the byte offset
+// after the game's own push constants before including this file (the proxy pass has its own layout: 0).
+#ifndef PUSH_CONSTANTS_OFFSET
+#ifdef GODOT_PUSH_PARAMS
+#error "Define PUSH_CONSTANTS_OFFSET (the size of GODOT_PUSH_PARAMS) before including shared.h"
+#endif
+#define PUSH_CONSTANTS_OFFSET 0
+#endif
+struct PushData {
+#ifdef GODOT_PUSH_PARAMS
+  GODOT_PUSH_PARAMS godot_params;  // the game's own block, at offset 0
+#endif
+  [[vk::offset(PUSH_CONSTANTS_OFFSET)]]
+  ShaderInjectData shader_injection;
+};
+[[vk::push_constant]]
+PushData push_data;
+#define shader_injection push_data.shader_injection
+#else
 #if ((__SHADER_TARGET_MAJOR == 5 && __SHADER_TARGET_MINOR >= 1) || __SHADER_TARGET_MAJOR >= 6)
 cbuffer shader_injection : register(b13, space50) {
 #elif (__SHADER_TARGET_MAJOR < 5) || ((__SHADER_TARGET_MAJOR == 5) && (__SHADER_TARGET_MINOR < 1))
@@ -81,6 +101,7 @@ cbuffer shader_injection : register(b13) {
 #endif
   ShaderInjectData shader_injection : packoffset(c0);
 }
+#endif
 
 #define RENODX_TONE_MAP_TYPE                 shader_injection.tone_map_type
 #define RENODX_PEAK_WHITE_NITS               shader_injection.peak_white_nits
