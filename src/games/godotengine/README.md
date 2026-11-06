@@ -31,8 +31,9 @@ replaces Godot's tone mapper and final blit, keeps a float viewport and outputs 
   between Godot's render passes/pipelines and the clone views (also for the swap chain), and the swap chain proxy
   pass pushes constants with task/mesh stage bits; these come from shared RenoDX code. NVIDIA renders correctly,
   other vendors are untested.
-- Resource upgrade: every `r8g8b8a8_typeless` render target or UAV texture as wide OR as tall as the swap chain is
-  cloned to `r16g16b16a16_float`. In Godot 4 this is the viewport target (written by the tone mapper or by FSR/SMAA,
+- Resource upgrade: every `r8g8b8a8_typeless` render target or UAV texture as wide OR as tall as the swap chain (or
+  its window: after a resize Godot creates the new viewport before it resizes the swap chain) is cloned to
+  `r16g16b16a16_float`. In Godot 4 this is the viewport target (written by the tone mapper or by FSR/SMAA,
   then by the 2D/UI canvas, read by the final blit) and, at 100% 3D scale with SSAO/SSIL/SSR, the normal/roughness
   buffer, which Godot creates with an identical description. A viewport kept at its aspect ratio fills the window in
   one dimension only (letterboxed: full width, e.g. 1920x1080 in a 1920x1200 window; pillarboxed: full height, e.g.
@@ -130,6 +131,10 @@ Known limitations:
   window's width or height.
 - A SubViewport as wide or as tall as the window (split screen, a full-height side panel) is cloned too; the D3D12
   alpha/sRGB view caveat above may apply to it (untested).
+- The clone rules use `ResourceUpgradeInfo::BACK_BUFFER_OR_WINDOW` (a resized window's targets are created before the
+  swap chain resize). A RenoDX add-on built before that value existed reads it as "any size" and would clone every
+  RGBA8 target, SubViewports included, if it owned the shared resource-upgrade handlers: load only add-ons (Devkit
+  included) built from the same tree.
 - 3D SubViewports stay SDR (8-bit targets, original tone mapper), except with SMAA or 3D scaling (FSR): their tone
   mapper then writes Godot's float intermediate, gets the HDR result, and the 8-bit SubViewport target clips it per
   channel (measured on the test project; the image differs from vanilla only in highlights).
