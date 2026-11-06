@@ -31,11 +31,13 @@ replaces Godot's tone mapper and final blit, keeps a float viewport and outputs 
   between Godot's render passes/pipelines and the clone views (also for the swap chain), and the swap chain proxy
   pass pushes constants with task/mesh stage bits; these come from shared RenoDX code. NVIDIA renders correctly,
   other vendors are untested.
-- Resource upgrade: every `r8g8b8a8_typeless` render target or UAV texture as wide as the swap chain is cloned to
-  `r16g16b16a16_float`. In Godot 4 this is the viewport target (written by the tone mapper or by FSR/SMAA, then by the
-  2D/UI canvas, read by the final blit) and, at 100% 3D scale with SSAO/SSIL/SSR, the normal/roughness buffer, which
-  Godot creates with an identical description. The width (not the size or aspect ratio) is what is matched: some
-  windows are 2 px taller than the viewport, and narrower SubViewport targets must stay 8-bit because their views
+- Resource upgrade: every `r8g8b8a8_typeless` render target or UAV texture as wide OR as tall as the swap chain is
+  cloned to `r16g16b16a16_float`. In Godot 4 this is the viewport target (written by the tone mapper or by FSR/SMAA,
+  then by the 2D/UI canvas, read by the final blit) and, at 100% 3D scale with SSAO/SSIL/SSR, the normal/roughness
+  buffer, which Godot creates with an identical description. A viewport kept at its aspect ratio fills the window in
+  one dimension only (letterboxed: full width, e.g. 1920x1080 in a 1920x1200 window; pillarboxed: full height, e.g.
+  3779x2126 in a 3840x2126 window or 16:9 on an ultrawide), so either dimension is matched, not the exact size (some
+  windows are a few pixels larger: 3840x2160 in 3840x2162). SubViewport targets must stay 8-bit because their views
   force alpha to 1 or decode sRGB, which a D3D12 clone view does not keep.
 - Tone mapper: `tonemap.glsl` (TonemapShaderRD) has four desktop Forward+ variants per Godot version, all replaced
   by hash (`tonemap/`). 4.6: `0x0656E0CE` (3D LUT, bilinear glow), `0xBF1B5017` (bicubic glow), `0x667C84AD` (1D LUT),
@@ -123,6 +125,11 @@ Tested on Godot 4.6.1 (Road to Vostok demo, D3D12) and on test projects for Godo
    without ReShade's layer (`HDR output requested, but is not supported`).
 
 Known limitations:
+- Stretch mode `viewport` (a fixed base resolution scaled up by the final blit) and `scale_mode = integer` (margins
+  on both axes) keep the 8-bit viewport and Godot's tone mapper (SDR in HDR10) unless the viewport still equals the
+  window's width or height.
+- A SubViewport as wide or as tall as the window (split screen, a full-height side panel) is cloned too; the D3D12
+  alpha/sRGB view caveat above may apply to it (untested).
 - 3D SubViewports stay SDR (8-bit targets, original tone mapper), except with SMAA or 3D scaling (FSR): their tone
   mapper then writes Godot's float intermediate, gets the HDR result, and the 8-bit SubViewport target clips it per
   channel (measured on the test project; the image differs from vanilla only in highlights).
