@@ -60,6 +60,8 @@ struct __declspec(uuid("72c2182f-dbf5-42b6-a4d5-ee8de408402d")) DeviceData {
   // Fallbacks keyed by original application texture handle; values are old-format conversion images.
   cross_addon::parallel_node_hash_map<uint64_t, reshade::api::resource, std::shared_mutex>
       texture_transfer_bridges;
+  // Window of the swap chain that set back_buffer_desc (last one wins, as for back_buffer_desc).
+  std::atomic<HWND> back_buffer_window = nullptr;
 };
 
 struct __declspec(uuid("0a2b51ad-ef13-4010-81a4-37a4a0f857a6")) CommandListData {
@@ -980,6 +982,7 @@ static void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   const std::unique_lock lock(data->mutex);
   data->resource_upgrade_finished.store(true, std::memory_order_release);
   data->back_buffer_desc = device->get_resource_desc(swapchain->get_current_back_buffer());
+  data->back_buffer_window.store(static_cast<HWND>(swapchain->get_hwnd()), std::memory_order_release);
 #ifdef DEBUG_LEVEL_0
   reshade::log::message(reshade::log::level::debug, "utils::resource::upgrade::OnInitSwapchain(reset resource upgrade)");
 #endif
@@ -1019,7 +1022,8 @@ inline CloneUpgradeTargetMatch FindCloneUpgradeTarget(
     if (
         (target->use_resource_view_cloning
          || target->use_resource_view_cloning_and_upgrade)
-        && target->CheckResourceDesc(desc, data->back_buffer_desc, initial_state)) {
+        && target->CheckResourceDesc(
+            desc, data->back_buffer_desc, initial_state, data->back_buffer_window.load(std::memory_order_acquire))) {
       const uint32_t counted = upgrade_counts[i].fetch_add(1u, std::memory_order_acq_rel) + 1u;
 #ifdef DEBUG_LEVEL_1
       std::stringstream s;
@@ -1118,7 +1122,8 @@ static bool OnCreateResource(
     if (
         !target->use_resource_view_cloning
         && !target->use_resource_view_cloning_and_upgrade
-        && target->CheckResourceDesc(desc, device_back_buffer_desc, initial_state)) {
+        && target->CheckResourceDesc(
+            desc, device_back_buffer_desc, initial_state, private_data->back_buffer_window.load(std::memory_order_acquire))) {
       const uint32_t counted = upgrade_counts[i].fetch_add(1u, std::memory_order_acq_rel) + 1u;
 #ifdef DEBUG_LEVEL_0
       std::stringstream s;

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <windows.h>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -140,6 +142,11 @@ struct ResourceUpgradeInfo {
 
   static const int16_t BACK_BUFFER = -1;
   static const int16_t ANY = -2;
+  // Only for `dimensions` (the match; not new_dimensions/min_dimensions): the back buffer, or the client area of its
+  // window. Targets created after a window resize but before the swap chain resize have only the window's new size.
+  // A module built before this value existed reads it as ANY and upgrades every format match: rebuild every add-on
+  // that embeds this header.
+  static const int16_t BACK_BUFFER_OR_WINDOW = -3;
   float aspect_ratio = ANY;
   float aspect_ratio_tolerance = 0.0001f;
 
@@ -196,7 +203,8 @@ struct ResourceUpgradeInfo {
   [[nodiscard]] bool CheckResourceDesc(
       reshade::api::resource_desc desc,
       reshade::api::resource_desc back_buffer_desc,
-      reshade::api::resource_usage state = reshade::api::resource_usage::undefined) const {
+      reshade::api::resource_usage state = reshade::api::resource_usage::undefined,
+      HWND back_buffer_window = nullptr) const {
     if (desc.texture.format != this->old_format) return false;
     if (this->usage != reshade::api::resource_usage::undefined) {
       if (this->usage != desc.usage) return false;
@@ -226,17 +234,30 @@ struct ResourceUpgradeInfo {
         return true;
       };
 
+      // BACK_BUFFER_OR_WINDOW reads the window only when the back buffer does not match, so other rules cost nothing.
+      const auto matches_window = [&](uint32_t size, bool is_width) {
+        RECT client_rect = {};
+        if (back_buffer_window == nullptr || GetClientRect(back_buffer_window, &client_rect) == FALSE) return false;
+        return std::cmp_equal(size, is_width ? (client_rect.right - client_rect.left) : (client_rect.bottom - client_rect.top));
+      };
+
       if (this->aspect_ratio == ANY) {
-        if (dimensions.width == BACK_BUFFER) {
+        if (dimensions.width == BACK_BUFFER || dimensions.width == BACK_BUFFER_OR_WINDOW) {
           if (back_buffer_desc.type == reshade::api::resource_type::unknown) return false;
-          if (desc.texture.width != back_buffer_desc.texture.width) return false;
+          if (desc.texture.width != back_buffer_desc.texture.width
+              && (dimensions.width != BACK_BUFFER_OR_WINDOW || !matches_window(desc.texture.width, true))) {
+            return false;
+          }
         } else if (dimensions.width > 0) {
           if (desc.texture.width != dimensions.width) return false;
         }
 
-        if (dimensions.height == BACK_BUFFER) {
+        if (dimensions.height == BACK_BUFFER || dimensions.height == BACK_BUFFER_OR_WINDOW) {
           if (back_buffer_desc.type == reshade::api::resource_type::unknown) return false;
-          if (desc.texture.height != back_buffer_desc.texture.height) return false;
+          if (desc.texture.height != back_buffer_desc.texture.height
+              && (dimensions.height != BACK_BUFFER_OR_WINDOW || !matches_window(desc.texture.height, false))) {
+            return false;
+          }
         } else if (dimensions.height > 0) {
           if (desc.texture.height != dimensions.height) return false;
         }
