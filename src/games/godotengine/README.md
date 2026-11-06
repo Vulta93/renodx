@@ -135,6 +135,9 @@ Known limitations:
   swap chain resize). A RenoDX add-on built before that value existed reads it as "any size" and would clone every
   RGBA8 target, SubViewports included, if it owned the shared resource-upgrade handlers: load only add-ons (Devkit
   included) built from the same tree.
+- A DirectComposition swap chain has no window handle (Godot uses one when layered windows are allowed, e.g. per-pixel
+  transparency; Slay the Spire 2's MegaDot build has one), so the window-size match cannot apply: such a game still
+  loses the float viewport after a runtime resize (it keeps it at its startup size).
 - 3D SubViewports stay SDR (8-bit targets, original tone mapper), except with SMAA or 3D scaling (FSR): their tone
   mapper then writes Godot's float intermediate, gets the HDR result, and the 8-bit SubViewport target clips it per
   channel (measured on the test project; the image differs from vanilla only in highlights).
