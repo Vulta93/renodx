@@ -38,8 +38,10 @@ replaces Godot's tone mapper and final blit, keeps a float viewport and outputs 
   buffer, which Godot creates with an identical description. A viewport kept at its aspect ratio fills the window in
   one dimension only (letterboxed: full width, e.g. 1920x1080 in a 1920x1200 window; pillarboxed: full height, e.g.
   3779x2126 in a 3840x2126 window or 16:9 on an ultrawide), so either dimension is matched, not the exact size (some
-  windows are a few pixels larger: 3840x2160 in 3840x2162). SubViewport targets must stay 8-bit because their views
-  force alpha to 1 or decode sRGB, which a D3D12 clone view does not keep.
+  windows are a few pixels larger: 3840x2160 in 3840x2162; a size within 4 px of the swap chain or window size
+  matches, since a `viewport` stretch mode can round the viewport above the window, e.g. DOGWALK's 3841x2160 in a
+  3838x2158 swap chain). SubViewport targets must stay 8-bit because their views force alpha to 1 or decode sRGB,
+  which a D3D12 clone view does not keep.
 - Tone mapper: `tonemap.glsl` (TonemapShaderRD) has four desktop Forward+ variants per Godot version, all replaced
   by hash (`tonemap/`). 4.6: `0x0656E0CE` (3D LUT, bilinear glow), `0xBF1B5017` (bicubic glow), `0x667C84AD` (1D LUT),
   `0x6291BC2F` (1D LUT, bicubic glow). 4.7: `0xB21EACEC`, `0x3F415A05`, `0x32F7250B`, `0xEF76A934` in the same

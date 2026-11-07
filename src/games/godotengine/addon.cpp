@@ -544,8 +544,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         // Godot 4 creates the viewport target and the normal/roughness buffer with identical descs (RGBA8 typeless,
         // render target + UAV), so these rules clone both. A viewport kept at its aspect ratio fills the window in one
         // dimension only: letterboxed it is as wide as the swap chain (1920x1080 in 1920x1200), pillarboxed as tall
-        // (3779x2126 in 3840x2126), so either dimension matches; not the exact size, since windows can also be a few
-        // pixels larger (3840x2160 in 3840x2162). The window counts too: after a resize Godot creates the new viewport
+        // (3779x2126 in 3840x2126), so either dimension matches, within 4 px (a window can be a few pixels larger,
+        // 3840x2160 in 3840x2162; `viewport` stretch rounds above it, 3841x2160 in 3838x2158). The window counts too: after a resize Godot creates the new viewport
         // before it resizes the swap chain. SubViewport targets must stay RGBA8 (their views force alpha to 1 or
         // decode sRGB, which a D3D12 clone view loses); one as wide or as tall as the window is cloned anyway.
         for (const auto& dimensions : {
