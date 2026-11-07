@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <ranges>
 #include <shared_mutex>
@@ -143,10 +145,14 @@ struct ResourceUpgradeInfo {
   static const int16_t BACK_BUFFER = -1;
   static const int16_t ANY = -2;
   // Only for `dimensions` (the match; not new_dimensions/min_dimensions): the back buffer, or the client area of its
-  // window. Targets created after a window resize but before the swap chain resize have only the window's new size.
+  // window, each within BACK_BUFFER_OR_WINDOW_TOLERANCE_PIXELS. Targets created after a window resize but before the
+  // swap chain resize have only the window's new size.
   // A module built before this value existed reads it as ANY and upgrades every format match: rebuild every add-on
   // that embeds this header.
   static const int16_t BACK_BUFFER_OR_WINDOW = -3;
+  // Not a `dimensions` value: how far a BACK_BUFFER_OR_WINDOW size may be off, since engines round scaled
+  // viewports (Godot: 3841x2160 in a 3838x2158 swap chain, 3840x2160 in 3840x2162).
+  static const int16_t BACK_BUFFER_OR_WINDOW_TOLERANCE_PIXELS = 4;
   float aspect_ratio = ANY;
   float aspect_ratio_tolerance = 0.0001f;
 
@@ -234,18 +240,23 @@ struct ResourceUpgradeInfo {
         return true;
       };
 
-      // BACK_BUFFER_OR_WINDOW reads the window only when the back buffer does not match, so other rules cost nothing.
-      const auto matches_window = [&](uint32_t size, bool is_width) {
+      // BACK_BUFFER_OR_WINDOW reads the window only when the back buffer is not near, so other rules cost nothing.
+      const auto is_near = [](uint32_t size, int64_t target_size) {
+        return std::llabs(static_cast<int64_t>(size) - target_size) <= BACK_BUFFER_OR_WINDOW_TOLERANCE_PIXELS;
+      };
+      const auto matches_back_buffer_or_window = [&](uint32_t size, uint32_t back_buffer_size, bool is_width) {
+        if (is_near(size, back_buffer_size)) return true;
         RECT client_rect = {};
         if (back_buffer_window == nullptr || GetClientRect(back_buffer_window, &client_rect) == FALSE) return false;
-        return std::cmp_equal(size, is_width ? (client_rect.right - client_rect.left) : (client_rect.bottom - client_rect.top));
+        return is_near(size, is_width ? (client_rect.right - client_rect.left) : (client_rect.bottom - client_rect.top));
       };
 
       if (this->aspect_ratio == ANY) {
         if (dimensions.width == BACK_BUFFER || dimensions.width == BACK_BUFFER_OR_WINDOW) {
           if (back_buffer_desc.type == reshade::api::resource_type::unknown) return false;
           if (desc.texture.width != back_buffer_desc.texture.width
-              && (dimensions.width != BACK_BUFFER_OR_WINDOW || !matches_window(desc.texture.width, true))) {
+              && (dimensions.width != BACK_BUFFER_OR_WINDOW
+                  || !matches_back_buffer_or_window(desc.texture.width, back_buffer_desc.texture.width, true))) {
             return false;
           }
         } else if (dimensions.width > 0) {
@@ -255,7 +266,8 @@ struct ResourceUpgradeInfo {
         if (dimensions.height == BACK_BUFFER || dimensions.height == BACK_BUFFER_OR_WINDOW) {
           if (back_buffer_desc.type == reshade::api::resource_type::unknown) return false;
           if (desc.texture.height != back_buffer_desc.texture.height
-              && (dimensions.height != BACK_BUFFER_OR_WINDOW || !matches_window(desc.texture.height, false))) {
+              && (dimensions.height != BACK_BUFFER_OR_WINDOW
+                  || !matches_back_buffer_or_window(desc.texture.height, back_buffer_desc.texture.height, false))) {
             return false;
           }
         } else if (dimensions.height > 0) {
