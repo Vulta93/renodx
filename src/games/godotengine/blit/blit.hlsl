@@ -1,5 +1,5 @@
 // Godot 4 BlitShaderRD (servers/rendering/renderer_rd/shaders/blit.glsl, no USE_LAYER / lens distortion): the final
-// copy of a viewport to the swap chain. Ported from Godot's MIT GLSL source (4.6-stable and 4.7.2-stable); each
+// copy of a viewport to the swap chain. Ported from Godot's MIT GLSL source (4.2.2 to 4.7.2 stable); each
 // per-hash file sets GODOT_VERSION and calls GodotBlit.
 //
 // For a linear (HDR 2D) viewport Godot encodes to sRGB and dithers here; 4.6 also clamps, 4.7 leaves the clamp to the
@@ -10,7 +10,7 @@
 #error "GODOT_VERSION must be defined by the per-hash file"
 #endif
 
-// std140 layout of the GLSL `Pos` push-constant block (64 bytes in 4.3, 80 in 4.4-4.6, 96 in 4.7).
+// std140 layout of the GLSL `Pos` push-constant block (64 bytes in 4.2-4.3, 80 in 4.4-4.6, 96 in 4.7).
 struct Pos {
   float4 src_rect;
   float4 dst_rect;
@@ -30,7 +30,7 @@ struct Pos {
   float aspect_ratio;
 
   uint layer;
-  uint source_linear_or_convert_to_srgb;  // `convert_to_srgb` before 4.7, `source_is_srgb` (inverted) from 4.7.
+  uint source_linear_or_convert_to_srgb;  // `pad1` before 4.2, `convert_to_srgb` to 4.6, `source_is_srgb` (inverted) from 4.7.
 #if GODOT_VERSION >= 405
   uint use_debanding;
 #endif
@@ -88,8 +88,10 @@ float4 GodotBlit(float2 uv, float4 frag_coord) {
     return color;
   }
   const bool convert_to_srgb = data.source_linear_or_convert_to_srgb == 0u;
-#else
+#elif GODOT_VERSION >= 402
   const bool convert_to_srgb = data.source_linear_or_convert_to_srgb != 0u;
+#else
+  const bool convert_to_srgb = false;  // a pad before 4.2 (no HDR 2D viewports); not used: 4.0/4.1 keep their blit
 #endif
 
   if (convert_to_srgb) {

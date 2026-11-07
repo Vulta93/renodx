@@ -1,4 +1,4 @@
-// Godot 4.3 Forward+ tonemap, 1D LUT, bilinear glow upscale (Vulkan; seen in 4.3).
+// Godot 4.2/4.3 Forward+ tonemap, 1D LUT, bilinear glow upscale (Vulkan; seen in 4.2.2 and 4.3).
 #define GODOT_VERSION 403
 #define USE_1D_LUT
 #include "./tonemap.hlsl"

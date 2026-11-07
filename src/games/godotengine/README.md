@@ -1,6 +1,6 @@
 # RenoDX for Godot Engine
 
-Work in progress: an engine-wide addon for Godot games. On Godot 4.3 to 4.7 Forward+ with D3D12 or Vulkan it
+Work in progress: an engine-wide addon for Godot games. On Godot 4.0 to 4.7 Forward+ (Vulkan; D3D12 from 4.3) it
 replaces Godot's tone mapper and final blit, keeps a float viewport and outputs HDR10.
 
 ## Scope
@@ -10,7 +10,7 @@ replaces Godot's tone mapper and final blit, keeps a float viewport and outputs 
 | Godot 4.6, 4.7 Forward+ on D3D12 | tone mapper and final blit replaced, float viewport target, HDR10 output |
 | Godot 4.3, 4.4, 4.5 Forward+ on D3D12 | same, but only with the `override.cfg` workaround below (otherwise ReShade does not hook the device) |
 | Godot 4.7 with its own HDR output on (`Window.hdr_output_requested`) | left to Godot (swap chain and tone mapper) |
-| Godot 4.3-4.7 Forward+ on Vulkan | same as D3D12 without the `override.cfg`; needs ReShade installed for Vulkan (the global layer, game in `ReShadeApps.ini`) |
+| Godot 4.0-4.7 Forward+ on Vulkan (4.0-4.2 have no D3D12) | same as D3D12 without the `override.cfg`; needs ReShade installed for Vulkan (the global layer, game in `ReShadeApps.ini`) |
 | Godot 4 Mobile | not tested |
 | Godot 3 GLES3/GLES2, Godot 4 Compatibility (OpenGL) | not handled yet: the addon leaves these games untouched |
 
@@ -45,13 +45,16 @@ replaces Godot's tone mapper and final blit, keeps a float viewport and outputs 
   `0x6291BC2F` (1D LUT, bicubic glow). 4.7: `0xB21EACEC`, `0x3F415A05`, `0x32F7250B`, `0xEF76A934` in the same
   order. 4.3: `0x914EEDB6`, `0x51BDE35D`, `0xC200205E`, `0xA71CD15D`; 4.4: `0xA0DD4706`, `0x4A3080B2`,
   `0x9E1957A5`, `0xFDC2A39E`; 4.5: `0x2D4AED1E`, `0xD44A3465`, `0x19657F6D`, `0xF01F42A0`. Vulkan, same order:
-  4.3 `0x0941A535`, `0x4E7421AB`, `0xE5B09824`, `0xCCD1E425`; 4.4 `0xFA110435`, `0x679069A8`, `0x219BD7CC`,
+  4.0 and 4.1 `0x3CF3A19A`, `0x16B23788`, `0xBBE36649`, `0x852DA30F`; 4.2 and 4.3 `0x0941A535`, `0x4E7421AB`,
+  `0xE5B09824`, `0xCCD1E425`; 4.4 `0xFA110435`, `0x679069A8`, `0x219BD7CC`,
   `0x12C854BA`; 4.5 `0xE1AC35ED`, `0x277EEA0D`, `0x8EA1E429`, `0x5B6C8FD0`; 4.6 `0x8D6FF34D`, `0x80315116`,
   `0xB4D324B8`, `0xCC2CAB8B`; 4.7 `0x548A4E8B`, `0x88473F26`, `0x67FE91D5`, `0xE6ABA95D`. The Devkit could not decompile the DXIL, so `tonemap/tonemap.hlsl` is a port of Godot's MIT GLSL source
-  (4.3 to 4.7) with the original register layout; each per-hash file only sets `GODOT_VERSION` and Godot's two variant
+  (4.0 to 4.7; for this pass 4.2 equals 4.3, and 4.0/4.1 differ in their push-constant block, one bool per feature
+  instead of `flags`, and always encode to sRGB, whose clamp stands in for 4.2's glow clamp) with the original
+  register layout; each per-hash file only sets `GODOT_VERSION` and Godot's two variant
   defines. Tone mapper, glow mode and adjustments are push-constant branches inside each variant. Before 4.6 the
   operator output is clamped by the sRGB encode and glow (except mix) is blended after it; the port follows that.
-- Final blit (`blit/`, 4.3 `0x22687DAC`, 4.4 `0xA252A18D`, 4.5 `0x2845C867`, 4.6 `0x83ADBE18`, 4.7 `0x13955D03`; Vulkan 4.3 `0x7109F4EE`, 4.4 `0xE52452DA`, 4.5 and 4.6 `0x416C3F79`, 4.7
+- Final blit (`blit/`, 4.3 `0x22687DAC`, 4.4 `0xA252A18D`, 4.5 `0x2845C867`, 4.6 `0x83ADBE18`, 4.7 `0x13955D03`; Vulkan 4.2 and 4.3 `0x7109F4EE`, 4.4 `0xE52452DA`, 4.5 and 4.6 `0x416C3F79`, 4.7
   `0x15F02F27`): for HDR 2D viewports Godot encodes linear to sRGB here
   and clamps (4.3/4.4 before the encode, 4.5/4.6 after the dither) or relies on the 8-bit swap chain to clamp (4.7). Outside Vanilla the replacement drops the clamp
   and the 8-bit dither, so HDR 2D viewports get HDR too.
@@ -124,6 +127,10 @@ Tested on Godot 4.6.1 (Road to Vostok demo, D3D12) and on test projects for Godo
    LUT the same as the SDR viewport; SubViewports with SMAA or FSR1 opaque, clipped by their 8-bit target as on D3D12.
    Godot 4.7.2's own HDR output could not be tested on Vulkan: Godot refused it on the test machine (NVIDIA) with and
    without ReShade's layer (`HDR output requested, but is not supported`).
+12. Godot 4.0.4, 4.1.4 and 4.2.2 test exports (Vulkan; 4.0/4.1 share one set of hashes, 4.2 runs 4.3's): Vanilla vs
+   Godot's shader within 0.623/255 outside the UI on 7 steps each covering all four variants, no pixel over 1/255, no
+   NaN; on 4.1.4 also every glow mode, BCS, auto exposure, FXAA, debanding and all of them together (same bound);
+   RenoDRT peak 999 nits, UI 202.9 nits.
 
 Known limitations:
 - Stretch mode `viewport` (a fixed base resolution scaled up by the final blit) and `scale_mode = integer` (margins

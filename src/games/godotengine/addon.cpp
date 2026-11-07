@@ -63,7 +63,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x2845C867, &IsActive),  // 4.5
     CustomShaderEntryCallback(0x83ADBE18, &IsActive),  // 4.6
     CustomShaderEntryCallback(0x13955D03, &IsActive),  // 4.7
-    // Final viewport blit, Vulkan: 4.3, 4.4, 4.5 and 4.6, 4.7.
+    // Final viewport blit, Vulkan: 4.2 and 4.3, 4.4, 4.5 and 4.6, 4.7. The 4.0/4.1 blit (0x018C0D81) is a plain copy
+    // that already carries the float viewport into the swap chain, so it is kept.
     CustomShaderEntryCallback(0x7109F4EE, &IsActive),
     CustomShaderEntryCallback(0xE52452DA, &IsActive),
     CustomShaderEntryCallback(0x416C3F79, &IsActive),
@@ -95,7 +96,12 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     CustomShaderEntryCallback(0x32F7250B, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0xEF76A934, &IsFloatRenderTarget),
     // Forward+ tonemap, Vulkan, same variant order.
-    // 4.3
+    // 4.0 and 4.1 (Vulkan only, no D3D12 before 4.3)
+    CustomShaderEntryCallback(0x3CF3A19A, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x16B23788, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0xBBE36649, &IsFloatRenderTarget),
+    CustomShaderEntryCallback(0x852DA30F, &IsFloatRenderTarget),
+    // 4.2 and 4.3
     CustomShaderEntryCallback(0x0941A535, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0x4E7421AB, &IsFloatRenderTarget),
     CustomShaderEntryCallback(0xE5B09824, &IsFloatRenderTarget),

@@ -1,4 +1,4 @@
-// Godot final viewport blit (Vulkan; seen in 4.3).
+// Godot final viewport blit (Vulkan; seen in 4.2.2 and 4.3).
 #define GODOT_VERSION 403
 #include "./blit.hlsl"
 

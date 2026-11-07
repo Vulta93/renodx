@@ -1,5 +1,6 @@
 // Godot 4 desktop Forward+ tonemap pass (servers/rendering/renderer_rd/shaders/effects/tonemap.glsl), ported to HLSL
-// from Godot's MIT source (4.3, 4.4.1, 4.5.1, 4.6 and 4.7.2 stable) because the Devkit could not decompile the DXIL.
+// from Godot's MIT source (4.0.4 to 4.7.2 stable; for this pass 4.2 matches 4.3; 4.0 and 4.1 differ in Params and always
+// encode to sRGB, whose clamp stands in for 4.2's explicit glow clamp) because the Devkit could not decompile the DXIL.
 // Godot builds four desktop variants with USE_GLOW_FILTER_BICUBIC and USE_1D_LUT; each per-hash file sets those and
 // GODOT_VERSION (major * 100 + minor) and calls GodotTonemap. The registers are the ones Godot's NIR-to-DXIL path
 // assigns (set * 100000000 + binding * 100000, push constants at b1700000000), read from the original shaders.
@@ -14,9 +15,44 @@
 #error "GODOT_VERSION must be defined by the per-hash file"
 #endif
 
-// The GLSL `Params` push-constant block (std430, 96 bytes before 4.6, 112 after). Scalars keep every member at its
-// std430 byte offset under both HLSL cbuffer packing (D3D12) and Slang's std430 push-constant layout (Vulkan): an
-// HLSL array would start each element on a new 16-byte register, a std430 float3 on a 16-byte boundary.
+// The GLSL `Params` push-constant block (std430: 112 bytes in 4.0-4.1, 96 in 4.2-4.5, 112 from 4.6). Scalars keep
+// every member at its std430 byte offset under both HLSL cbuffer packing (D3D12) and Slang's std430 push-constant
+// layout (Vulkan): an HLSL array would start each element on a new 16-byte register, a std430 float3 on a 16-byte
+// boundary.
+#if GODOT_VERSION < 402
+// 4.0-4.1 (Vulkan only): one bool per feature instead of `flags`, read through GodotFlags().
+struct Params {
+  float3 bcs;
+  uint use_bcs;
+
+  uint use_glow;
+  uint use_auto_exposure;
+  uint use_color_correction;
+  uint tonemapper;
+
+  uint2 glow_texture_size;
+  float glow_intensity;
+  float glow_map_strength;
+
+  uint glow_mode;
+  float glow_level_0;
+  float glow_level_1;
+  float glow_level_2;
+  float glow_level_3;
+  float glow_level_4;
+  float glow_level_5;
+  float glow_level_6;
+
+  float exposure;
+  float white;
+  float auto_exposure_scale;
+  float luminance_multiplier;
+
+  float2 pixel_size;
+  uint use_fxaa;
+  uint use_debanding;
+};
+#else
 struct Params {
   float3 bcs;
   uint flags;
@@ -47,11 +83,12 @@ struct Params {
   float4 tonemapper_params;
 #endif
 };
+#endif
 
 #ifdef __SLANG__
 // Vulkan: Godot's own block at offset 0 of the push-constant range, RenoDX's data right after it (shared.h).
 #define GODOT_PUSH_PARAMS Params
-#if GODOT_VERSION >= 406
+#if GODOT_VERSION >= 406 || GODOT_VERSION < 402
 #define PUSH_CONSTANTS_OFFSET 112
 #else
 #define PUSH_CONSTANTS_OFFSET 96
@@ -114,6 +151,24 @@ SamplerState source_color_correction_sampler : register(s300000000);
 #define FLAG_CONVERT_TO_SRGB (1u << 6)
 #endif
 
+#if GODOT_VERSION < 402
+// 4.0-4.1 always encode to sRGB (HDR 2D viewports came in 4.2).
+uint GodotFlags() {
+  uint flags = FLAG_CONVERT_TO_SRGB;
+  if (params.use_bcs != 0u) flags |= FLAG_USE_BCS;
+  if (params.use_glow != 0u) flags |= FLAG_USE_GLOW;
+  if (params.use_auto_exposure != 0u) flags |= FLAG_USE_AUTO_EXPOSURE;
+  if (params.use_color_correction != 0u) flags |= FLAG_USE_COLOR_CORRECTION;
+  if (params.use_fxaa != 0u) flags |= FLAG_USE_FXAA;
+  if (params.use_debanding != 0u) flags |= FLAG_USE_8_BIT_DEBANDING;
+  return flags;
+}
+#else
+uint GodotFlags() {
+  return params.flags;
+}
+#endif
+
 #define TONEMAPPER_LINEAR   0u
 #define TONEMAPPER_REINHARD 1u
 #define TONEMAPPER_FILMIC   2u
@@ -159,7 +214,7 @@ TonemapCurve VanillaCurve() {
 // Godot 4.7's HDR form; at output_max_value 1 it equals 4.6's (w^2 c + c^2) / (w^2 c + w^2).
 float3 TonemapReinhard(float3 color, TonemapCurve curve) {
 #if GODOT_VERSION < 404
-  // Godot 4.3's own form (2c / (1 + c) at white 1, so never an identity).
+  // Godot 4.0-4.3's own form (2c / (1 + c) at white 1, so never an identity).
   return (params.white * color + color) / (color * params.white + params.white);
 #else
   return color * (1.0f + color / curve.reinhard_white_squared) / (1.0f + color / curve.output_max_value);
@@ -415,7 +470,7 @@ float3 ApplyColorCorrection(float3 color) {
 }
 
 #if GODOT_VERSION < 405
-// Godot 4.3/4.4 FXAA (reduced FXAA 3.x, 5 taps).
+// Godot 4.0-4.4 FXAA (reduced FXAA 3.x, 5 taps).
 float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
   const float FXAA_REDUCE_MIN = (1.0 / 128.0);
   const float FXAA_REDUCE_MUL = (1.0 / 8.0);
@@ -634,23 +689,23 @@ float3 DoFxaa(float3 color, float exposure, float2 uv_interp) {
 // encoding, then the LUT.
 float3 ApplyPostTonemap(float3 color, float2 uv) {
 #if GODOT_VERSION < 406
-  const bool convert_to_srgb = (params.flags & FLAG_CONVERT_TO_SRGB) != 0u;
+  const bool convert_to_srgb = (GodotFlags() & FLAG_CONVERT_TO_SRGB) != 0u;
   if (convert_to_srgb) {
     color = renodx::color::srgb::Encode(saturate(color));
   }
-  if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode != GLOW_MODE_MIX) {
+  if ((GodotFlags() & FLAG_USE_GLOW) != 0u && params.glow_mode != GLOW_MODE_MIX) {
     float3 glow = ApplyTonemapping(SampleGlow(uv), VanillaCurve());
     if (convert_to_srgb) {
       glow = renodx::color::srgb::Encode(saturate(glow));
     }
     color = ApplyGlow(color, glow, params.white);
   }
-  if ((params.flags & FLAG_USE_BCS) != 0u) {
+  if ((GodotFlags() & FLAG_USE_BCS) != 0u) {
     color = color * params.bcs.x;
     color = lerp(0.5f, color, params.bcs.y);
     color = lerp(dot(float3(1.0f, 1.0f, 1.0f), color) * 0.33333f, color, params.bcs.z);
   }
-  if ((params.flags & FLAG_USE_COLOR_CORRECTION) != 0u) {
+  if ((GodotFlags() & FLAG_USE_COLOR_CORRECTION) != 0u) {
 #if GODOT_VERSION >= 405
     if (!convert_to_srgb) {
       color = renodx::color::srgb::Encode(saturate(color));
@@ -660,22 +715,22 @@ float3 ApplyPostTonemap(float3 color, float2 uv) {
   }
   return color;
 #else
-  if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode == GLOW_MODE_SOFTLIGHT) {
+  if ((GodotFlags() & FLAG_USE_GLOW) != 0u && params.glow_mode == GLOW_MODE_SOFTLIGHT) {
     color = ApplyGlow(color, ApplyTonemapping(SampleGlow(uv), VanillaCurve()), params.white);
   }
 
-  if ((params.flags & FLAG_USE_BCS) != 0u) {
+  if ((GodotFlags() & FLAG_USE_BCS) != 0u) {
     color = color * params.bcs.x;
     color = renodx::color::srgb::Encode(color);
     color = lerp(0.5f, color, params.bcs.y);
     color = lerp(dot(float3(1.0f, 1.0f, 1.0f), color) * (1.0 / 3.0), color, params.bcs.z);
 
-    if ((params.flags & FLAG_USE_COLOR_CORRECTION) != 0u) {
+    if ((GodotFlags() & FLAG_USE_COLOR_CORRECTION) != 0u) {
       color = ApplyColorCorrection(saturate(color));
-    } else if ((params.flags & FLAG_CONVERT_TO_SRGB) == 0u) {
+    } else if ((GodotFlags() & FLAG_CONVERT_TO_SRGB) == 0u) {
       color = renodx::color::srgb::Decode(color);
     }
-  } else if ((params.flags & FLAG_CONVERT_TO_SRGB) != 0u) {
+  } else if ((GodotFlags() & FLAG_CONVERT_TO_SRGB) != 0u) {
     color = renodx::color::srgb::Encode(color);
   }
   return color;
@@ -687,20 +742,20 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
   color.rgb *= params.luminance_multiplier;
 
   float exposure = params.exposure;
-  if ((params.flags & FLAG_USE_AUTO_EXPOSURE) != 0u) {
+  if ((GodotFlags() & FLAG_USE_AUTO_EXPOSURE) != 0u) {
     exposure *= 1.0 / (GODOT_LOAD(source_auto_exposure, int3(0, 0, 0)).r * params.luminance_multiplier / params.auto_exposure_scale);
   }
   color.rgb *= exposure;
 
-  if ((params.flags & FLAG_USE_FXAA) != 0u) {
+  if ((GodotFlags() & FLAG_USE_FXAA) != 0u) {
     color.rgb = DoFxaa(color.rgb, exposure, uv_interp);
   }
 
   // Pre-tonemap glow: every mode but soft light from 4.6, only mix before.
 #if GODOT_VERSION >= 406
-  if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode != GLOW_MODE_SOFTLIGHT) {
+  if ((GodotFlags() & FLAG_USE_GLOW) != 0u && params.glow_mode != GLOW_MODE_SOFTLIGHT) {
 #else
-  if ((params.flags & FLAG_USE_GLOW) != 0u && params.glow_mode == GLOW_MODE_MIX) {
+  if ((GodotFlags() & FLAG_USE_GLOW) != 0u && params.glow_mode == GLOW_MODE_MIX) {
 #endif
     float3 glow = SampleGlow(uv_interp);
     if (params.glow_mode == GLOW_MODE_MIX) {
@@ -710,7 +765,7 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
     }
   }
 
-  const bool output_srgb = (params.flags & FLAG_CONVERT_TO_SRGB) != 0u;
+  const bool output_srgb = (GodotFlags() & FLAG_CONVERT_TO_SRGB) != 0u;
   const TonemapCurve vanilla_curve = VanillaCurve();
 
   // output_max_value > 1: Godot 4.7's own HDR output is on, and the addon leaves that swap chain alone.
@@ -718,11 +773,11 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
     float3 vanilla = ApplyPostTonemap(ApplyTonemapping(color.rgb, vanilla_curve), uv_interp);
     // screen_space_dither(gl_FragCoord.xy, 255.0 or 1023.0)
     float3 dither = frac(dot(float2(171.0, 231.0), frag_coord.xy) / float3(103.0, 71.0, 97.0)) - 0.5;
-    if ((params.flags & FLAG_USE_8_BIT_DEBANDING) != 0u) {
+    if ((GodotFlags() & FLAG_USE_8_BIT_DEBANDING) != 0u) {
       vanilla += dither / 255.0;
     }
 #if GODOT_VERSION == 405
-    else if ((params.flags & FLAG_USE_10_BIT_DEBANDING) != 0u) {
+    else if ((GodotFlags() & FLAG_USE_10_BIT_DEBANDING) != 0u) {
       vanilla += dither / 1023.0;
     }
 #endif
@@ -735,7 +790,7 @@ float4 GodotTonemap(float2 uv_interp, float4 frag_coord) {
 
   // Linear, and Reinhard with white == output_max_value (identity), only clip at the UNORM write: the operator output
   // is no SDR reference there, so the vanilla chain runs on RenoDRT's neutral SDR instead (graded == neutral without
-  // adjustments, i.e. a plain RenoDRT tone map of the scene). Godot 4.3's Reinhard is a real curve below white (2c/(1+c)
+  // adjustments, i.e. a plain RenoDRT tone map of the scene). Godot 4.0-4.3's Reinhard is a real curve below white (2c/(1+c)
   // at white 1), so like Filmic/ACES it stays the reference even though it also reaches 1 at white.
   const bool is_hard_clip = params.tonemapper == TONEMAPPER_LINEAR
                             || (GODOT_VERSION >= 404 && params.tonemapper == TONEMAPPER_REINHARD
